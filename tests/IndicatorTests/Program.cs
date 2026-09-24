@@ -34,16 +34,23 @@ internal static class Program
 		Run("Probability model: three-outcome shrinkage", ModelShrinkage);
 		Run("Prior odds and label percentages", PriorOddsAndPercentages);
 		Run("Live odds of an open trade", LiveOddsOfOpenTrade);
-		Run("FVG: completing candle is not a retest", FvgCompletingCandleIsNotReaction);
-		Run("FVG retest: BUY at close, TP 80 ticks later", FvgRetestBuyHitsTakeProfit);
+		Run("Candlestick patterns: shapes and near misses, both ways", CandlePatternShapes);
+		Run("Candlestick patterns: hammer shapes read by what came before", CandlePatternContext);
+		Run("FVG: the completing candle is not a retest", FvgCompletingCandleIsNotReaction);
+		Run("FVG: hammer at the retest -> bullish reaction, BUY, TP 80 ticks later", FvgRetestBuyHitsTakeProfit);
+		Run("FVG: bearish engulfing at a bullish gap -> bearish reaction, SHORT", FvgBearishReactionAtBullishGap);
+		Run("FVG: a reaction needs a pattern that includes the touch", FvgReactionNeedsPatternAtZone);
+		Run("FVG: used, filled and expired gaps stop being watched", FvgZoneLifecycle);
 		Run("Sweep of highs: SHORT, same-bar rules", SweepShortSameBarRule);
+		Run("Sweep: a shooting star on the sweep bar confirms it", SweepPatternConfirmation);
 		Run("Break-even: stop moves at +40t, exits at +20t", BreakEvenStopAfterTrigger);
 		Run("Live ticks: signal only after the bar closes", LiveSignalAppearsAfterClose);
 		Run("Live ticks: a dip before the trigger is not a break-even exit", LiveBreakEvenFollowsTheTicks);
-		Run("Absorption: heatmap cells and buy confirmation", AbsorptionConfirmation);
-		Run("FVG: a reacted zone still dies when price closes through", ReactedZoneIsInvalidated);
-		Run("Candlestick patterns: shapes and near misses, both ways", CandlePatternShapes);
-		Run("Candlestick patterns: the fourth confirmation", CandlePatternConfirmation);
+		Run("Fills: footprint fill, its reaction and the order-flow confirmation", FootprintFillConfirmation);
+		Run("Fills: a reaction after a big fill is a signal", FillReactionSignal);
+		Run("Order book: resting orders, filled vs pulled", OrderBookRestingOrders);
+		Run("Order book: fills merge with the footprint and get a reaction", OrderBookFillReaction);
+		Run("Order book: a fill on the other side of the footprint stays apart", OrderBookFillSides);
 		Run("Fuzz: historical run vs oracle", () => FuzzHistorical(seed: 7, configure: null));
 		Run("Fuzz: expiry + session end + cooldown 0", () => FuzzHistorical(seed: 11, configure: i =>
 		{
@@ -57,39 +64,47 @@ internal static class Program
 			i.OneTradeAtATime = false;
 			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.SweepThenFvg;
 		}));
-		Run("Fuzz: no break-even, worst-case rule", () => FuzzHistorical(seed: 29, configure: i =>
+		Run("Fuzz: no break-even, worst case, gaps filled by a close", () => FuzzHistorical(seed: 29, configure: i =>
 		{
 			i.BreakEvenTriggerTicks = 0;
 			i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+			i.FvgFill = FvgReactionLiquiditySweep.FvgFillRule.CloseBeyond;
 		}));
-		Run("Fuzz: tight bracket, break-even, worst-case rule", () => FuzzHistorical(seed: 37, configure: i =>
+		Run("Fuzz: tight bracket, reactions may close inside, gaps filled at 50%", () => FuzzHistorical(seed: 37, configure: i =>
 		{
 			i.TakeProfitTicks = 40;
 			i.StopLossTicks = 120;
 			i.BreakEvenTriggerTicks = 20;
 			i.BreakEvenStopTicks = 10;
 			i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+			i.RequireCloseThroughZone = false;
+			i.FvgFill = FvgReactionLiquiditySweep.FvgFillRule.Middle;
 		}));
-		Run("Fuzz: break-even at entry, 120 / 60 bracket", () => FuzzHistorical(seed: 31, configure: i =>
+		Run("Fuzz: break-even at entry, fill reactions only", () => FuzzHistorical(seed: 31, configure: i =>
 		{
 			i.TakeProfitTicks = 120;
 			i.StopLossTicks = 60;
 			i.BreakEvenTriggerTicks = 30;
 			i.BreakEvenStopTicks = 0;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FillReactionOnly;
+			i.ReactionBars = 5;
 		}));
-		Run("Fuzz: candlestick pattern required, other shapes", () => FuzzHistorical(seed: 43, configure: i =>
+		Run("Fuzz: sweeps need a pattern and order flow, other shapes", () => FuzzHistorical(seed: 43, configure: i =>
 		{
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.LiquiditySweepOnly;
 			i.RequireCandlePattern = true;
 			i.PinBarWickRatio = 1.5;
 			i.PatternAverageBars = 5;
 			i.TweezerToleranceTicks = 0;
 			i.PatternHarami = false;
 			i.PatternMarubozu = false;
+			i.FillMinVolume = 250;
+			i.FillVolumeMultiplier = 2;
 		}));
 		Run("Fuzz: filters hide signals, the model still learns", FuzzFilters);
-		Run("Fuzz: live tick stream matches history", FuzzLiveMatchesHistory);
+		Run("Fuzz: live ticks and a live order book match history", FuzzLiveMatchesHistory);
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
-		Run("Render: labels, levels, panel, tooltip", RenderSmoke);
+		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
 		Console.WriteLine();
 		Console.WriteLine($"{_checks} checks, {Failures.Count} failed");
@@ -290,6 +305,7 @@ internal static class Program
 		CheckClose(Estimate(true, fvg, 2).Tp, trigger.Item1, 1e-12, "one TP, same trigger, other confirmations");
 		CheckClose(Estimate(true, fvg, 4).Tp, trigger.Item1, 1e-12, "all four confirmations is a setup of its own");
 		CheckClose(Estimate(true, sweep, 1).Tp, direction.Item1, 1e-12, "one TP, other trigger");
+		CheckClose(Estimate(true, Enum.Parse(triggerType, "Fill"), 1).Tp, direction.Item1, 1e-12, "one TP, the fill trigger");
 		CheckClose(Estimate(false, fvg, 1).Tp, prior.Item1, 1e-12, "shorts are unaffected by longs");
 
 		Record(true, fvg, 1, "BreakEven");
@@ -392,9 +408,9 @@ internal static class Program
 		}
 	}
 
-	// Hand-built cases for every pattern and the near misses that fall just outside it. Each
-	// case is checked for buys, and again upside down (mirrored) for shorts, where it must give
-	// the bearish twin; then with its pattern's switch off.
+	// Hand-built cases for every pattern and the near misses that fall just outside it, read
+	// after a decline. Each case is checked for buys, again upside down (mirrored, read after a
+	// rally) for shorts, where it must give the bearish twin, and with its pattern's switch off.
 	private static void CandlePatternShapes()
 	{
 		var cases = new (string Name, decimal[][] Candles, string[] Expected, Action<FvgReactionLiquiditySweep> Configure)[]
@@ -405,18 +421,20 @@ internal static class Program
 			("... is a hammer with wick / body 1.5", new[] { C(100, 100.75m, 98.75m, 100.75m) }, new[] { "Hammer" }, i => i.PinBarWickRatio = 1.5),
 			("dragonfly doji", new[] { C(100, 100.25m, 97, 100) }, new[] { "DragonflyDoji" }, null),
 			("inverted hammer", new[] { C(100, 103, 99.75m, 100.75m) }, new[] { "InvertedHammer" }, null),
-			("gravestone shape at a buy is an inverted hammer", new[] { C(100, 103, 99.75m, 100) }, new[] { "InvertedHammer" }, null),
+			("gravestone shape after a decline is an inverted hammer", new[] { C(100, 103, 99.75m, 100) }, new[] { "InvertedHammer" }, null),
 			("marubozu", new[] { C(100, 102, 100, 102) }, new[] { "BullishMarubozu" }, null),
 			("marubozu with a 1-tick wick", new[] { C(100, 102.25m, 100, 102) }, new string[0], null),
 			("marubozu under the average body", new[] { C(100, 100.75m, 100, 100.75m) }, new string[0], null),
-			("bullish engulfing", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.75m, 99.25m, 101.5m) }, new[] { "BullishEngulfing" }, null),
+			("bullish engulfing", new[] { C(101, 101.25m, 99.25m, 100), C(100, 101.75m, 99.75m, 101.5m) }, new[] { "BullishEngulfing" }, null),
+			("... that also takes out the low is an outside reversal too", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.75m, 99.25m, 101.5m) },
+				new[] { "BullishEngulfing", "BullishOutsideReversal" }, null),
+			("engulfing after a gap, closing right on the open", new[] { C(101, 101.25m, 99.75m, 100), C(99.5m, 101.25m, 99.25m, 101) },
+				new[] { "BullishEngulfing" }, null),
+			("engulfing opening above the close before", new[] { C(101, 101.25m, 99.75m, 100), C(100.25m, 101.75m, 100.25m, 101.5m) }, new string[0], null),
 			("short of the open: piercing line and harami", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101, 99.25m, 100.75m) },
 				new[] { "BullishHarami", "PiercingLine" }, null),
 			("engulfing body no bigger", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.25m, 99.25m, 101) }, new string[0], null),
 			("engulfing under the average body", new[] { C(100.25m, 100.5m, 99.75m, 100), C(100, 100.75m, 99.25m, 100.5m) }, new string[0], null),
-			("engulfing after a gap, closing right on the open", new[] { C(101, 101.25m, 99.75m, 100), C(99.5m, 101.25m, 99.25m, 101) },
-				new[] { "BullishEngulfing" }, null),
-			("engulfing opening above the close before", new[] { C(101, 101.25m, 99.75m, 100), C(100.25m, 101.75m, 100.25m, 101.5m) }, new string[0], null),
 			("piercing line", new[] { C(102, 102.25m, 99.75m, 100), C(100, 101.5m, 99.25m, 101.25m) }, new[] { "PiercingLine" }, null),
 			("piercing line closing on the middle", new[] { C(102, 102.25m, 99.75m, 100), C(100, 101.25m, 99.25m, 101) }, new string[0], null),
 			("piercing line opening above the close before", new[] { C(102, 102.25m, 99.75m, 100), C(100.25m, 101.5m, 100.25m, 101.25m) }, new string[0], null),
@@ -429,8 +447,12 @@ internal static class Program
 			("... match within 2 ticks", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.25m, 101, 100, 100.75m) }, new[] { "TweezerBottom" },
 				i => i.TweezerToleranceTicks = 2),
 			("tweezer, second candle bearish", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.75m, 101, 99.75m, 100.25m) }, new string[0], null),
+			("bullish outside reversal", new[] { C(101, 101.25m, 100, 100.25m), C(100.5m, 101.75m, 99.5m, 101.5m) }, new[] { "BullishOutsideReversal" }, null),
+			("outside bar closing inside the range before", new[] { C(101, 101.25m, 100, 100.25m), C(100.5m, 101.75m, 99.5m, 101) }, new string[0], null),
 			("morning star", new[] { C(103, 103.25m, 100.75m, 101), C(101, 101.5m, 100.5m, 101.25m), C(101.25m, 102.75m, 101, 102.5m) },
 				new[] { "MorningStar" }, null),
+			("morning doji star", new[] { C(103, 103.25m, 100.75m, 101), C(101, 101.5m, 100.5m, 101), C(101.25m, 102.75m, 101, 102.5m) },
+				new[] { "MorningDojiStar" }, null),
 			("star above the middle of the first body", new[] { C(103, 103.25m, 100.75m, 101), C(102.25m, 102.75m, 102, 102.5m), C(101.25m, 102.75m, 101, 102.5m) },
 				new string[0], null),
 			("star with an average body", new[] { C(103, 103.25m, 100.75m, 101), C(101, 102.25m, 100.75m, 102), C(101.75m, 103, 101.5m, 102.75m) },
@@ -439,6 +461,14 @@ internal static class Program
 				new string[0], null),
 			("first candle under the average body", new[] { C(102, 102.25m, 100.75m, 101.25m), C(101.25m, 101.75m, 100.75m, 101.5m), C(101.5m, 103, 101.25m, 102.75m) },
 				new string[0], null),
+			("three inside up", new[] { C(103, 103.25m, 100.75m, 101), C(102, 102.5m, 101.75m, 102.25m), C(102.25m, 103.5m, 102, 103.25m) },
+				new[] { "ThreeInsideUp" }, null),
+			("three inside up without closing above the first open", new[] { C(103, 103.25m, 100.75m, 101), C(102, 102.5m, 101.75m, 102.25m), C(102.25m, 103, 102, 102.75m) },
+				new string[0], null),
+			("three outside up", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.75m, 99.75m, 101.5m), C(101.5m, 102.25m, 101.25m, 102) },
+				new[] { "ThreeOutsideUp" }, null),
+			("three outside up without a higher close", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.75m, 99.75m, 101.5m), C(101.5m, 101.75m, 101, 101.25m) },
+				new string[0], null),
 			("three white soldiers", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(102.25m, 104, 102, 103.75m) },
 				new[] { "ThreeWhiteSoldiers" }, null),
 			("soldier opening above the body before", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101.5m, 102.75m, 101.25m, 102.5m), C(102.25m, 104, 102, 103.75m) },
@@ -446,7 +476,16 @@ internal static class Program
 			("soldier closing far from its high", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(102.25m, 104.75m, 102, 103.75m) },
 				new string[0], null),
 			("soldiers not closing higher", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(101.25m, 102.75m, 101, 102.5m) },
-				new string[0], null)
+				new string[0], null),
+			("bullish three-line strike (with its engulfing and tweezer)",
+				new[] { C(103, 103.25m, 102.25m, 102.5m), C(102.5m, 102.75m, 101.75m, 102), C(102, 102.25m, 101.25m, 101.5m), C(101.5m, 103.5m, 101.25m, 103.25m) },
+				new[] { "BullishEngulfing", "BullishThreeLineStrike", "TweezerBottom" }, null),
+			("strike stopping short of the first open",
+				new[] { C(103, 103.25m, 102.25m, 102.5m), C(102.5m, 102.75m, 101.75m, 102), C(102, 102.25m, 101.25m, 101.5m), C(101.5m, 103, 101.25m, 102.75m) },
+				new[] { "BullishEngulfing", "TweezerBottom" }, null),
+			("strike after two equal closes",
+				new[] { C(103, 103.25m, 102.25m, 102.5m), C(102.75m, 103, 102.25m, 102.5m), C(102, 102.25m, 101.25m, 101.5m), C(101.5m, 103.5m, 101.25m, 103.25m) },
+				new[] { "BullishEngulfing", "TweezerBottom" }, null)
 		};
 
 		// the switch that covers each pattern
@@ -460,39 +499,58 @@ internal static class Program
 			["PiercingLine"] = i => i.PatternPiercingLine = false,
 			["BullishHarami"] = i => i.PatternHarami = false,
 			["TweezerBottom"] = i => i.PatternTweezers = false,
+			["BullishOutsideReversal"] = i => i.PatternOutsideReversal = false,
 			["MorningStar"] = i => i.PatternStars = false,
-			["ThreeWhiteSoldiers"] = i => i.PatternThreeSoldiers = false
+			["MorningDojiStar"] = i => i.PatternStars = false,
+			["ThreeInsideUp"] = i => i.PatternThreeInside = false,
+			["ThreeOutsideUp"] = i => i.PatternThreeOutside = false,
+			["ThreeWhiteSoldiers"] = i => i.PatternThreeSoldiers = false,
+			["BullishThreeLineStrike"] = i => i.PatternThreeLineStrike = false
 		};
+
+		void AllOff(FvgReactionLiquiditySweep i)
+		{
+			foreach (var off in family.Values)
+				off(i);
+		}
 
 		foreach (var (name, candles, expected, configure) in cases)
 		{
 			var bars = PatternBars(candles);
-			var buy = PatternsAt(bars, true, configure);
+			var buy = PatternsAt(bars, true, true, configure);
 			Check(buy.SequenceEqual(expected), $"{name}: got [{string.Join(",", buy)}]");
 
-			// upside down it is the bearish twin, for a short
+			// upside down it is the bearish twin, read after a rally
 			var twin = expected.Select(n => BearishTwin[n]).OrderBy(n => n, StringComparer.Ordinal).ToList();
-			var sell = PatternsAt(Mirror(bars, 400), false, configure);
+			var sell = PatternsAt(Mirror(bars, 400), false, false, configure);
 			Check(sell.SequenceEqual(twin), $"{name}, mirrored: got [{string.Join(",", sell)}]");
 
 			foreach (var pattern in expected)
 			{
-				var off = PatternsAt(bars, true, i => { configure?.Invoke(i); family[pattern](i); });
+				var off = PatternsAt(bars, true, true, i => { configure?.Invoke(i); family[pattern](i); });
 				Check(!off.Contains(pattern), $"{name}: still found with its switch off");
 
-				var twinOff = PatternsAt(Mirror(bars, 400), false, i => { configure?.Invoke(i); family[pattern](i); });
+				var twinOff = PatternsAt(Mirror(bars, 400), false, false, i => { configure?.Invoke(i); family[pattern](i); });
 				Check(!twinOff.Contains(BearishTwin[pattern]), $"{name}, mirrored: still found with its switch off");
 			}
 
-			Check(PatternsAt(bars, true, i => { configure?.Invoke(i); i.UseCandlePatterns = false; }).Count == 0, $"{name}: found with patterns off");
+			Check(PatternsAt(bars, true, true, i => { configure?.Invoke(i); AllOff(i); }).Count == 0, $"{name}: found with every switch off");
 		}
 
-		// label order: three candles, then two, then one
+		// label order: strongest first
 		var patternType = IndicatorType.GetNestedType("CandlePattern", BindingFlags.NonPublic);
 		var namesOf = IndicatorType.GetMethod("PatternNames", PrivateStatic);
 		List<string> Names(string flags) => (List<string>)namesOf.Invoke(null, new[] { Enum.Parse(patternType, flags) });
-		Check(Names("Hammer, TweezerBottom, MorningStar").SequenceEqual(new[] { "Morning star", "Tweezer bottom", "Hammer" }), "label order");
+		Check(Names("Hammer, TweezerBottom, MorningStar").SequenceEqual(new[] { "Morning star", "Hammer", "Tweezer bottom" }), "label order");
 		Check(Names("None").Count == 0, "no pattern, no names");
+
+		// the stronger pattern decides between a bullish and a bearish one; equals cancel out
+		var decide = IndicatorType.GetMethod("DecideReaction", PrivateStatic);
+		int Decide(string bull, string bear) => (int)decide.Invoke(null, new[] { Enum.Parse(patternType, bull), Enum.Parse(patternType, bear) });
+		Check(Decide("Hammer", "BearishEngulfing") == -1, "an engulfing beats a hammer");
+		Check(Decide("MorningStar, BullishHarami", "BearishEngulfing") == 1, "a morning star beats an engulfing");
+		Check(Decide("BullishEngulfing", "BearishEngulfing") == 0 && Decide("None", "None") == 0, "twins and nothing are a tie");
+		Check(Decide("InvertedHammer", "None") == 1 && Decide("None", "HangingMan") == -1, "one side only");
 
 		// the average body only counts the candles before the pattern that exist
 		var average = IndicatorType.GetMethod("AverageBody", Private);
@@ -500,6 +558,27 @@ internal static class Program
 		short1.Candles.AddRange(new[] { Bar(100, 102, 99, 101), Bar(101, 103, 100, 103), Bar(103, 104, 102, 103.5m) });
 		Check((decimal)average.Invoke(short1, new object[] { 2 }) == 1.5m && (decimal)average.Invoke(short1, new object[] { 0 }) == 0,
 			"average body of the bars that exist");
+	}
+
+	// The hammer shapes depend on what came before; every other pattern does not.
+	private static void CandlePatternContext()
+	{
+		var hammer = PatternBars(new[] { C(100, 101, 97, 100.75m) });
+		Check(PatternsAt(hammer, true, true, null).SequenceEqual(new[] { "Hammer" }), "after a decline: hammer");
+		Check(PatternsAt(hammer, false, false, null).SequenceEqual(new[] { "HangingMan" }), "after a rally: hanging man");
+		Check(PatternsAt(hammer, true, false, null).Count == 0 && PatternsAt(hammer, false, true, null).Count == 0, "no hammer reading the other way");
+
+		var star = PatternBars(new[] { C(100, 103, 99.75m, 100.75m) });
+		Check(PatternsAt(star, true, true, null).SequenceEqual(new[] { "InvertedHammer" }), "after a decline: inverted hammer");
+		Check(PatternsAt(star, false, false, null).SequenceEqual(new[] { "ShootingStar" }), "after a rally: shooting star");
+		Check(PatternsAt(star, true, false, null).Count == 0 && PatternsAt(star, false, true, null).Count == 0, "no star reading the other way");
+
+		var dragonfly = PatternBars(new[] { C(100, 100.25m, 97, 100) });
+		Check(PatternsAt(dragonfly, false, false, null).SequenceEqual(new[] { "HangingMan" }), "a dragonfly doji after a rally is a hanging man");
+
+		var engulfing = PatternBars(new[] { C(101, 101.25m, 99.25m, 100), C(100, 101.75m, 99.75m, 101.5m) });
+		Check(PatternsAt(engulfing, true, true, null).SequenceEqual(new[] { "BullishEngulfing" })
+			&& PatternsAt(engulfing, true, false, null).SequenceEqual(new[] { "BullishEngulfing" }), "an engulfing reads the same after a rally");
 	}
 
 	private static decimal[] C(decimal open, decimal high, decimal low, decimal close)
@@ -517,14 +596,14 @@ internal static class Program
 	}
 
 	// the patterns the indicator finds on the last of `bars`
-	private static List<string> PatternsAt(List<IndicatorCandle> bars, bool isLong, Action<FvgReactionLiquiditySweep> configure)
+	private static List<string> PatternsAt(List<IndicatorCandle> bars, bool bullish, bool afterDecline, Action<FvgReactionLiquiditySweep> configure)
 	{
 		var ind = NewIndicator(configure);
 		ind.Candles.AddRange(bars);
-		return PatternList(IndicatorType.GetMethod("FindCandlePatterns", Private).Invoke(ind, new object[] { bars.Count - 1, isLong }));
+		return PatternList(IndicatorType.GetMethod("FindCandlePatterns", Private).Invoke(ind, new object[] { bars.Count - 1, bullish, afterDecline }));
 	}
 
-		#endregion
+	#endregion
 
 	#region Scenarios
 
@@ -540,23 +619,30 @@ internal static class Program
 		return bars;
 	}
 
+	// bar 19: dips into the gap and closes back above it as a hammer - 2-tick body at the top,
+	// 5-tick lower wick, no upper wick
+	private static IndicatorCandle HammerRetest(decimal delta = 50)
+	{
+		return Bar(103, 103.5m, 101.75m, 103.5m, delta);
+	}
+
 	private static void FvgCompletingCandleIsNotReaction()
 	{
 		var bars = FvgSetup();
 		bars.Add(Bar(103.75m, 104.5m, 103.25m, 104));       // 19 no retest
 		var ind = RunHistorical(bars);
 
-		Check(Series(ind, "_bullReaction")[17] == 0, "old bug: the gap's own right candle was flagged as a reaction");
+		Check(Series(ind, "_bullReaction")[17] == 0, "the gap's own right candle is not a reaction");
 		Check(Trades(ind).Count == 0, "no signal without a retest");
 
-		var zones = (IList)IndicatorType.GetField("_zones", Private).GetValue(ind);
-		Check(zones.Count == 1, $"expected exactly one zone, got {zones.Count}");
+		var zones = Zones(ind);
+		Check(zones.Count == 1 && zones[0].State == "Active" && zones[0].Top == 102.5m && zones[0].Bottom == 100.5m, "exactly one live zone");
 	}
 
 	private static void FvgRetestBuyHitsTakeProfit()
 	{
 		var bars = FvgSetup();
-		bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));   // 19 dips into the zone, closes above it, bullish
+		bars.Add(HammerRetest());                                    // 19
 		bars.Add(Bar(103.5m, 110, 103, 109));                        // 20
 		bars.Add(Bar(109, 124, 108, 123));                           // 21 high 124 >= TP 123.5
 		bars.Add(Bar(123, 124, 122, 123.5m));                        // 22
@@ -573,14 +659,119 @@ internal static class Program
 		Check(t.IsLong && t.IsShown && t.EntryBar == 19, "BUY on the retest bar");
 		Check(t.EntryPrice == 103.5m && t.TakeProfitPrice == 123.5m && t.StopLossPrice == 83.5m, "80-tick bracket from the close");
 		Check(t.HasBreakEven && t.TriggerPrice == 113.5m && t.BreakEvenPrice == 108.5m, "break-even at +40t moves the stop to +20t");
-		Check(t.Trigger == "Fvg" && t.Confirmations == 1, $"trigger/confirmations {t.Trigger}/{t.Confirmations}");
+		Check(t.Trigger == "Fvg" && t.Confirmations == 2 && t.DeltaConfirms && t.CandlePatterns.SequenceEqual(new[] { "Hammer" }),
+			$"trigger/confirmations {t.Trigger}/{t.Confirmations} [{string.Join(",", t.CandlePatterns)}]");
+		Check(t.ZoneTop == 102.5m && t.ZoneBottom == 100.5m, "the reaction's zone");
 		CheckClose(t.TakeProfit, 2.0 / 9, 1e-12, "no history -> TP 2/9");
 		CheckClose(t.BreakEven, 4.0 / 9, 1e-12, "no history -> BE 4/9");
 		CheckClose(t.ExpectedTicks, 0, 1e-12, "no history -> 0 expected ticks");
 		Check(t.Outcome == "TakeProfit" && t.ExitBar == 21 && t.BreakEvenBar == 21, $"outcome {t.Outcome} on bar {t.ExitBar}");
 		Check(Series(ind, "_buySignal")[19] == 101.25m, "buy arrow 2 ticks under the low");
-		Check(Series(ind, "_bullReaction")[19] == 0, "signal arrow replaces the reaction arrow");
+		Check(Series(ind, "_bullReaction")[19] == 101.25m, "the (hidden) reaction series marks the bar");
 		Check((int)IndicatorType.GetField("_longWins", Private).GetValue(ind) == 1, "panel counts the win");
+
+		var zone = Zones(ind).SingleOrDefault(z => z.Bottom == 100.5m);
+		Check(zone != null && zone.State == "Used" && zone.EndBar == 19 && zone.ReactionBullish && zone.ReactionPatterns.SequenceEqual(new[] { "Hammer" })
+			&& zone.SignalShown, "the zone is used by the reaction and stops being watched");
+	}
+
+	private static void FvgBearishReactionAtBullishGap()
+	{
+		var bars = FvgSetup();
+		bars.Add(Bar(102.75m, 103.25m, 102, 103));                 // 19 dips into the gap, no pattern
+		bars.Add(Bar(103, 103.25m, 100, 100.25m, delta: -30));     // 20 bearish engulfing, closes under the gap (and a tweezer top)
+		bars.Add(Bar(100.25m, 100.5m, 100, 100.25m));              // 21 forming
+		var ind = RunHistorical(bars);
+		var trades = Trades(ind);
+
+		Check(trades.Count == 1, $"expected 1 trade, got {trades.Count}");
+
+		if (trades.Count != 1)
+			return;
+
+		var t = trades[0];
+		Check(!t.IsLong && t.EntryBar == 20 && t.Trigger == "Fvg" && t.Confirmations == 2,
+			$"SHORT {t.IsLong}/{t.EntryBar}/{t.Trigger}/{t.Confirmations}");
+		Check(t.CandlePatterns.SequenceEqual(new[] { "BearishEngulfing", "TweezerTop" }), $"patterns [{string.Join(",", t.CandlePatterns)}]");
+
+		var zone = Zones(ind).Single();
+		Check(zone.State == "Used" && zone.EndBar == 20 && !zone.ReactionBullish && zone.LastTouchBar == 20, "a bearish reaction used the bullish gap");
+
+		// without the close-through rule a pattern inside the gap is enough - but bar 19 still has none
+		var loose = Trades(RunHistorical(bars, i => i.RequireCloseThroughZone = false));
+		Check(loose.Count == 1 && loose[0].EntryBar == 20, "no pattern on the touch itself");
+	}
+
+	private static void FvgReactionNeedsPatternAtZone()
+	{
+		// (a) a plain dip into the gap - its 1-tick upper wick on an 8-tick bar is no hammer
+		var plain = FvgSetup();
+		plain.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));  // 19
+		plain.Add(Bar(103.5m, 104, 103, 103.75m));                 // 20 forming
+		var ind = RunHistorical(plain);
+		Check(Trades(ind).Count == 0, "no pattern, no reaction, no signal");
+		var zone = Zones(ind).Single();
+		Check(zone.State == "Active" && zone.LastTouchBar == 19, "the gap is still watched");
+
+		// (b) a morning star whose star touched the gap: the third candle stays above the gap,
+		// but the pattern includes the touch
+		var star = FvgSetup();
+		star.Add(Bar(104, 104, 102.75m, 103));                     // 19 long bearish, above the gap
+		star.Add(Bar(103, 103.25m, 102.25m, 102.75m));             // 20 the star, in the gap
+		star.Add(Bar(102.75m, 104.25m, 102.75m, 104));             // 21 long bullish, back above the first body's middle
+		star.Add(Bar(104, 104.25m, 103.75m, 104));                 // 22 forming
+		var trades = Trades(RunHistorical(star));
+		Check(trades.Count == 1 && trades[0].EntryBar == 21 && trades[0].IsLong
+			&& trades[0].CandlePatterns.SequenceEqual(new[] { "BullishEngulfing", "MorningStar" }),
+			$"morning star off the gap: [{string.Join(",", trades.SelectMany(t => t.CandlePatterns))}]");
+
+		// (c) a hammer four bars after the touch, above the gap: too far from it to count
+		var late = FvgSetup();
+		late.Add(Bar(103, 103.75m, 101.75m, 103.5m));              // 19 touch, no pattern
+		late.Add(Bar(103.5m, 104, 103.25m, 103.75m));              // 20
+		late.Add(Bar(103.75m, 104.25m, 103.5m, 104));              // 21
+		late.Add(Bar(104, 104.5m, 103.75m, 104.25m));              // 22
+		late.Add(Bar(104.25m, 104.5m, 103.25m, 104.5m));           // 23 hammer, not touching
+		late.Add(Bar(104.5m, 104.75m, 104.25m, 104.5m));           // 24 forming
+		ind = RunHistorical(late);
+		Check(Trades(ind).Count == 0 && Zones(ind).Single().State == "Active", "a pattern that does not include the touch is no reaction");
+	}
+
+	private static void FvgZoneLifecycle()
+	{
+		// used: the hammer reaction retires the gap
+		var used = FvgSetup();
+		used.Add(HammerRetest());
+		used.Add(Bar(103.5m, 104, 103, 103.75m));
+		var zones = Zones(RunHistorical(used));
+		Check(zones.Count == 1 && zones[0].State == "Used" && zones[0].EndBar == 19, "used");
+
+		// filled: price reaches the far edge (100.5) without a pattern
+		List<IndicatorCandle> Through(decimal low)
+		{
+			var bars = FvgSetup();
+			bars.Add(Bar(103, 103.25m, low, 101));                  // 19 no pattern
+			bars.Add(Bar(101, 101.5m, 100.75m, 101.25m));           // 20 forming
+			return bars;
+		}
+
+		zones = Zones(RunHistorical(Through(100.5m)));
+		Check(zones.Count == 1 && zones[0].State == "Filled" && zones[0].EndBar == 19, "filled at the far edge");
+
+		zones = Zones(RunHistorical(Through(100.5m), i => i.FvgFill = FvgReactionLiquiditySweep.FvgFillRule.CloseBeyond));
+		Check(zones.Count == 1 && zones[0].State == "Active", "close-beyond rule: a wick to the edge is not a fill");
+
+		zones = Zones(RunHistorical(Through(101.5m), i => i.FvgFill = FvgReactionLiquiditySweep.FvgFillRule.Middle));
+		Check(zones.Count == 1 && zones[0].State == "Filled", "middle rule: reaching 101.5 fills it");
+
+		zones = Zones(RunHistorical(Through(101.75m), i => i.FvgFill = FvgReactionLiquiditySweep.FvgFillRule.Middle));
+		Check(zones.Count == 1 && zones[0].State == "Active", "middle rule: 101.75 does not");
+
+		// expired: never touched, older than Zone Max Age
+		var old = FvgSetup();
+		old.AddRange(Enumerable.Range(0, 12).Select(_ => Bar(104, 104.5m, 103.5m, 104)));   // 19 - 30, above the gap
+		zones = Zones(RunHistorical(old, i => i.MaxZoneAgeBars = 10));
+		Check(zones.Count == 1 && zones[0].State == "Expired" && zones[0].EndBar == 27, $"expired on bar {zones.FirstOrDefault()?.EndBar}");
 	}
 
 	private static void SweepShortSameBarRule()
@@ -606,13 +797,36 @@ internal static class Program
 		Check(Outcome(79.5m, null) == "TakeProfit", "low nearer the open -> low first -> TP");
 	}
 
+	private static void SweepPatternConfirmation()
+	{
+		// the bar sweeping the 100.5 highs is a shooting star: 1-tick body at its low, 5-tick
+		// upper wick, after a doji - so no two-candle pattern
+		var bars = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		bars.Add(Bar(100.25m, 101.5m, 100, 100));
+		bars.Add(Bar(100, 100.25m, 99.75m, 100));
+
+		var shorts = Trades(RunHistorical(bars));
+		Check(shorts.Count == 1 && !shorts[0].IsLong && shorts[0].Trigger == "Sweep" && shorts[0].CandlePatterns.SequenceEqual(new[] { "ShootingStar" })
+			&& shorts[0].Confirmations == 1, "shooting star confirms the sweep short");
+		Check(Trades(RunHistorical(bars, i => i.RequireCandlePattern = true)).Count == 1, "RequireCandlePattern keeps it");
+
+		var off = Trades(RunHistorical(bars, i => i.PatternHammer = false));
+		Check(off.Count == 1 && off[0].CandlePatterns.Count == 0 && off[0].Confirmations == 0, "without shooting stars: no confirmation");
+		Check(Trades(RunHistorical(bars, i => { i.PatternHammer = false; i.RequireCandlePattern = true; })).Count == 0,
+			"RequireCandlePattern drops the sweep without a pattern");
+
+		var sweeps = (IList)IndicatorType.GetField("_sweeps", Private).GetValue(RunHistorical(bars));
+		Check(sweeps.Count == 1 && (int)Get(sweeps[0], "Bar") == 15 && (int)Get(sweeps[0], "SwingBar") == 14 && (decimal)Get(sweeps[0], "Level") == 100.5m
+			&& !(bool)Get(sweeps[0], "SweptLows"), "the sweep line runs from the last bar at the high");
+	}
+
 	private static void BreakEvenStopAfterTrigger()
 	{
 		// BUY at 103.5: TP 123.5, SL 83.5, trigger 113.5 (+40t), break-even stop 108.5 (+20t)
 		List<IndicatorCandle> Bars()
 		{
 			var bars = FvgSetup();
-			bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));   // 19 BUY
+			bars.Add(HammerRetest());                                  // 19 BUY
 			bars.Add(Bar(103.5m, 114, 103.25m, 113.75m));              // 20 dips a tick, then runs through the trigger
 			bars.Add(Bar(113.75m, 113.75m, 108, 108.25m));             // 21 falls back through the break-even stop
 			bars.Add(Bar(108.25m, 109, 107, 108));                     // 22 forming
@@ -641,143 +855,11 @@ internal static class Program
 		Check(plain.Count == 1 && !plain[0].HasBreakEven && plain[0].Outcome == "Open", "without break-even the trade is still open");
 	}
 
-	private static void ReactedZoneIsInvalidated()
-	{
-		var bars = FvgSetup();
-		bars.Add(Bar(103, 103.75m, 101.75m, 103.5m));      // 19 reaction
-		bars.Add(Bar(103.5m, 103.5m, 102.75m, 103));        // 20 still above the zone
-		var ind = RunHistorical(bars);
-		Check(ZoneKeys(ind).Count == 1 && ZoneKeys(ind)[0].EndsWith("|False|True"), "zone reacted and is still drawn");
-
-		bars.Add(Bar(103, 103, 99.75m, 100));               // 21 closes under the 100.5 bottom
-		bars.Add(Bar(100, 100.25m, 99.75m, 100));           // 22 forming
-		ind = RunHistorical(bars);
-		Check(ZoneKeys(ind).Count == 0, "zone closed through after its reaction is removed");
-	}
-
-	private static void AbsorptionConfirmation()
-	{
-		// the FVG retest bar (19, range 101.75 - 103.75) with a footprint: thin levels
-		// everywhere plus one heavy level whose side and position vary per case
-		List<IndicatorCandle> Bars(decimal heavyPrice, bool heavyOnBid)
-		{
-			var bars = FvgSetup();
-			var retest = Bar(103, 103.75m, 101.75m, 103.5m, delta: 50);
-
-			for (var p = retest.Low; p <= retest.High; p += Tick)
-			{
-				var heavy = p == heavyPrice;
-				decimal volume = heavy ? 400 : 20;
-				var bid = heavy ? (heavyOnBid ? 340 : 60) : 10;
-				retest.Levels.Add(new PriceVolumeInfo { Price = p, Volume = volume, Bid = bid, Ask = volume - bid });
-			}
-
-			bars.Add(retest);
-			bars.Add(Bar(103.5m, 104, 103, 103.75m));
-			return bars;
-		}
-
-		var ind = RunHistorical(Bars(101.75m, heavyOnBid: true));
-		var trades = Trades(ind);
-		Check(trades.Count == 1 && trades[0].HasAbsorption && trades[0].Confirmations == 2, "sellers absorbed at the low confirm the buy");
-
-		var map = (IDictionary)IndicatorType.GetField("_absorptionByBar", Private).GetValue(ind);
-		var cells = map.Contains(19) ? (Array)Get(map[19], "Cells") : Array.Empty<object>();
-		Check(cells.Length == 1, $"exactly the heavy level is flagged, got {cells.Length}");
-
-		if (cells.Length == 1)
-		{
-			var cell = cells.GetValue(0);
-			var cellType = cell.GetType();
-			Check((decimal)cellType.GetProperty("Price").GetValue(cell) == 101.75m && !(bool)cellType.GetProperty("AskDominant").GetValue(cell),
-				"flagged cell is the bid-dominant 101.75 level");
-		}
-
-		var wrongSide = Trades(RunHistorical(Bars(101.75m, heavyOnBid: false)));
-		Check(wrongSide.Count == 1 && !wrongSide[0].HasAbsorption, "absorbed BUYING at the low does not confirm a buy");
-
-		var wrongPlace = Trades(RunHistorical(Bars(103.5m, heavyOnBid: true)));
-		Check(wrongPlace.Count == 1 && !wrongPlace[0].HasAbsorption, "absorption near the high does not confirm a buy");
-
-		var required = Trades(RunHistorical(Bars(103.5m, heavyOnBid: true), i => i.RequireAbsorption = true));
-		Check(required.Count == 0, "RequireAbsorption drops the unconfirmed buy");
-	}
-
-	private static void CandlePatternConfirmation()
-	{
-		// the FVG retest bar, once as a hammer (2-tick body at the top, 5-tick lower wick, no
-		// upper wick) and once with a 1-tick upper wick on its 8-tick range - too much for a hammer
-		List<IndicatorCandle> Bars(bool hammer)
-		{
-			var bars = FvgSetup();
-			bars.Add(hammer ? Bar(103, 103.5m, 101.75m, 103.5m, delta: 50) : Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));
-			bars.Add(Bar(103.5m, 104, 103, 103.75m));
-			return bars;
-		}
-
-		var trades = Trades(RunHistorical(Bars(true)));
-		Check(trades.Count == 1 && trades[0].CandlePatterns.SequenceEqual(new[] { "Hammer" }) && trades[0].Confirmations == 2,
-			"hammer + delta = 2 confirmations");
-
-		var plain = Trades(RunHistorical(Bars(false)));
-		Check(plain.Count == 1 && plain[0].CandlePatterns.Count == 0 && plain[0].Confirmations == 1, "no pattern, delta only");
-
-		Check(Trades(RunHistorical(Bars(false), i => i.RequireCandlePattern = true)).Count == 0, "RequireCandlePattern drops the signal without one");
-		Check(Trades(RunHistorical(Bars(true), i => i.RequireCandlePattern = true)).Count == 1, "RequireCandlePattern keeps the hammer");
-
-		var off = Trades(RunHistorical(Bars(true), i => i.PatternHammer = false));
-		Check(off.Count == 1 && off[0].CandlePatterns.Count == 0 && off[0].Confirmations == 1, "hammers switched off");
-
-		var unused = Trades(RunHistorical(Bars(true), i => i.UseCandlePatterns = false));
-		Check(unused.Count == 1 && unused[0].CandlePatterns.Count == 0 && unused[0].Confirmations == 1, "patterns switched off");
-
-		// short: the bar sweeping the 100.5 highs is a shooting star - 1-tick body at its low,
-		// 5-tick upper wick - after a doji, so no two-candle pattern
-		var sweep = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
-		sweep.Add(Bar(100.25m, 101.5m, 100, 100));
-		sweep.Add(Bar(100, 100.25m, 99.75m, 100));
-		var shorts = Trades(RunHistorical(sweep));
-		Check(shorts.Count == 1 && !shorts[0].IsLong && shorts[0].Trigger == "Sweep" && shorts[0].CandlePatterns.SequenceEqual(new[] { "ShootingStar" })
-			&& shorts[0].Confirmations == 1, "shooting star confirms the sweep short");
-
-		// the label names it, the tooltip lists it with the other confirmations
-		var ind = RunHistorical(Bars(true));
-		var chart = (FakeChart)ind.ChartInfo;
-		ind.FirstVisibleBarNumber = 0;
-		ind.LastVisibleBarNumber = 20;
-		chart.MouseLocationInfo.LastPosition = new Point(chart.GetXByBar(19, false), chart.GetYByPrice(101.75m - 2 * Tick, false) + ind.LabelOffset + 4);
-		var context = new RenderContext();
-		ind.HarnessRender(context);
-		Check(context.Strings.Any(s => s == "FVG | Hammer | conf 2/4 | n=0 | EV 0t"), "label names the pattern");
-		Check(context.Strings.Any(s => s == "Absorption no   Trend no   Delta yes   Pattern yes"), "tooltip: the four confirmations");
-		Check(context.Strings.Any(s => s == "Candlestick pattern: Hammer"), "tooltip: the pattern");
-
-		// a new-signal alert names it too
-		var live = NewIndicator(i => i.UseAlerts = true);
-		var history = FvgSetup();
-		live.Candles.AddRange(history);
-		live.HarnessRecalculate();
-
-		for (var i = 0; i < history.Count; i++)
-			live.HarnessCalculate(i);
-
-		StreamBar(live, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.5m }, delta: 50);
-		StreamBar(live, new[] { 103.5m, 104m });
-		Check(live.Alerts.Count == 1 && live.Alerts[0].StartsWith("BUY @ 103.50 (FVG, Hammer): TP 22% / BE 45% / SL 33%"),
-			$"alert names the pattern: {string.Join(" / ", live.Alerts)}");
-	}
-
 	private static void LiveBreakEvenFollowsTheTicks()
 	{
-		var ind = NewIndicator(null);
-		var history = FvgSetup();
-		ind.Candles.AddRange(history);
-		ind.HarnessRecalculate();
+		var ind = LiveIndicator(FvgSetup());
 
-		for (var i = 0; i < history.Count; i++)
-			ind.HarnessCalculate(i);
-
-		StreamBar(ind, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.25m, 103.75m, 103.5m }, delta: 50); // 19: BUY at 103.5
+		StreamBar(ind, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.25m, 103.5m }, delta: 50); // 19: hammer, BUY at 103.5
 
 		// 20: trades under the break-even stop BEFORE reaching the trigger, then holds above it -
 		// the bar's low (103.25) is below 108.5, but it came first
@@ -795,31 +877,400 @@ internal static class Program
 
 	private static void LiveSignalAppearsAfterClose()
 	{
-		var history = FvgSetup();
-		var ind = NewIndicator(null);
-		ind.Candles.AddRange(history);
-		ind.HarnessRecalculate();
+		var ind = LiveIndicator(FvgSetup(), i => i.UseAlerts = true);
 
-		for (var i = 0; i < history.Count; i++)
-			ind.HarnessCalculate(i);
-
-		// bar 19 forms tick by tick: into the zone, then back above it
-		var path19 = new[] { 103m, 102.5m, 101.75m, 102.75m, 103.25m, 103.75m, 103.5m };
-		StreamBar(ind, path19, delta: 50);
+		// bar 19 forms tick by tick: into the zone, then back above it as a hammer
+		StreamBar(ind, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.25m, 103.5m }, delta: 50);
 		Check(Series(ind, "_buySignal")[19] == 0 && Trades(ind).Count == 0, "no signal while the bar is still forming");
 
 		// first tick of bar 20 closes bar 19
 		StreamBar(ind, new[] { 103.5m, 104m, 110m, 109m });
 		Check(Series(ind, "_buySignal")[19] != 0 && Trades(ind).Count == 1, "signal appears once the bar has closed");
+		Check(ind.Alerts.Count == 1 && ind.Alerts[0].StartsWith("BUY @ 103.50 (FVG, Hammer): TP 22% / BE 45% / SL 33%"),
+			$"alert names the setup: {string.Join(" / ", ind.Alerts)}");
 
 		// bar 21 runs through TP intrabar; resolution happens on the tick, before the bar closes
 		StreamBar(ind, new[] { 109m, 118m, 123.5m });
 		var trades = Trades(ind);
 		Check(trades.Count == 1 && trades[0].Outcome == "TakeProfit" && trades[0].ExitBar == 21, "TP resolved intrabar");
 
-		var zones = (IList)IndicatorType.GetField("_zones", Private).GetValue(ind);
-		var keys = zones.Cast<object>().Select(z => $"{Get(z, "StartBar")}/{Get(z, "IsBullish")}").ToList();
+		var keys = Zones(ind).Select(z => $"{z.StartBar}/{z.IsBullish}").ToList();
 		Check(keys.Count == keys.Distinct().Count(), "no duplicate zones from intrabar recalculation");
+	}
+
+	// the retest bar with a footprint: thin levels everywhere plus one heavy level whose side
+	// and position vary per case
+	private static List<IndicatorCandle> FootprintRetest(decimal heavyPrice, bool heavyOnBid, decimal heavyVolume = 400, decimal? bidShare = null)
+	{
+		var bars = FvgSetup();
+		var retest = HammerRetest();
+
+		for (var p = retest.Low; p <= retest.High; p += Tick)
+		{
+			var heavy = p == heavyPrice;
+			var volume = heavy ? heavyVolume : 20;
+			var bid = heavy ? volume * (bidShare ?? (heavyOnBid ? 0.85m : 0.15m)) : 10;
+			retest.Levels.Add(new PriceVolumeInfo { Price = p, Volume = volume, Bid = bid, Ask = volume - bid });
+		}
+
+		bars.Add(retest);
+		bars.Add(Bar(103.5m, 104, 103, 103.75m));
+		return bars;
+	}
+
+	private static void FootprintFillConfirmation()
+	{
+		var ind = RunHistorical(FootprintRetest(101.75m, heavyOnBid: true));
+		var trades = Trades(ind);
+		Check(trades.Count == 1 && trades[0].FillConfirms && trades[0].Confirmations == 3, "sellers filled into bids at the low confirm the buy");
+
+		var fills = Fills(ind);
+		Check(fills.Count == 1 && fills[0].Bar == 19 && fills[0].Price == 101.75m && fills[0].Volume == 400 && fills[0].BidsFilled && fills[0].FromFootprint,
+			"the heavy level is the bar's big fill");
+		Check(fills.Count == 1 && fills[0].Reaction == 1 && fills[0].ReactionBar == 19 && fills[0].ReactionPatterns.SequenceEqual(new[] { "Hammer" }),
+			"the hammer is the bullish reaction to it, on the fill bar itself");
+
+		var wrongSide = RunHistorical(FootprintRetest(101.75m, heavyOnBid: false));
+		Check(Trades(wrongSide).Single().FillConfirms == false, "offers filled at the low do not confirm a buy");
+		var offerFill = Fills(wrongSide).Single();
+		Check(!offerFill.BidsFilled && offerFill.Reaction == 0 && !offerFill.Decided,
+			"filled offers mean a rally into them: the hammer shape does not read bullish there, the window is still open");
+
+		var wrongPlace = Trades(RunHistorical(FootprintRetest(103.5m, heavyOnBid: true)));
+		Check(wrongPlace.Count == 1 && !wrongPlace[0].FillConfirms, "a fill near the high does not confirm a buy");
+
+		Check(Trades(RunHistorical(FootprintRetest(103.5m, heavyOnBid: true), i => i.RequireFillConfirmation = true)).Count == 0,
+			"RequireFillConfirmation drops the unconfirmed buy");
+
+		// as much sold as bought at the busiest price: read as filled bids
+		var even = Fills(RunHistorical(FootprintRetest(101.75m, true, bidShare: 0.5m))).Single();
+		Check(even.BidsFilled && even.Reaction == 1, "an even split counts as filled bids");
+
+		// thresholds: 8 levels, the heavy one plus 7 x 20 - with 150 the average is 36.25, so
+		// 3x the average (108.75) is under the 150 minimum and the minimum decides
+		Check(Fills(RunHistorical(FootprintRetest(101.75m, true), i => i.FillMinVolume = 500)).Count == 0, "under Min filled volume: no fill");
+		Check(Fills(RunHistorical(FootprintRetest(101.75m, true, heavyVolume: 150))).Count == 1, "exactly the minimum counts");
+		Check(Fills(RunHistorical(FootprintRetest(101.75m, true, heavyVolume: 140))).Count == 0, "just under it does not");
+		Check(Fills(RunHistorical(FootprintRetest(101.75m, true, heavyVolume: 150), i => i.FillVolumeMultiplier = 5)).Count == 0,
+			"5x the average (181.25) is more than 150");
+	}
+
+	private static void FillReactionSignal()
+	{
+		// a quiet market, then a bearish bar whose low fills a heavy bid, then the reaction bar
+		List<IndicatorCandle> Bars(params IndicatorCandle[] after)
+		{
+			var bars = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+			var fillBar = Bar(100, 100.5m, 99.75m, 99.75m);                              // 15
+			fillBar.Levels.Add(new PriceVolumeInfo { Price = 99.75m, Volume = 400, Bid = 340, Ask = 60 });
+
+			foreach (var p in new[] { 100m, 100.25m, 100.5m })
+				fillBar.Levels.Add(new PriceVolumeInfo { Price = p, Volume = 20, Bid = 10, Ask = 10 });
+
+			bars.Add(fillBar);
+			bars.AddRange(after);
+			bars.Add(Bar(100.25m, 100.5m, 100, 100.25m));                                 // forming
+			return bars;
+		}
+
+		// 16: bullish engulfing (and tweezer bottom) closing above the fill
+		var engulfing = Bars(Bar(99.75m, 100.5m, 99.75m, 100.25m, delta: 20));
+		var ind = RunHistorical(engulfing);
+		var trades = Trades(ind);
+		Check(trades.Count == 1 && trades[0].IsLong && trades[0].EntryBar == 16 && trades[0].Trigger == "Fill", $"BUY from the fill reaction ({trades.Count})");
+
+		if (trades.Count == 1)
+		{
+			Check(trades[0].CandlePatterns.SequenceEqual(new[] { "BullishEngulfing", "TweezerBottom" }), $"[{string.Join(",", trades[0].CandlePatterns)}]");
+			Check(trades[0].FillConfirms && trades[0].DeltaConfirms && trades[0].Confirmations == 3, "delta, order flow and pattern");
+			Check(trades[0].FillPrice == 99.75m && trades[0].FillVolume == 400, "the fill it reacted to");
+		}
+
+		var fill = Fills(ind).Single();
+		Check(fill.Bar == 15 && fill.BidsFilled && fill.Reaction == 1 && fill.ReactionBar == 16 && fill.SignalShown && fill.Decided,
+			"bullish reaction on the bar after the fill");
+
+		Check(Trades(RunHistorical(engulfing, i => i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FillReactionOnly)).Count == 1,
+			"fill reactions only: the same signal");
+		Check(Trades(RunHistorical(engulfing, i => i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly)).Count == 0,
+			"FVG reactions only: none");
+
+		// no pattern in the window: no reaction once the window has closed
+		var doji = Bar(99.75m, 100, 99.5m, 99.75m);
+		ind = RunHistorical(Bars(doji, Bar(99.75m, 100, 99.5m, 99.75m), Bar(99.75m, 100, 99.5m, 99.75m)));
+		fill = Fills(ind).Single();
+		Check(fill.Reaction == 0 && fill.Decided && fill.WatchedBars == 3 && Trades(ind).Count == 0, "no clear reaction within 3 bars");
+		Check(fill.UpTicks == 1 && fill.DownTicks == 1, $"follow-through +{fill.UpTicks}t / -{fill.DownTicks}t");
+
+		ind = RunHistorical(Bars(doji, Bar(99.75m, 100, 99.5m, 99.75m)));
+		Check(!Fills(ind).Single().Decided, "still waiting with a bar of the window left");
+	}
+
+	#endregion
+
+	#region Order book
+
+	private static void OrderBookRestingOrders()
+	{
+		var ind = LiveIndicator(FvgSetup());
+		var live = ind.Candles.Count - 1;
+		var t0 = new DateTime(2026, 3, 2, 15, 0, 0);
+		ind.MarketTime = t0;
+
+		Depth(ind, true, 103.5m, 40);    // too small to follow
+		Depth(ind, true, 103m, 120);     // a big bid
+		Depth(ind, true, 101m, 200);     // a deeper big bid - the deepest level
+		Depth(ind, false, 105m, 95);     // a big offer
+		Depth(ind, false, 107m, 20);     // a small offer behind it
+		var orders = Orders(ind);
+		Check(orders.Count == 3 && orders.All(o => o.State == "Active" && o.FirstBar == live), "three resting orders of 70+, from the live bar");
+
+		// the 103 bid is hit: 80 of its 120 sold into it, then the level is gone
+		Print(ind, 103m, 50, sell: true);
+		Print(ind, 103m, 30, sell: true);
+		Depth(ind, true, 103m, 0);
+		var bid = Orders(ind).Single(o => o.Price == 103m);
+		Check(bid.State == "Filled" && bid.EndBar == live && bid.Traded == 80 && bid.MaxVolume == 120, "filled at once: 80 of 120 traded against it");
+		Check(Fills(ind).Count == 0, "80 traded is under Min filled volume: its band ends, no bubble of its own");
+
+		// buys at 105 do not fill a bid; the offer leaves without prints of its own
+		Print(ind, 105m, 30, sell: true);
+		Depth(ind, false, 105m, 0);
+		Check(Orders(ind).Single(o => o.Price == 105m).Leaving, "leaving, waiting for its prints");
+		ind.MarketTime = t0.AddSeconds(1);
+		Print(ind, 104m, 1, sell: false);
+		Check(Orders(ind).Single(o => o.Price == 105m).State == "Active", "not decided within the 2 seconds");
+		ind.MarketTime = t0.AddSeconds(3);
+		Print(ind, 104m, 1, sell: false);
+		Check(Orders(ind).Single(o => o.Price == 105m).State == "Pulled", "pulled: no buys against it in 2 seconds");
+
+		// the book reports a level gone before its prints arrive
+		Depth(ind, false, 106m, 150);
+		Depth(ind, false, 106m, 0);
+		ind.MarketTime = t0.AddSeconds(3.5);
+		Print(ind, 106m, 100, sell: false);
+		Check(Orders(ind).Single(o => o.Price == 106m).State == "Filled", "late prints still make it a fill");
+
+		// a fill of its own takes Min filled volume (150) traded against the order
+		Depth(ind, false, 106.25m, 200);
+		Print(ind, 106.25m, 149, sell: false);
+		Depth(ind, false, 106.25m, 0);
+		Depth(ind, false, 106.5m, 200);
+		Print(ind, 106.5m, 150, sell: false);
+		Depth(ind, false, 106.5m, 0);
+		var fills = Fills(ind);
+		Check(Orders(ind).Count(o => (o.Price == 106.25m || o.Price == 106.5m) && o.State == "Filled") == 2
+			&& fills.Count == 1 && fills[0].Price == 106.5m && fills[0].Volume == 150 && fills[0].RestingSize == 200 && !fills[0].BidsFilled
+			&& !fills[0].FromFootprint && fills[0].Bar == live,
+			"149 traded is no fill of its own, 150 is");
+
+		// the deepest bid leaving the book scrolled out of view
+		Depth(ind, true, 101m, 0);
+		ind.MarketTime = t0.AddSeconds(6);
+		Print(ind, 104m, 1, sell: false);
+		Check(Orders(ind).Single(o => o.Price == 101m).State == "OutOfView", "out of view, not pulled");
+
+		// dips under the size and comes back before it is settled: the same order
+		Depth(ind, true, 102.5m, 90);
+		Depth(ind, true, 102.5m, 30);
+		Check(Orders(ind).Single(o => o.Price == 102.5m).Leaving, "under the size: leaving");
+		Depth(ind, true, 102.5m, 110);
+		var back = Orders(ind).Single(o => o.Price == 102.5m);
+		Check(back.State == "Active" && !back.Leaving && back.MaxVolume == 110 && back.Volume == 110 && back.EndBar == -1, "back in time: still resting");
+
+		// resting orders stay in the book across bars
+		StreamBar(ind, new[] { 104m, 104.25m });
+		Check(Orders(ind).Single(o => o.Price == 102.5m).FirstBar == live, "first seen on its own bar");
+
+		// a new chart calculation reloads the book from its snapshot
+		ind.Depth.Levels.Add(new MarketDataArg { Price = 102m, Volume = 130, DataType = MarketDataType.Bid });
+		ind.Depth.Levels.Add(new MarketDataArg { Price = 102.25m, Volume = 20, DataType = MarketDataType.Bid });
+		ind.Depth.Levels.Add(new MarketDataArg { Price = 104.5m, Volume = 75, DataType = MarketDataType.Ask });
+		Recalculate(ind);
+		orders = Orders(ind);
+		Check(orders.Count == 2 && orders.All(o => o.State == "Active" && o.FirstBar == ind.Candles.Count - 1)
+			&& orders.Any(o => o.IsBid && o.Price == 102m && o.Volume == 130) && orders.Any(o => !o.IsBid && o.Price == 104.5m), "reloaded from the snapshot");
+
+		// a higher minimum follows fewer orders
+		ind.RestingOrderMin = 100;
+		Recalculate(ind);
+		Check(Orders(ind).Select(o => o.Price).SequenceEqual(new[] { 102m }), "only the 130 bid is 100+");
+	}
+
+	private static void OrderBookFillReaction()
+	{
+		var history = Enumerable.Range(0, 17).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		var ind = LiveIndicator(history);
+		var t0 = new DateTime(2026, 3, 2, 15, 0, 0);
+		ind.MarketTime = t0;
+
+		// bar 17: a 200-lot bid at 99.5 is sold into and filled, and the bar closes as a hammer
+		var candle = new IndicatorCandle { Open = 100, High = 100, Low = 100, Close = 100, Time = DateTime.MinValue };
+		ind.Candles.Add(candle);
+		AddTick(ind, candle, 100m);
+		Depth(ind, true, 99.25m, 40);
+		Depth(ind, true, 99.5m, 200);
+		AddTick(ind, candle, 99.75m);
+		AddTick(ind, candle, 99.5m);
+		Print(ind, 99.5m, 180, sell: true);
+		Depth(ind, true, 99.5m, 0);
+		AddTick(ind, candle, 100m);
+		AddTick(ind, candle, 100.25m);
+
+		var fills = Fills(ind);
+		Check(fills.Count == 1 && fills[0].Bar == 17 && !fills[0].FromFootprint && fills[0].RestingSize == 200 && fills[0].Volume == 180,
+			"the order book saw the bid filled");
+
+		// the footprint of bar 17 has its biggest level right there
+		candle.Levels.Add(new PriceVolumeInfo { Price = 99.5m, Volume = 200, Bid = 180, Ask = 20 });
+
+		foreach (var p in new[] { 99.75m, 100m, 100.25m })
+			candle.Levels.Add(new PriceVolumeInfo { Price = p, Volume = 20, Bid = 10, Ask = 10 });
+
+		StreamBar(ind, new[] { 100.25m, 100.5m });   // bar 18 closes bar 17
+		fills = Fills(ind);
+		Check(fills.Count == 1 && fills[0].FromFootprint && fills[0].RestingSize == 200 && fills[0].Volume == 200, "one fill: footprint and order book agree");
+		Check(fills[0].Reaction == 1 && fills[0].ReactionBar == 17 && fills[0].ReactionPatterns.SequenceEqual(new[] { "Hammer" }), "hammer: bullish reaction");
+
+		var trades = Trades(ind);
+		Check(trades.Count == 1 && trades[0].IsLong && trades[0].EntryBar == 17 && trades[0].Trigger == "Fill", "the footprint fill's reaction is a BUY");
+
+		// bar 19: an order-book fill away from the footprint's biggest level stays a fill of its
+		// own - shown, but no signal (history has no order book to repeat it)
+		ind.MarketTime = t0.AddSeconds(10);
+		Depth(ind, false, 101m, 200);
+		var bar19 = new IndicatorCandle { Open = 100.5m, High = 100.5m, Low = 100.5m, Close = 100.5m, Time = DateTime.MinValue };
+		ind.Candles.Add(bar19);
+		AddTick(ind, bar19, 100.75m);
+		AddTick(ind, bar19, 101m);
+		Print(ind, 101m, 160, sell: false);
+		Depth(ind, false, 101m, 0);
+		AddTick(ind, bar19, 100.75m);
+		fills = Fills(ind);
+		Check(fills.Count == 2 && !fills[1].FromFootprint && !fills[1].BidsFilled && fills[1].RestingSize == 200 && fills[1].Bar == 19, "offer filled at 101");
+
+		// a filled order with less than Min filled volume traded against it only ends its band
+		Depth(ind, true, 100.5m, 90);
+		AddTick(ind, bar19, 100.5m);
+		Print(ind, 100.5m, 60, sell: true);
+		Depth(ind, true, 100.5m, 0);
+		Check(Fills(ind).Count == 2 && Orders(ind).Single(o => o.Price == 100.5m).State == "Filled", "a 90-lot filled with 60 traded is no bubble of its own");
+		AddTick(ind, bar19, 100.75m);
+
+		// its bar closes (as a shooting star) before the late prints arrive: the fill still gets
+		// its reaction read from it
+		ind.MarketTime = t0.AddSeconds(20);
+		Depth(ind, false, 101.25m, 200);
+		StreamBar(ind, new[] { 100.75m, 101m, 101.25m, 100.5m });            // bar 20 closes bar 19
+		Depth(ind, false, 101.25m, 0);
+		StreamBar(ind, new[] { 100.5m, 100.25m });                           // bar 21 closes bar 20 while it waits
+		ind.MarketTime = t0.AddSeconds(21);
+		Print(ind, 101.25m, 170, sell: false);
+		var late = Fills(ind).SingleOrDefault(f => f.Price == 101.25m);
+		Check(late != null && late.Bar == 20 && late.Reaction == -1 && late.ReactionBar == 20
+			&& late.ReactionPatterns.SequenceEqual(new[] { "ShootingStar", "TweezerTop" }),
+			"a late fill catches up on the bar that closed meanwhile");
+		Check(Trades(ind).Count(t => t.Trigger == "Fill") == 1, "order-book fills never make signals");
+	}
+
+	// A resting order filled at the price of the bar's big fill merges with it only when it is
+	// the side the footprint says was filled, whichever of the two is seen first
+	private static void OrderBookFillSides()
+	{
+		var history = Enumerable.Range(0, 17).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		var ind = LiveIndicator(history);
+		ind.MarketTime = new DateTime(2026, 3, 2, 15, 0, 0);
+
+		// the heaviest price of a bar at 99.5 - 100.5, where sellers hit the bids hardest
+		void HeavyAt(IndicatorCandle candle, decimal price)
+		{
+			for (var p = 99.5m; p <= 100.5m; p += Tick)
+			{
+				candle.Levels.Add(p == price
+					? new PriceVolumeInfo { Price = p, Volume = 500, Bid = 330, Ask = 170 }
+					: new PriceVolumeInfo { Price = p, Volume = 20, Bid = 10, Ask = 10 });
+			}
+		}
+
+		IndicatorCandle NewBar(decimal open)
+		{
+			var candle = new IndicatorCandle { Open = open, High = open, Low = open, Close = open, Time = DateTime.MinValue };
+			ind.Candles.Add(candle);
+			AddTick(ind, candle, open);
+			return candle;
+		}
+
+		// bar 17: a 200-lot offer at 100.25 is lifted while the bar trades (seen first), then the
+		// footprint of the closed bar says bids were filled there
+		var bar17 = NewBar(100);
+		Depth(ind, false, 100.5m, 20);
+		Depth(ind, false, 100.25m, 200);
+		AddTick(ind, bar17, 100.25m);
+		Print(ind, 100.25m, 160, sell: false);
+		Depth(ind, false, 100.25m, 0);
+
+		foreach (var p in new[] { 99.5m, 100.5m, 100m })
+			AddTick(ind, bar17, p);
+
+		HeavyAt(bar17, 100.25m);
+		StreamBar(ind, new[] { 100m, 100.25m });   // bar 18 closes bar 17
+		var fills = Fills(ind).Where(f => f.Bar == 17).ToList();
+		Check(fills.Count == 2
+			&& fills.Any(f => !f.FromFootprint && !f.BidsFilled && f.RestingSize == 200 && f.Volume == 160)
+			&& fills.Any(f => f.FromFootprint && f.BidsFilled && f.RestingSize == 0 && f.Volume == 500),
+			"an offer filled where the footprint says bids were filled stays a fill of its own");
+
+		// bar 19: the same, but the prints that fill the offer arrive after the bar has closed
+		// (the footprint fill is seen first)
+		var bar19 = NewBar(100.25m);                // closes bar 18
+		Depth(ind, false, 100.25m, 200);
+
+		foreach (var p in new[] { 99.5m, 100.5m, 100.25m })
+			AddTick(ind, bar19, p);
+
+		Depth(ind, false, 100.25m, 0);
+		HeavyAt(bar19, 100.25m);
+		StreamBar(ind, new[] { 100.25m, 100m });   // bar 20 closes bar 19
+		Print(ind, 100.25m, 160, sell: false);
+		fills = Fills(ind).Where(f => f.Bar == 19).ToList();
+		Check(fills.Count == 2
+			&& fills.Any(f => !f.FromFootprint && !f.BidsFilled && f.RestingSize == 200)
+			&& fills.Any(f => f.FromFootprint && f.BidsFilled && f.RestingSize == 0),
+			"a late offer fill does not mark the footprint's bid fill");
+
+		// bar 21: a 200-lot bid at 100 whose prints arrive after the close marks the footprint's
+		// bid fill at 100 instead of adding a second one
+		var bar21 = NewBar(100);                    // closes bar 20
+		Depth(ind, true, 99.75m, 20);
+		Depth(ind, true, 100m, 200);
+
+		foreach (var p in new[] { 99.5m, 100.5m, 100m })
+			AddTick(ind, bar21, p);
+
+		Depth(ind, true, 100m, 0);
+		HeavyAt(bar21, 100m);
+		StreamBar(ind, new[] { 100m, 100.25m });   // bar 22 closes bar 21
+		Print(ind, 100m, 160, sell: true);
+		fills = Fills(ind).Where(f => f.Bar == 21).ToList();
+		Check(fills.Count == 1 && fills[0].FromFootprint && fills[0].BidsFilled && fills[0].RestingSize == 200,
+			$"a late bid fill marks the footprint's bid fill ({fills.Count} fills)");
+
+		// bar 23: a 90-lot bid filled with only 60 traded is no fill of its own, but it still
+		// marks the footprint's bid fill at its price when the bar closes
+		var bar23 = NewBar(100);                    // closes bar 22
+		Depth(ind, true, 100m, 90);
+
+		foreach (var p in new[] { 99.5m, 100.5m, 100m })
+			AddTick(ind, bar23, p);
+
+		Print(ind, 100m, 60, sell: true);
+		Depth(ind, true, 100m, 0);
+		Check(!Fills(ind).Any(f => f.Bar == 23), "no bubble for a small filled order");
+		HeavyAt(bar23, 100m);
+		StreamBar(ind, new[] { 100m, 100.25m });   // bar 24 closes bar 23
+		fills = Fills(ind).Where(f => f.Bar == 23).ToList();
+		Check(fills.Count == 1 && fills[0].FromFootprint && fills[0].RestingSize == 90, "the small filled bid marks the footprint fill");
+		Check(Orders(ind).Count(o => o.State == "Filled") == 4, "all four orders were filled");
 	}
 
 	#endregion
@@ -841,10 +1292,10 @@ internal static class Program
 
 		var patterns = VerifyPatternsOnEveryBar(ind, market.Candles);
 
-		// with the default shapes the market has every pattern of the cheat sheet somewhere
+		// with the default shapes the market has every pattern somewhere
 		if (configure == null)
 		{
-			var missing = BearishTwin.Keys.Concat(BearishTwin.Values).Where(n => !patterns.ContainsKey(n)).ToList();
+			var missing = PatternStrength.Where(n => !patterns.ContainsKey(n)).ToList();
 			Check(missing.Count == 0, $"fuzz market never shows {string.Join(", ", missing)}");
 		}
 	}
@@ -882,7 +1333,8 @@ internal static class Program
 
 		var historical = RunHistorical(market.Candles, null, market.SessionStarts);
 
-		// same market, but only the first 2500 bars are loaded; the rest streams in tick by tick
+		// same market, but only the first 2500 bars are loaded; the rest streams in tick by tick,
+		// with a made-up order book trading around it
 		var live = NewIndicator(i =>
 		{
 			i.UseAlerts = true;
@@ -900,13 +1352,16 @@ internal static class Program
 
 		Check(live.Alerts.Count == 0, "no alerts while loading history");
 
+		var book = new BookSimulator(live, seed: 3, start: new DateTime(2026, 3, 9, 14, 30, 0));
+
 		for (var b = historyBars; b < market.Candles.Count; b++)
-			StreamBar(live, market.Paths[b], market.Candles[b].Delta, market.Candles[b].Levels);
+			StreamBar(live, market.Paths[b], market.Candles[b].Delta, market.Candles[b].Levels, book);
 
 		var liveTrades = Trades(live);
 		var histTrades = Trades(historical);
 
-		// signal decisions only use closed bars, so the tracked signals must be identical
+		// signal decisions only use closed bars (and never the order book), so the tracked
+		// signals must be identical
 		var liveKeys = liveTrades.Select(SignalKey).ToList();
 		var histKeys = histTrades.Select(SignalKey).ToList();
 		Check(liveKeys.SequenceEqual(histKeys), $"live stream produced different signals ({liveKeys.Count} vs {histKeys.Count})");
@@ -915,9 +1370,15 @@ internal static class Program
 		var histZones = ZoneKeys(historical);
 		Check(liveZones.SequenceEqual(histZones), "live stream produced different FVG zones");
 
+		string FillKey(FillView f) => $"{f.Bar}|{f.Price}|{f.Volume}|{f.BidsFilled}|{f.Reaction}|{f.ReactionBar}|{string.Join(",", f.ReactionPatterns)}";
+		var liveFills = Fills(live).Where(f => f.FromFootprint).Select(FillKey).ToList();
+		var histFills = Fills(historical).Select(FillKey).ToList();
+		Check(liveFills.SequenceEqual(histFills), $"live stream produced different footprint fills ({liveFills.Count} vs {histFills.Count})");
+
 		VerifyOutcomes(live, market, liveTrades, liveFromBar: historyBars);
 		VerifyInvariants(live, liveTrades, market.Candles.Count);
 		VerifySignalsAgainstOracle(live, market, liveTrades);
+		book.Verify(live);
 
 		// alerts: every shown signal and result that happened after the history load, nothing else
 		var expectedSignals = liveTrades.Count(t => t.IsShown && t.EntryBar >= historyBars - 1);
@@ -937,14 +1398,12 @@ internal static class Program
 		var market = Generate(3000, 31);
 		var ind = RunHistorical(market.Candles, null, market.SessionStarts);
 		var first = Trades(ind).Select(t => SignalKey(t) + $"|{t.Outcome}|{t.ExitBar}|{t.IsShown}|{t.TakeProfit:R}").ToList();
+		var firstZones = ZoneKeys(ind);
 
-		ind.HarnessRecalculate();
-
-		for (var i = 0; i < market.Candles.Count; i++)
-			ind.HarnessCalculate(i);
+		Recalculate(ind);
 
 		var second = Trades(ind).Select(t => SignalKey(t) + $"|{t.Outcome}|{t.ExitBar}|{t.IsShown}|{t.TakeProfit:R}").ToList();
-		Check(first.SequenceEqual(second), "recalculation changed the results");
+		Check(first.SequenceEqual(second) && firstZones.SequenceEqual(ZoneKeys(ind)), "recalculation changed the results");
 
 		// re-sending an already closed bar must not touch it
 		var signalBar = Trades(ind).Last(t => t.IsShown).EntryBar;
@@ -962,62 +1421,118 @@ internal static class Program
 		var chart = (FakeChart)ind.ChartInfo;
 		var trades = Trades(ind);
 		var last = market.Candles.Count - 1;
+		var first = last - 400;
 
-		ind.FirstVisibleBarNumber = last - 400;
+		ind.FirstVisibleBarNumber = first;
 		ind.LastVisibleBarNumber = last;
-		chart.FirstBar = ind.FirstVisibleBarNumber;
-		chart.TopPrice = market.Candles.Skip(last - 400).Max(c => c.High) + 40;
+		chart.FirstBar = first;
+		chart.TopPrice = market.Candles.Skip(first).Max(c => c.High) + 40;
 
+		ind.ShowReactionLabels = true;
 		var context = new RenderContext();
 		ind.HarnessRender(context);
 
-		var visibleShown = trades.Where(t => t.IsShown && t.EntryBar >= ind.FirstVisibleBarNumber).ToList();
-		Check(visibleShown.Count > 0, "render test needs visible signals");
-		Check(context.Strings.Count(s => s.StartsWith("BUY  TP ") || s.StartsWith("SHORT  TP ")) == visibleShown.Count,
-			"one probability label per visible signal");
-		Check(context.Strings.Any(s => s.StartsWith("FVG / Sweep signals")), "stats panel drawn");
-		Check(context.Strings.Any(s => s.StartsWith("Labelled EV>0: ") && s.Contains("EV<=0: ")), "track record line drawn");
-		Check(context.Strings.Any(s => s.StartsWith("Longs ") && s.Contains(" BE ")), "panel rows count break-even exits");
-		Check(context.Rectangles > 0 && context.Lines > 0, "levels and boxes drawn");
+		var visibleShown = trades.Where(t => t.IsShown && t.EntryBar >= first).OrderBy(t => t.EntryBar).ToList();
+		Check(visibleShown.Count(t => t.Outcome != "Open") > 3, "render test needs visible closed signals");
 
-		// labels read "BUY  TP x% | BE y% | SL z%" and the three add up to 100
-		var labels = context.Strings.Where(s => s.StartsWith("BUY  TP ") || s.StartsWith("SHORT  TP ")).ToList();
-		Check(labels.All(l => l.Contains("% | BE ") && l.Split('%').Take(3).Sum(part => int.Parse(new string(part.Reverse().TakeWhile(char.IsDigit).Reverse().ToArray()))) == 100),
-			"label odds add up to 100%");
-		Check(context.Strings.Any(s => s.Contains(" | EV ")), "labels show expected ticks");
-
-		// second label line: trigger | first pattern (+ how many more) | conf x/4 | n | EV,
-		// labels drawn left to right
-		var patternType = IndicatorType.GetNestedType("CandlePattern", BindingFlags.NonPublic);
-		var namesOf = IndicatorType.GetMethod("PatternNames", PrivateStatic);
-		var triggerNames = new Dictionary<string, string> { ["Fvg"] = "FVG", ["Sweep"] = "Sweep", ["SweepThenFvg"] = "Sweep+FVG" };
-
-		string SetupLine(TradeView t)
+		// every card, left to right: side, setup, odds and EV
+		List<(string Side, string Setup, string Odds)> Cards(RenderContext drawn)
 		{
-			var names = (List<string>)namesOf.Invoke(null, new[] { Enum.Parse(patternType, t.CandlePatterns.Count == 0 ? "None" : string.Join(", ", t.CandlePatterns)) });
-			var pattern = names.Count == 0 ? "" : names.Count == 1 ? $" | {names[0]}" : $" | {names[0]} +{names.Count - 1}";
-			var ev = (int)Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero);
-			return $"{triggerNames[t.Trigger]}{pattern} | conf {t.Confirmations}/4 | n={t.Setup.Count} | EV {ev.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t";
+			var found = new List<(string Side, string Setup, string Odds)>();
+
+			for (var i = 0; i + 2 < drawn.Strings.Count; i++)
+			{
+				if (drawn.Strings[i] == "BUY" || drawn.Strings[i] == "SHORT")
+					found.Add((drawn.Strings[i], drawn.Strings[i + 1], drawn.Strings[i + 2]));
+			}
+
+			return found;
 		}
 
-		var setupLines = context.Strings.Where(s => s.Contains(" | conf ")).ToList();
-		var expectedLines = visibleShown.OrderBy(t => t.EntryBar).Select(SetupLine).ToList();
-		Check(setupLines.SequenceEqual(expectedLines), $"label setup lines differ, first: {setupLines.FirstOrDefault()} vs {expectedLines.FirstOrDefault()}");
+		(string, string, string) CardOf(TradeView t) => (t.IsLong ? "BUY" : "SHORT", SetupTextOf(t), OddsLineOf(t));
+
+		// by default only the open trade keeps its card; the others shrink to their result
+		var cards = Cards(context);
+		var expectedCards = visibleShown.Where(t => t.Outcome == "Open").Select(CardOf).ToList();
+		Check(cards.SequenceEqual(expectedCards), $"cards differ, first drawn: {cards.FirstOrDefault()} vs {expectedCards.FirstOrDefault()}");
+
+		var chips = context.Strings.Where(t => System.Text.RegularExpressions.Regex.IsMatch(t, @"^(TP|BE|SL|EXP) [+-]?\d+t$")).ToList();
+		var expectedChips = visibleShown.Where(t => t.Outcome != "Open").Select(ResultChipOf).ToList();
+		Check(chips.SequenceEqual(expectedChips), $"result chips differ: {string.Join(" ", chips.Take(5))} vs {string.Join(" ", expectedChips.Take(5))}");
+
+		// closed trades only leave a faint box: TP side and SL side
+		var closedInView = trades.Count(t => t.IsShown && t.Outcome != "Open" && t.EntryBar <= last && t.ExitBar >= first);
+		Check(context.Operations.Count(o => o.Kind == "fill" && o.Color.A == 14) == 2 * closedInView, "faint boxes for the closed trades");
+		Check(context.Operations.Count(o => o.Kind == "fill" && o.Color.A == 30) == 2 * visibleShown.Count(t => t.Outcome == "Open"),
+			"full boxes for the open trade");
+		Check(!context.Operations.Any(o => o.Kind == "line" && o.Dashed && o.Color.A == 160),
+			"entry and trigger lines only for the open trade");
+		var movedClosed = trades.Count(t => t.IsShown && t.Outcome != "Open" && t.BreakEvenActive && t.EntryBar <= last && t.ExitBar >= first);
+		Check(movedClosed > 0 && context.Operations.Count(o => o.Kind == "line" && o.Color.R == 255 && o.Color.G == 179 && o.Color.B == 0 && o.Color.A == 90)
+			== movedClosed, "closed trades keep a faint break-even line");
+
+		var defaults = NewIndicator(null);
+		Check(defaults.CompactClosedLabels && !defaults.ShowReactionLabels && !defaults.ShowUsedZones && defaults.ShowZoneMidline,
+			"the clean defaults: compact closed labels, no reaction labels, no retired zones");
+
+		// every card when closed trades keep theirs
+		ind.CompactClosedLabels = false;
+		var full = new RenderContext();
+		ind.HarnessRender(full);
+		ind.CompactClosedLabels = true;
+		expectedCards = visibleShown.Select(CardOf).ToList();
+		Check(Cards(full).SequenceEqual(expectedCards), $"full cards differ, first drawn: {Cards(full).FirstOrDefault()} vs {expectedCards.FirstOrDefault()}");
 		Check(visibleShown.Any(t => t.CandlePatterns.Count == 1) && visibleShown.Any(t => t.CandlePatterns.Count > 1),
-			"render test needs labels with one and with several patterns");
+			"render test needs cards with one and with several patterns");
 
-		// an activated trade draws its break-even stop line in the break-even color
-		var moved = visibleShown.FirstOrDefault(t => t.BreakEvenActive);
+		// the panel
+		Check(context.Strings.Contains("FVG · Sweep · Fill signals   TP 80t · SL 80t · BE +40t → +20t"), "panel title");
+		Check(new[] { "Longs", "Shorts", "Total" }.All(context.Strings.Contains), "panel rows");
+		Check(context.Strings.Any(s => s.StartsWith("Labelled EV>0: ") && s.Contains("EV≤0: ")), "track record line");
+		var fills = Fills(ind);
+		Check(context.Strings.Contains($"Fills {fills.Count}: {fills.Count(f => f.Reaction > 0)} bullish · {fills.Count(f => f.Reaction < 0)} bearish reactions"),
+			"fills line");
+		Check(context.Strings.Contains("Resting ≥70: 0 bids · 0 offers"), "no order book in history");
 
-		if (moved != null)
-		{
-			var yBreakEven = chart.GetYByPrice(moved.BreakEvenPrice, false);
-			var beColor = ind.BreakEvenPen.RenderObject.Color;
-			Check(context.Operations.Any(o => o.Kind == "line" && o.From.Y == yBreakEven && o.Color.ToArgb() == beColor.ToArgb()), "break-even stop line drawn");
-		}
+		// one bubble per visible fill, one dot per visible sweep, one triangle per visible reaction
+		// that did not become a card
+		// (solid once the reaction window is over, faint while it is open)
+		var visibleFills = fills.Where(f => f.Bar >= first && f.Bar <= last).ToList();
+		var decidedBubbles = context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 150);
+		var pendingBubbles = context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 70);
+		Check(visibleFills.Count > 0 && decidedBubbles == visibleFills.Count(f => f.Decided) && pendingBubbles == visibleFills.Count(f => !f.Decided),
+			$"{decidedBubbles} + {pendingBubbles} bubbles for {visibleFills.Count} fills");
 
-		// hover the first visible label (drawn first, so never nudged) -> tooltip
-		var target = visibleShown.OrderBy(t => t.EntryBar).First();
+		var sweeps = (IList)IndicatorType.GetField("_sweeps", Private).GetValue(ind);
+		var visibleSweeps = sweeps.Cast<object>().Where(s => (int)Get(s, "Bar") >= first && (int)Get(s, "SwingBar") <= last).ToList();
+		var dots = context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 230);
+		Check(visibleSweeps.Count > 0 && dots == visibleSweeps.Count, $"{dots} sweep dots for {visibleSweeps.Count} sweeps");
+		Check(visibleSweeps.All(sw => context.Operations.Any(o => o.Kind == "line" && o.Dashed
+				&& o.From.X == chart.GetXByBar((int)Get(sw, "SwingBar"), false) && o.To.X == chart.GetXByBar((int)Get(sw, "Bar"), false)
+				&& o.From.Y == chart.GetYByPrice((decimal)Get(sw, "Level"), false))),
+			"each sweep line runs from the swing to the sweep bar");
+
+		var reactions = Zones(ind).Where(z => z.State == "Used" && !z.SignalShown && z.EndBar >= first && z.EndBar <= last).ToList();
+		var triangles = context.Operations.Count(o => o.Kind == "polygon");
+		Check(reactions.Count > 0 && triangles == reactions.Count, $"{triangles} reaction markers for {reactions.Count} reactions");
+		Check(reactions.All(z => context.Strings.Contains(PatternSummaryOf(z.ReactionPatterns))), "each reaction names its pattern");
+
+		// active zones reach the right edge; used, filled and expired ones only show when asked for
+		var active = Zones(ind).Where(z => z.State == "Active" && z.StartBar <= last).ToList();
+		var right = chart.Region.Width;
+		var reaching = context.Operations.Count(o => o.Kind == "fill" && o.Bounds.Right == right && o.Color.A == 40);
+		Check(active.Count > 0 && reaching == active.Count, $"{reaching} full-width boxes for {active.Count} live zones");
+		Check(!context.Operations.Any(o => o.Kind == "fill" && o.Color.A == 16), "no traces of retired zones by default");
+
+		var retired = Zones(ind).Count(z => z.State != "Active" && z.StartBar <= last && z.EndBar >= first);
+		ind.ShowUsedZones = true;
+		var traces = new RenderContext();
+		ind.HarnessRender(traces);
+		ind.ShowUsedZones = false;
+		Check(retired > 0 && traces.Operations.Count(o => o.Kind == "fill" && o.Color.A == 16) == retired, "a faint trace per retired zone when switched on");
+
+		// hover a card (the first one is drawn first, so never nudged) -> its tooltip
+		var target = visibleShown[0];
 		var candle = market.Candles[target.EntryBar];
 		var x = chart.GetXByBar(target.EntryBar, false);
 		var y = target.IsLong
@@ -1028,57 +1543,168 @@ internal static class Program
 		context = new RenderContext();
 		ind.HarnessRender(context);
 		Check(context.Strings.Any(s => s.StartsWith("P(TP) ") && s.Contains("P(BE) ")), "tooltip drawn on hover");
-		Check(context.Strings.Any(s => s.StartsWith("Absorption ") && s.Contains("   Pattern ")), "tooltip lists the four confirmations");
-		var patternLine = target.CandlePatterns.Count > 1 ? "Candlestick patterns: " : "Candlestick pattern: ";
-		Check(context.Strings.Any(s => s.StartsWith(patternLine)) == (target.CandlePatterns.Count > 0), "tooltip names the pattern(s) when there are any");
+		Check(context.Strings.Any(s => s.StartsWith($"Confirmations {target.Confirmations}/4: trend ")), "tooltip lists the four confirmations");
+
+		// hover a bubble (cards and reaction labels off, so nothing sits on top of it)
+		ind.ShowSignalLabels = false;
+		ind.ShowReactionLabels = false;
+		var reactionBars = new HashSet<int>(reactions.Select(z => z.EndBar));
+		var bubbleFill = visibleFills.Where(f => !reactionBars.Contains(f.Bar)).OrderByDescending(f => f.Volume).First();
+		chart.MouseLocationInfo.LastPosition = new Point(chart.GetXByBar(bubbleFill.Bar, false), chart.GetYByPrice(bubbleFill.Price, false));
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Any(s => s.EndsWith($" filled @ {bubbleFill.Price.ToString("0.00", CultureInfo.InvariantCulture)} on bar {bubbleFill.Bar}")),
+			"fill tooltip on hover");
 
 		// cluster mode + everything switched on/off still renders
+		ind.ShowSignalLabels = true;
 		chart.ChartVisualMode = ChartVisualModes.Clusters;
 		ind.ShowStatsPanel = false;
 		ind.ShowTradeLevels = false;
+		ind.ShowFills = false;
+		ind.ShowReactionLabels = false;
 		context = new RenderContext();
 		ind.HarnessRender(context);
-		Check(!context.Strings.Any(s => s.StartsWith("FVG / Sweep signals")), "panel hidden when switched off");
+		Check(!context.Strings.Any(s => s.StartsWith("FVG · Sweep · Fill signals")), "panel hidden when switched off");
+		Check(!context.Operations.Any(o => o.Kind == "ellipse" && o.Color.A == 150), "no bubbles when switched off");
 
 		// an open shown trade gets a live line in the panel
-		var openInd = NewIndicator(null);
-		var bars = FvgSetup();
-		bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));
-		bars.Add(Bar(103.5m, 108, 103, 107.5m));
-		openInd.Candles.AddRange(bars);
-		openInd.HarnessRecalculate();
-
-		for (var i = 0; i < bars.Count; i++)
-			openInd.HarnessCalculate(i);
-
+		var openBars = FvgSetup();
+		openBars.Add(HammerRetest());
+		openBars.Add(Bar(103.5m, 108, 103, 107.5m));
+		var openInd = RunHistorical(openBars);
 		openInd.FirstVisibleBarNumber = 0;
-		openInd.LastVisibleBarNumber = bars.Count - 1;
+		openInd.LastVisibleBarNumber = openBars.Count - 1;
 		((FakeChart)openInd.ChartInfo).TopPrice = 130;
 		context = new RenderContext();
 		openInd.HarnessRender(context);
-		Check(context.Strings.Any(s => s.StartsWith("Live BUY +16t:  TP ")), "live line for the open trade (+16 ticks)");
+		Check(context.Strings.Any(s => s.StartsWith("Live BUY +16t:  TP ") && s.Contains("% · BE ")), "live line for the open trade (+16 ticks)");
+		Check(Cards(context).SequenceEqual(Trades(openInd).Select(CardOf)), "the open trade keeps its full card");
+		Check(context.Operations.Count(o => o.Kind == "line" && o.Dashed && o.Color.A == 160) == 2, "the open trade's entry and trigger lines");
 		Check(context.Strings.Any(s => s.StartsWith("TP ") && s.Contains("123.50")), "TP price tag on the open trade");
 		Check(context.Strings.Any(s => s.StartsWith("SL ") && s.Contains("83.50")), "SL price tag before the stop moves");
 
 		// once +40t is reached the stop tag moves to break-even and SL odds drop to 0
-		var movedInd = NewIndicator(null);
-		bars = FvgSetup();
-		bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));
-		bars.Add(Bar(103.5m, 114.5m, 103.25m, 114.5m));
-		movedInd.Candles.AddRange(bars);
-		movedInd.HarnessRecalculate();
-
-		for (var i = 0; i < bars.Count; i++)
-			movedInd.HarnessCalculate(i);
-
+		var movedBars = FvgSetup();
+		movedBars.Add(HammerRetest());
+		movedBars.Add(Bar(103.5m, 114.5m, 103.25m, 114.5m));
+		var movedInd = RunHistorical(movedBars);
 		movedInd.FirstVisibleBarNumber = 0;
-		movedInd.LastVisibleBarNumber = bars.Count - 1;
+		movedInd.LastVisibleBarNumber = movedBars.Count - 1;
 		((FakeChart)movedInd.ChartInfo).TopPrice = 130;
 		context = new RenderContext();
 		movedInd.HarnessRender(context);
-		Check(context.Strings.Any(s => s.StartsWith("Live BUY +44t, stop +20t:  TP ") && s.EndsWith("| SL 0%")), "live line after the stop moved");
+		Check(context.Strings.Any(s => s.StartsWith("Live BUY +44t, stop +20t:  TP ") && s.EndsWith("· SL 0%")), "live line after the stop moved");
 		Check(context.Strings.Any(s => s.StartsWith("BE ") && s.Contains("108.50")), "stop tag moved to break-even");
+
+		// the open trade's price tags stay on top of the bubbles
+		var tagged = RunHistorical(FootprintRetest(101.75m, heavyOnBid: true));
+		tagged.FirstVisibleBarNumber = 0;
+		tagged.LastVisibleBarNumber = tagged.Candles.Count - 1;
+		((FakeChart)tagged.ChartInfo).TopPrice = 130;
+		context = new RenderContext();
+		tagged.HarnessRender(context);
+		var tpTag = context.Operations.FindIndex(o => o.Kind == "text" && o.Text.StartsWith("TP ") && !o.Text.Contains("%") && !o.Text.EndsWith("t"));
+		var lastBubble = context.Operations.FindLastIndex(o => o.Kind == "ellipse");
+		var card = context.Operations.FindIndex(o => o.Kind == "text" && o.Text == "BUY");
+		Check(lastBubble >= 0 && card >= 0 && tpTag > lastBubble && tpTag > card, "price tags are drawn over the bubbles and the cards");
+
+		// resting orders: bands with their size at the right edge, and a tooltip
+		var bookInd = LiveIndicator(FvgSetup());
+		bookInd.FirstVisibleBarNumber = 0;
+		bookInd.LastVisibleBarNumber = bookInd.Candles.Count - 1;
+		var bookChart = (FakeChart)bookInd.ChartInfo;
+		Depth(bookInd, true, 103m, 120);
+		Depth(bookInd, false, 106m, 95);
+		Depth(bookInd, true, 102.75m, 60);
+
+		// a filled order keeps a faint band without a tag; one still leaving the book shows nothing
+		// (both far enough from the other tags that theirs would not be skipped as overlapping)
+		bookInd.MarketTime = new DateTime(2026, 3, 2, 15, 0, 0);
+		Depth(bookInd, true, 100m, 80);
+		Print(bookInd, 100m, 80, sell: true);
+		Depth(bookInd, true, 100m, 0);
+		Depth(bookInd, false, 109m, 110);
+		Depth(bookInd, false, 109m, 0);
+		context = new RenderContext();
+		bookInd.HarnessRender(context);
+		Check(context.Strings.Contains("120") && context.Strings.Contains("95") && !context.Strings.Contains("60"), "size tags of the 70+ orders only");
+		Check(!context.Strings.Contains("80") && !context.Strings.Contains("110") && !context.Strings.Contains("0"), "no tags for filled or leaving orders");
+		Check(context.Operations.Count(o => o.Kind == "fill" && o.Color.A == 70 && o.Color.B == 245) == 1, "the filled bid keeps a faint band");
+		Check(context.Strings.Contains("Resting ≥70: 1 bids · 1 offers · largest 120 bid @ 103.00"), "panel line for the order book");
+		var tag = context.Operations.First(o => o.Kind == "fill" && o.CornerRadius == 3 && o.Bounds.Right > bookChart.Region.Width - 12);
+		bookChart.MouseLocationInfo.LastPosition = new Point(tag.Bounds.X + 2, tag.Bounds.Y + 2);
+		context = new RenderContext();
+		bookInd.HarnessRender(context);
+		Check(context.Strings.Any(s => s.StartsWith("Resting bid 120 @ 103.00") || s.StartsWith("Resting offer 95 @ 106.00")), "order tooltip on hover");
+
+		// hover a reaction marker's label
+		var reactionInd = RunHistorical(FvgBearishBars(), i =>
+		{
+			i.EnableShortSignals = false;
+			i.ShowReactionLabels = true;
+		});
+		reactionInd.FirstVisibleBarNumber = 0;
+		reactionInd.LastVisibleBarNumber = reactionInd.Candles.Count - 1;
+		var reactionChart = (FakeChart)reactionInd.ChartInfo;
+		context = new RenderContext();
+		reactionInd.HarnessRender(context);
+		var chip = context.Operations.FirstOrDefault(o => o.Kind == "text" && o.Text == "Bearish engulfing +1");
+		Check(chip != null, "an unsignalled reaction shows its pattern");
+
+		if (chip != null)
+		{
+			reactionChart.MouseLocationInfo.LastPosition = new Point(chip.From.X + 2, chip.From.Y + 2);
+			context = new RenderContext();
+			reactionInd.HarnessRender(context);
+			Check(context.Strings.Any(s => s.StartsWith("Bearish reaction on bar 20: Bearish engulfing, Tweezer top")), "reaction tooltip on hover");
+		}
 	}
+
+	// the bars of FvgBearishReactionAtBullishGap
+	private static List<IndicatorCandle> FvgBearishBars()
+	{
+		var bars = FvgSetup();
+		bars.Add(Bar(102.75m, 103.25m, 102, 103));
+		bars.Add(Bar(103, 103.25m, 100, 100.25m, delta: -30));
+		bars.Add(Bar(100.25m, 100.5m, 100, 100.25m));
+		return bars;
+	}
+
+	// "TP +80t", as the chip of a closed trade shows it
+	private static string ResultChipOf(TradeView t)
+	{
+		var badge = t.Outcome == "TakeProfit" ? "TP" : t.Outcome == "BreakEven" ? "BE" : t.Outcome == "StopLoss" ? "SL" : "EXP";
+		var ticks = (int)Math.Round((t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1), MidpointRounding.AwayFromZero);
+		return $"{badge} {ticks.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t";
+	}
+
+	// "FVG · Hammer", as a card shows it
+	private static string SetupTextOf(TradeView t)
+	{
+		var trigger = t.Trigger == "Fvg" ? "FVG" : t.Trigger == "SweepThenFvg" ? "Sweep+FVG" : t.Trigger;
+		var pattern = PatternSummaryOf(t.CandlePatterns);
+		return pattern.Length == 0 ? trigger : $"{trigger} · {pattern}";
+	}
+
+	private static string PatternSummaryOf(List<string> patterns)
+	{
+		var patternType = IndicatorType.GetNestedType("CandlePattern", BindingFlags.NonPublic);
+		var names = (List<string>)IndicatorType.GetMethod("PatternNames", PrivateStatic)
+			.Invoke(null, new[] { Enum.Parse(patternType, patterns.Count == 0 ? "None" : string.Join(", ", patterns)) });
+		return names.Count == 0 ? "" : names.Count == 1 ? names[0] : $"{names[0]} +{names.Count - 1}";
+	}
+
+	private static string OddsLineOf(TradeView t)
+	{
+		var p = LabelPercentsOf(t);
+		var ev = ((int)Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero)).ToString("+0;-0;0", CultureInfo.InvariantCulture);
+		return t.HasBreakEven ? $"TP {p[0]}%  BE {p[1]}%  SL {p[2]}%   EV {ev}t" : $"TP {p[0]}%  SL {p[1]}%   EV {ev}t";
+	}
+
+	#endregion
+
+	#region Oracles
 
 	private sealed class OracleZone
 	{
@@ -1087,18 +1713,95 @@ internal static class Program
 		public decimal Top;
 		public decimal Bottom;
 		public bool Bull;
-		public bool Filled;
-		public bool Reacted;
+		public string State = "Active";
+		public int End = -1;
+		public int LastTouch = -1;
+		public bool ReactionBull;
+		public List<string> Patterns = new List<string>();
 	}
 
-	// Re-derives every signal from the raw bars (zones, reactions, sweeps, EMA trend,
-	// delta, absorption, cooldown, filters) and checks the indicator's signals and
-	// trigger arrows against it.
+	private sealed class OracleFill
+	{
+		public int Bar;
+		public decimal Price;
+		public decimal Volume;
+		public bool BidsFilled;
+		public int Reaction;
+		public int ReactionBar = -1;
+		public List<string> Patterns = new List<string>();
+		public bool Decided;
+	}
+
+	// strongest first; twins share a rank - the order is part of the rules
+	private static readonly string[] PatternStrength =
+	{
+		"BullishThreeLineStrike", "BearishThreeLineStrike", "MorningDojiStar", "EveningDojiStar", "MorningStar", "EveningStar",
+		"ThreeOutsideUp", "ThreeOutsideDown", "ThreeWhiteSoldiers", "ThreeBlackCrows", "BullishOutsideReversal", "BearishOutsideReversal",
+		"BullishEngulfing", "BearishEngulfing", "ThreeInsideUp", "ThreeInsideDown", "PiercingLine", "DarkCloudCover",
+		"Hammer", "ShootingStar", "DragonflyDoji", "GravestoneDoji", "TweezerBottom", "TweezerTop",
+		"BullishMarubozu", "BearishMarubozu", "BullishHarami", "BearishHarami", "InvertedHammer", "HangingMan"
+	};
+
+	private static readonly Dictionary<string, int> PatternCandles = new Dictionary<string, int>
+	{
+		["BullishThreeLineStrike"] = 4, ["BearishThreeLineStrike"] = 4,
+		["MorningDojiStar"] = 3, ["EveningDojiStar"] = 3, ["MorningStar"] = 3, ["EveningStar"] = 3,
+		["ThreeOutsideUp"] = 3, ["ThreeOutsideDown"] = 3, ["ThreeWhiteSoldiers"] = 3, ["ThreeBlackCrows"] = 3,
+		["ThreeInsideUp"] = 3, ["ThreeInsideDown"] = 3,
+		["BullishOutsideReversal"] = 2, ["BearishOutsideReversal"] = 2, ["BullishEngulfing"] = 2, ["BearishEngulfing"] = 2,
+		["PiercingLine"] = 2, ["DarkCloudCover"] = 2, ["TweezerBottom"] = 2, ["TweezerTop"] = 2, ["BullishHarami"] = 2, ["BearishHarami"] = 2,
+		["Hammer"] = 1, ["ShootingStar"] = 1, ["DragonflyDoji"] = 1, ["GravestoneDoji"] = 1, ["BullishMarubozu"] = 1, ["BearishMarubozu"] = 1,
+		["InvertedHammer"] = 1, ["HangingMan"] = 1
+	};
+
+	private static int OracleRank(List<string> names)
+	{
+		return names.Count == 0 ? int.MaxValue : names.Min(n => Array.IndexOf(PatternStrength, n) / 2);
+	}
+
+	private static int OracleDecide(List<string> bull, List<string> bear)
+	{
+		var b = OracleRank(bull);
+		var s = OracleRank(bear);
+		return b < s ? 1 : s < b ? -1 : 0;
+	}
+
+	private static OracleZone BetterZone(OracleZone best, OracleZone zone)
+	{
+		if (best == null)
+			return zone;
+
+		var rank = OracleRank(zone.Patterns);
+		var bestRank = OracleRank(best.Patterns);
+		return rank < bestRank || (rank == bestRank && zone.Confirmed > best.Confirmed) ? zone : best;
+	}
+
+	private static OracleFill BetterFill(OracleFill best, OracleFill fill)
+	{
+		if (best == null)
+			return fill;
+
+		var rank = OracleRank(fill.Patterns);
+		var bestRank = OracleRank(best.Patterns);
+
+		if (rank != bestRank)
+			return rank < bestRank ? fill : best;
+
+		if (fill.Volume != best.Volume)
+			return fill.Volume > best.Volume ? fill : best;
+
+		return fill.Bar > best.Bar ? fill : best;
+	}
+
+	// Re-derives every gap, reaction, fill, sweep and signal from the raw bars and checks the
+	// indicator's against them - including the hidden trigger series.
 	private static void VerifySignalsAgainstOracle(FvgReactionLiquiditySweep ind, Market market, List<TradeView> trades)
 	{
 		var candles = market.Candles;
 		var mirrored = Mirror(candles);
 		var zones = new List<OracleZone>();
+		var fills = new List<OracleFill>();
+		var fillByBar = new Dictionary<int, OracleFill>();
 		var ema = new List<decimal>();
 		var expected = new List<string>();
 		var markers = new Dictionary<int, (bool BullReaction, bool BearReaction, bool SweptLows, bool SweptHighs)>();
@@ -1107,12 +1810,55 @@ internal static class Program
 		var lastLong = -1;
 		var lastShort = -1;
 		var minGap = Math.Max(ind.MinFvgTicks, 1) * Tick;
+		var none = new List<string>();
 
-		// the last bar is still forming, so it never produces a signal
+		List<string> P(int b, bool bullish, bool afterDecline) => OraclePatterns(ind, candles, mirrored, b, bullish, afterDecline);
+
+		// the last bar is still forming, so it is never processed
 		for (var b = 0; b < candles.Count - 1; b++)
 		{
 			var c = candles[b];
 			ema.Add(b == 0 || ind.TrendEmaPeriod <= 0 ? c.Close : ema[b - 1] + 2m / (ind.TrendEmaPeriod + 1) * (c.Close - ema[b - 1]));
+
+			// the price where the bar filled the most, if it stands out
+			if (c.Levels.Count > 0)
+			{
+				var best = c.Levels.OrderByDescending(l => l.Volume).ThenBy(l => l.Price).First();
+				var average = c.Levels.Sum(l => l.Volume) / c.Levels.Count;
+
+				if (best.Volume > 0 && best.Volume >= Math.Max(ind.FillMinVolume, (decimal)ind.FillVolumeMultiplier * average))
+				{
+					var fill = new OracleFill { Bar = b, Price = best.Price, Volume = best.Volume, BidsFilled = best.Bid >= best.Ask };
+					fills.Add(fill);
+					fillByBar[b] = fill;
+				}
+			}
+
+			// the first pattern closing away from a fill, within its window, is the reaction to it
+			OracleFill bullFill = null;
+			OracleFill bearFill = null;
+
+			foreach (var fill in fills.Where(f => !f.Decided && f.Bar <= b))
+			{
+				var bull = c.Close > fill.Price ? P(b, true, fill.BidsFilled) : none;
+				var bear = c.Close < fill.Price ? P(b, false, fill.BidsFilled) : none;
+				var reaction = OracleDecide(bull, bear);
+
+				if (reaction != 0)
+				{
+					fill.Reaction = reaction;
+					fill.ReactionBar = b;
+					fill.Patterns = reaction > 0 ? bull : bear;
+					fill.Decided = true;
+
+					if (reaction > 0)
+						bullFill = BetterFill(bullFill, fill);
+					else
+						bearFill = BetterFill(bearFill, fill);
+				}
+				else if (b >= fill.Bar + ind.ReactionBars)
+					fill.Decided = true;
+			}
 
 			if (b < ind.SwingLookback + 3)
 				continue;
@@ -1125,42 +1871,73 @@ internal static class Program
 			if (left.Low - c.High >= minGap)
 				zones.Add(new OracleZone { Start = b - 1, Confirmed = b, Top = left.Low, Bottom = c.High, Bull = false });
 
-			var bullReaction = false;
-			var bearReaction = false;
+			var window = candles.Skip(b - ind.SwingLookback).Take(ind.SwingLookback).ToList();
+			var highest = window.Max(x => x.High);
+			var lowest = window.Min(x => x.Low);
+			var sweptHighs = c.High > highest && c.Close < highest;
+			var sweptLows = c.Low < lowest && c.Close > lowest;
 
-			foreach (var z in zones.Where(z => !z.Filled && b > z.Confirmed))
+			// a gap reacts to a pattern that includes a candle that traded into it; price comes
+			// down into a bullish gap and up into a bearish one
+			OracleZone bullZone = null;
+			OracleZone bearZone = null;
+
+			foreach (var zone in zones.Where(z => z.State == "Active" && b > z.Confirmed))
 			{
-				if (z.Bull)
-				{
-					var closeOk = ind.RequireCloseThroughZone ? c.Close > z.Top : c.Close >= z.Bottom;
+				if (c.Low <= zone.Top && c.High >= zone.Bottom)
+					zone.LastTouch = b;
 
-					if (!z.Reacted && c.Low <= z.Top && c.Low >= z.Bottom && closeOk && c.Close > c.Open)
+				if (zone.LastTouch >= 0)
+				{
+					var need = b - zone.LastTouch + 1;
+					var bull = P(b, true, zone.Bull).Where(n => PatternCandles[n] >= need).ToList();
+					var bear = P(b, false, zone.Bull).Where(n => PatternCandles[n] >= need).ToList();
+
+					if (ind.RequireCloseThroughZone)
 					{
-						bullReaction = z.Reacted = true;
-						continue;
+						if (c.Close <= zone.Top)
+							bull = none;
+
+						if (c.Close >= zone.Bottom)
+							bear = none;
 					}
 
-					z.Filled |= c.Close < z.Bottom;
+					var reaction = OracleDecide(bull, bear);
+
+					if (reaction != 0)
+					{
+						zone.State = "Used";
+						zone.End = b;
+						zone.ReactionBull = reaction > 0;
+						zone.Patterns = reaction > 0 ? bull : bear;
+
+						if (reaction > 0)
+							bullZone = BetterZone(bullZone, zone);
+						else
+							bearZone = BetterZone(bearZone, zone);
+
+						continue;
+					}
 				}
-				else
+
+				var middle = (zone.Top + zone.Bottom) / 2;
+				var filled = ind.FvgFill == FvgReactionLiquiditySweep.FvgFillRule.CloseBeyond ? (zone.Bull ? c.Close < zone.Bottom : c.Close > zone.Top)
+					: ind.FvgFill == FvgReactionLiquiditySweep.FvgFillRule.Middle ? (zone.Bull ? c.Low <= middle : c.High >= middle)
+					: zone.Bull ? c.Low <= zone.Bottom : c.High >= zone.Top;
+
+				if (filled)
 				{
-					var closeOk = ind.RequireCloseThroughZone ? c.Close < z.Bottom : c.Close <= z.Top;
-
-					if (!z.Reacted && c.High >= z.Bottom && c.High <= z.Top && closeOk && c.Close < c.Open)
-					{
-						bearReaction = z.Reacted = true;
-						continue;
-					}
-
-					z.Filled |= c.Close > z.Top;
+					zone.State = "Filled";
+					zone.End = b;
+				}
+				else if (b - zone.Start > ind.MaxZoneAgeBars)
+				{
+					zone.State = "Expired";
+					zone.End = b;
 				}
 			}
 
-			var window = candles.Skip(Math.Max(0, b - ind.SwingLookback)).Take(b - Math.Max(0, b - ind.SwingLookback)).ToList();
-			var sweptHighs = c.High > window.Max(x => x.High) && c.Close < window.Max(x => x.High);
-			var sweptLows = c.Low < window.Min(x => x.Low) && c.Close > window.Min(x => x.Low);
-			zones.RemoveAll(z => z.Filled || b - z.Start > ind.MaxZoneAgeBars);
-			markers[b] = (bullReaction, bearReaction, sweptLows, sweptHighs);
+			markers[b] = (bullZone != null, bearZone != null, sweptLows, sweptHighs);
 
 			if (sweptLows)
 				lastLowSweep = b;
@@ -1176,16 +1953,38 @@ internal static class Program
 				if (!(isLong ? ind.EnableBuySignals : ind.EnableShortSignals))
 					continue;
 
-				var fvg = isLong ? bullReaction : bearReaction;
+				var zone = isLong ? bullZone : bearZone;
+				var fill = isLong ? bullFill : bearFill;
 				var sweepNow = isLong ? sweptLows : sweptHighs;
 				var lastSweep = isLong ? lastLowSweep : lastHighSweep;
 				var confluence = lastSweep >= 0 && b - lastSweep <= ind.ConfluenceBars;
-				var trigger = fvg ? (confluence ? "SweepThenFvg" : "Fvg") : sweepNow ? "Sweep" : null;
+				var fvgTrigger = zone == null ? null : confluence ? "SweepThenFvg" : "Fvg";
+				string trigger;
 
-				if (trigger == null
-					|| (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly && !fvg)
-					|| (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.LiquiditySweepOnly && !sweepNow)
-					|| (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.SweepThenFvg && trigger != "SweepThenFvg"))
+				switch (ind.SignalSource)
+				{
+					case FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly:
+						trigger = fvgTrigger;
+						break;
+
+					case FvgReactionLiquiditySweep.SignalMode.LiquiditySweepOnly:
+						trigger = sweepNow ? "Sweep" : null;
+						break;
+
+					case FvgReactionLiquiditySweep.SignalMode.SweepThenFvg:
+						trigger = fvgTrigger == "SweepThenFvg" ? fvgTrigger : null;
+						break;
+
+					case FvgReactionLiquiditySweep.SignalMode.FillReactionOnly:
+						trigger = fill != null ? "Fill" : null;
+						break;
+
+					default:
+						trigger = fvgTrigger ?? (fill != null ? "Fill" : sweepNow ? "Sweep" : null);
+						break;
+				}
+
+				if (trigger == null)
 					continue;
 
 				var lastSignal = isLong ? lastLong : lastShort;
@@ -1193,17 +1992,17 @@ internal static class Program
 				if (lastSignal >= 0 && b - lastSignal <= ind.SignalCooldownBars)
 					continue;
 
-				var absorption = OracleAbsorption(ind, candles, b, isLong);
+				var patterns = trigger == "Fill" ? fill.Patterns : trigger == "Sweep" ? P(b, isLong, isLong) : zone.Patterns;
 				var withTrend = ind.TrendEmaPeriod > 0 && b >= ind.TrendEmaPeriod && (isLong ? c.Close > ema[b] : c.Close < ema[b]);
 				var delta = isLong ? c.Delta > 0 : c.Delta < 0;
-				var patterns = OraclePatterns(ind, candles, mirrored, b, isLong);
+				var fillOk = OracleSupportingFill(candles, fillByBar, b, isLong);
 
-				if ((ind.OnlyWithTrend && !withTrend) || (ind.RequireDeltaConfirmation && !delta) || (ind.RequireAbsorption && !absorption)
+				if ((ind.OnlyWithTrend && !withTrend) || (ind.RequireDeltaConfirmation && !delta) || (ind.RequireFillConfirmation && !fillOk)
 					|| (ind.RequireCandlePattern && patterns.Count == 0))
 					continue;
 
-				var confirmations = (absorption ? 1 : 0) + (withTrend ? 1 : 0) + (delta ? 1 : 0) + (patterns.Count > 0 ? 1 : 0);
-				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{absorption}|{withTrend}|{delta}|{string.Join(",", patterns)}");
+				var confirmations = (withTrend ? 1 : 0) + (delta ? 1 : 0) + (fillOk ? 1 : 0) + (patterns.Count > 0 ? 1 : 0);
+				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{withTrend}|{delta}|{fillOk}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}");
 
 				if (isLong)
 					lastLong = b;
@@ -1214,7 +2013,7 @@ internal static class Program
 
 		var actual = trades
 			.OrderBy(t => t.EntryBar).ThenBy(t => !t.IsLong)
-			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.HasAbsorption}|{t.WithTrend}|{t.DeltaConfirms}|{string.Join(",", t.CandlePatterns)}")
+			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.WithTrend}|{t.DeltaConfirms}|{t.FillConfirms}|{string.Join(",", t.CandlePatterns)}")
 			.ToList();
 
 		var firstDiff = Enumerable.Range(0, Math.Min(actual.Count, expected.Count)).FirstOrDefault(i => actual[i] != expected[i]);
@@ -1222,17 +2021,41 @@ internal static class Program
 			$"signals differ from the oracle ({actual.Count} vs {expected.Count}); first difference: "
 			+ $"{actual.ElementAtOrDefault(firstDiff)} vs {expected.ElementAtOrDefault(firstDiff)}");
 
-		Check(trades.Any(t => t.HasAbsorption) && (ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms)
-			&& (!ind.UseCandlePatterns || trades.Any(t => t.CandlePatterns.Count > 0)),
-			"fuzz market should exercise every confirmation");
+		Check((ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms) && trades.Any(t => t.FillConfirms)
+			&& trades.Any(t => t.CandlePatterns.Count > 0), "fuzz market should exercise every confirmation");
 
-		// trigger arrows: set where the oracle found a trigger, unless a shown signal took its place
+		if (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.AnyTrigger)
+			Check(new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg" }.All(k => trades.Any(t => t.Trigger == k)), "fuzz market should exercise every trigger");
+
+		// every gap and how it ended
+		string ZoneKey(OracleZone z) => $"{z.Start}|{z.Top}|{z.Bottom}|{z.Bull}|{z.State}|{z.End}|{z.LastTouch}|{z.State == "Used" && z.ReactionBull}|"
+			+ string.Join(",", z.Patterns.OrderBy(n => n, StringComparer.Ordinal));
+		var expectedZones = zones.Select(ZoneKey).OrderBy(k => k, StringComparer.Ordinal).ToList();
+		var actualZones = ZoneKeys(ind);
+		var zoneDiff = Enumerable.Range(0, Math.Min(actualZones.Count, expectedZones.Count)).FirstOrDefault(i => actualZones[i] != expectedZones[i]);
+		Check(actualZones.SequenceEqual(expectedZones), $"FVG zones differ from the oracle ({actualZones.Count} vs {expectedZones.Count}): "
+			+ $"{actualZones.ElementAtOrDefault(zoneDiff)} vs {expectedZones.ElementAtOrDefault(zoneDiff)}");
+		Check(zones.Any(z => z.State == "Used" && z.ReactionBull) && zones.Any(z => z.State == "Used" && !z.ReactionBull)
+			&& zones.Any(z => z.State == "Filled") && zones.Any(z => z.State == "Expired") && zones.Any(z => z.State == "Active"),
+			"fuzz market should use, fill and expire gaps");
+
+		// every footprint fill and its reaction
+		string FillKey(int bar, decimal price, decimal volume, bool bids, int reaction, int reactionBar, bool decided, IEnumerable<string> patterns) =>
+			$"{bar}|{price}|{volume}|{bids}|{reaction}|{reactionBar}|{decided}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}";
+		var expectedFills = fills.Select(f => FillKey(f.Bar, f.Price, f.Volume, f.BidsFilled, f.Reaction, f.ReactionBar, f.Decided, f.Patterns)).ToList();
+		var actualFills = Fills(ind).Where(f => f.FromFootprint)
+			.Select(f => FillKey(f.Bar, f.Price, f.Volume, f.BidsFilled, f.Reaction, f.ReactionBar, f.Decided, f.ReactionPatterns)).ToList();
+		var fillDiff = Enumerable.Range(0, Math.Min(actualFills.Count, expectedFills.Count)).FirstOrDefault(i => actualFills[i] != expectedFills[i]);
+		Check(actualFills.SequenceEqual(expectedFills), $"fills differ from the oracle ({actualFills.Count} vs {expectedFills.Count}): "
+			+ $"{actualFills.ElementAtOrDefault(fillDiff)} vs {expectedFills.ElementAtOrDefault(fillDiff)}");
+		Check(fills.Any(f => f.Reaction > 0) && fills.Any(f => f.Reaction < 0) && fills.Any(f => f.Decided && f.Reaction == 0),
+			"fuzz market should have bullish, bearish and no reactions to fills");
+
+		// the hidden trigger series
 		var bullReactionSeries = Series(ind, "_bullReaction");
 		var bearReactionSeries = Series(ind, "_bearReaction");
 		var bullSweepSeries = Series(ind, "_bullSweep");
 		var bearSweepSeries = Series(ind, "_bearSweep");
-		var shownLong = new HashSet<int>(trades.Where(t => t.IsShown && t.IsLong).Select(t => t.EntryBar));
-		var shownShort = new HashSet<int>(trades.Where(t => t.IsShown && !t.IsLong).Select(t => t.EntryBar));
 		var wrong = 0;
 
 		for (var b = 0; b < candles.Count; b++)
@@ -1241,49 +2064,35 @@ internal static class Program
 			var low = candles[b].Low - 2 * Tick;
 			var high = candles[b].High + 2 * Tick;
 
-			wrong += bullReactionSeries[b] != (m.BullReaction && !shownLong.Contains(b) ? low : 0) ? 1 : 0;
-			wrong += bullSweepSeries[b] != (m.SweptLows && !shownLong.Contains(b) ? low : 0) ? 1 : 0;
-			wrong += bearReactionSeries[b] != (m.BearReaction && !shownShort.Contains(b) ? high : 0) ? 1 : 0;
-			wrong += bearSweepSeries[b] != (m.SweptHighs && !shownShort.Contains(b) ? high : 0) ? 1 : 0;
+			wrong += bullReactionSeries[b] != (m.BullReaction ? low : 0) ? 1 : 0;
+			wrong += bullSweepSeries[b] != (m.SweptLows ? low : 0) ? 1 : 0;
+			wrong += bearReactionSeries[b] != (m.BearReaction ? high : 0) ? 1 : 0;
+			wrong += bearSweepSeries[b] != (m.SweptHighs ? high : 0) ? 1 : 0;
 		}
 
-		Check(wrong == 0, $"{wrong} trigger arrows differ from the oracle");
-
-		// the zones still alive (and drawn) at the end: same set, same state
-		var expectedZones = zones.Select(z => $"{z.Start}|{z.Top}|{z.Bottom}|{z.Bull}|{z.Filled}|{z.Reacted}").ToList();
-		Check(ZoneKeys(ind).SequenceEqual(expectedZones), "live FVG zones differ from the oracle");
+		Check(wrong == 0, $"{wrong} trigger series values differ from the oracle");
 	}
 
-	private static bool OracleAbsorption(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, int bar, bool isLong)
+	// a big fill of resting bids (buys) or offers (shorts) near that end of the signal bar or the bar before
+	private static bool OracleSupportingFill(List<IndicatorCandle> candles, Dictionary<int, OracleFill> fillByBar, int bar, bool isLong)
 	{
 		for (var b = bar; b >= Math.Max(0, bar - 1); b--)
 		{
-			var c = candles[b];
-
-			if (c.Levels.Count == 0 || c.Levels.Average(l => l.Volume) <= 0)
+			if (!fillByBar.TryGetValue(b, out var fill) || fill.BidsFilled != isLong)
 				continue;
 
-			var threshold = Math.Max(ind.AbsorptionMinVolume, (decimal)ind.AbsorptionVolumeMultiplier * c.Levels.Average(l => l.Volume));
+			var c = candles[b];
 			var edge = (c.High - c.Low) * 0.35m;
 
-			foreach (var l in c.Levels)
-			{
-				if (l.Volume < threshold || l.Volume <= 0 || Math.Max(l.Bid, l.Ask) / l.Volume < (decimal)ind.AbsorptionDominanceRatio)
-					continue;
-
-				if (isLong && l.Bid > l.Ask && l.Price <= c.Low + edge)
-					return true;
-
-				if (!isLong && l.Ask >= l.Bid && l.Price >= c.High - edge)
-					return true;
-			}
+			if (isLong ? fill.Price <= c.Low + edge : fill.Price >= c.High - edge)
+				return true;
 		}
 
 		return false;
 	}
 
-	// The candles upside down around a pivot: a bearish pattern is exactly the bullish one in
-	// this mirror, so the oracle only spells out the bullish definitions.
+	// The candles upside down around a pivot: a bearish pattern after a rally is exactly the
+	// bullish one after a decline in this mirror, so the oracle only spells out bullish ones.
 	private static List<IndicatorCandle> Mirror(List<IndicatorCandle> candles, decimal pivot = 100000)
 	{
 		return candles
@@ -1301,25 +2110,30 @@ internal static class Program
 		["BullishHarami"] = "BearishHarami",
 		["TweezerBottom"] = "TweezerTop",
 		["MorningStar"] = "EveningStar",
+		["MorningDojiStar"] = "EveningDojiStar",
 		["ThreeWhiteSoldiers"] = "ThreeBlackCrows",
-		["BullishMarubozu"] = "BearishMarubozu"
+		["BullishMarubozu"] = "BearishMarubozu",
+		["ThreeInsideUp"] = "ThreeInsideDown",
+		["ThreeOutsideUp"] = "ThreeOutsideDown",
+		["BullishOutsideReversal"] = "BearishOutsideReversal",
+		["BullishThreeLineStrike"] = "BearishThreeLineStrike"
 	};
 
-	// Independent re-implementation of the cheat-sheet patterns completing on bar b that point
-	// the trade's way, as sorted pattern names. Bearish ones are the bullish definitions read
-	// on the mirrored candles.
+	// Independent re-implementation of the candlestick patterns completing on bar b that point
+	// one way, as sorted pattern names. Bearish ones are the bullish definitions read on the
+	// mirrored candles, where a rally becomes a decline.
 	private static List<string> OraclePatterns(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<IndicatorCandle> mirrored,
-		int b, bool isLong)
+		int b, bool bullish, bool afterDecline)
 	{
-		var names = !ind.UseCandlePatterns ? new List<string>()
-			: isLong ? BullishPatterns(ind, candles, b)
-			: BullishPatterns(ind, mirrored, b).Select(n => BearishTwin[n]).ToList();
+		var names = bullish
+			? BullishPatterns(ind, candles, b, afterDecline)
+			: BullishPatterns(ind, mirrored, b, !afterDecline).Select(n => BearishTwin[n]).ToList();
 
 		names.Sort(StringComparer.Ordinal);
 		return names;
 	}
 
-	private static List<string> BullishPatterns(FvgReactionLiquiditySweep ind, List<IndicatorCandle> k, int b)
+	private static List<string> BullishPatterns(FvgReactionLiquiditySweep ind, List<IndicatorCandle> k, int b, bool afterDecline)
 	{
 		var names = new List<string>();
 
@@ -1350,10 +2164,11 @@ internal static class Program
 			var lowerWick = BodyBottom(c) - c.Low;
 			var wickRatio = (decimal)ind.PinBarWickRatio;
 
-			if (ind.PatternHammer && lowerWick >= wickRatio * Body(c) && upperWick * 10 <= range)
+			// the hammer shapes only read bullish after a decline
+			if (afterDecline && ind.PatternHammer && lowerWick >= wickRatio * Body(c) && upperWick * 10 <= range)
 				names.Add(Body(c) * 10 <= range ? "DragonflyDoji" : "Hammer");
 
-			if (ind.PatternInvertedHammer && upperWick >= wickRatio * Body(c) && lowerWick * 10 <= range)
+			if (afterDecline && ind.PatternInvertedHammer && upperWick >= wickRatio * Body(c) && lowerWick * 10 <= range)
 				names.Add("InvertedHammer");
 
 			if (ind.PatternMarubozu && Up(c) && Long(c, Yardstick(b)) && upperWick * 20 <= range && lowerWick * 20 <= range)
@@ -1376,6 +2191,9 @@ internal static class Program
 
 			if (ind.PatternTweezers && Down(p) && Up(c) && Math.Abs(c.Low - p.Low) <= ind.TweezerToleranceTicks * Tick)
 				names.Add("TweezerBottom");
+
+			if (ind.PatternOutsideReversal && c.High > p.High && c.Low < p.Low && Up(c) && c.Close > p.High)
+				names.Add("BullishOutsideReversal");
 		}
 
 		if (b >= 2)
@@ -1385,7 +2203,7 @@ internal static class Program
 			var y = Yardstick(b - 2);
 
 			if (ind.PatternStars && Down(a) && Long(a, y) && Small(p, y) && BodyTop(p) <= Middle(a) && Up(c) && Long(c, y) && c.Close > Middle(a))
-				names.Add("MorningStar");
+				names.Add(Body(p) * 10 <= p.High - p.Low ? "MorningDojiStar" : "MorningStar");
 
 			bool Soldier(IndicatorCandle x) => Up(x) && Long(x, y) && (x.High - x.Close) * 4 <= x.High - x.Low;
 			bool OpensIn(IndicatorCandle x, IndicatorCandle before) => x.Open >= BodyBottom(before) && x.Open <= BodyTop(before);
@@ -1393,13 +2211,33 @@ internal static class Program
 			if (ind.PatternThreeSoldiers && Soldier(a) && Soldier(p) && Soldier(c) && OpensIn(p, a) && OpensIn(c, p)
 				&& p.Close > a.Close && c.Close > p.Close)
 				names.Add("ThreeWhiteSoldiers");
+
+			// a bearish harami confirmed by a close above the first candle's open
+			if (ind.PatternThreeInside && Down(a) && Long(a, y) && Small(p, y) && BodyTop(p) <= BodyTop(a) && BodyBottom(p) >= BodyBottom(a)
+				&& Up(c) && c.Close > a.Open)
+				names.Add("ThreeInsideUp");
+
+			// a bullish engulfing confirmed by a higher close
+			if (ind.PatternThreeOutside && Down(a) && Up(p) && p.Open <= a.Close && p.Close >= a.Open && Body(p) > Body(a) && Long(p, y)
+				&& c.Close > p.Close)
+				names.Add("ThreeOutsideUp");
+		}
+
+		if (b >= 3 && ind.PatternThreeLineStrike)
+		{
+			var x1 = k[b - 3];
+			var x2 = k[b - 2];
+			var x3 = k[b - 1];
+
+			if (Down(x1) && Down(x2) && Down(x3) && x2.Close < x1.Close && x3.Close < x2.Close && Up(c) && c.Open <= x3.Close && c.Close > x1.Open)
+				names.Add("BullishThreeLineStrike");
 		}
 
 		return names;
 	}
 
-	// every bar, both ways: the indicator's pattern finder against the oracle; returns how
-	// often each pattern was found
+	// every bar, each way and after either move: the indicator's pattern finder against the
+	// oracle; returns how often each pattern was found
 	private static Dictionary<string, int> VerifyPatternsOnEveryBar(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles)
 	{
 		var find = IndicatorType.GetMethod("FindCandlePatterns", Private);
@@ -1409,13 +2247,16 @@ internal static class Program
 
 		for (var b = 0; b < candles.Count; b++)
 		{
-			foreach (var isLong in new[] { true, false })
+			foreach (var (bullish, afterDecline) in new[] { (true, true), (true, false), (false, true), (false, false) })
 			{
-				var actual = PatternList(find.Invoke(ind, new object[] { b, isLong }));
-				var expected = OraclePatterns(ind, candles, mirrored, b, isLong);
+				var actual = PatternList(find.Invoke(ind, new object[] { b, bullish, afterDecline }));
+				var expected = OraclePatterns(ind, candles, mirrored, b, bullish, afterDecline);
 
 				if (!actual.SequenceEqual(expected) && wrong++ < 3)
-					Failures.Add($"bar {b} {(isLong ? "buy" : "short")}: indicator [{string.Join(",", actual)}], oracle [{string.Join(",", expected)}]");
+				{
+					Failures.Add($"bar {b} {(bullish ? "bullish" : "bearish")} after a {(afterDecline ? "decline" : "rally")}: "
+						+ $"indicator [{string.Join(",", actual)}], oracle [{string.Join(",", expected)}]");
+				}
 
 				foreach (var name in actual)
 					counts[name] = counts.TryGetValue(name, out var n) ? n + 1 : 1;
@@ -1591,13 +2432,9 @@ internal static class Program
 			Check(tooClose == 0, $"{tooClose} signals inside the cooldown");
 		}
 
-		// 4) arrows exactly on shown signals, replacing the trigger arrows
+		// 4) arrows exactly on shown signals
 		var buy = Series(ind, "_buySignal");
 		var sell = Series(ind, "_shortSignal");
-		var bullReaction = Series(ind, "_bullReaction");
-		var bullSweep = Series(ind, "_bullSweep");
-		var bearReaction = Series(ind, "_bearReaction");
-		var bearSweep = Series(ind, "_bearSweep");
 		var shownLong = new HashSet<int>(trades.Where(t => t.IsShown && t.IsLong).Select(t => t.EntryBar));
 		var shownShort = new HashSet<int>(trades.Where(t => t.IsShown && !t.IsLong).Select(t => t.EntryBar));
 		var badMarkers = 0;
@@ -1605,12 +2442,6 @@ internal static class Program
 		for (var b = 0; b < barCount; b++)
 		{
 			if ((buy[b] != 0) != shownLong.Contains(b) || (sell[b] != 0) != shownShort.Contains(b))
-				badMarkers++;
-
-			if (buy[b] != 0 && (bullReaction[b] != 0 || bullSweep[b] != 0))
-				badMarkers++;
-
-			if (sell[b] != 0 && (bearReaction[b] != 0 || bearSweep[b] != 0))
 				badMarkers++;
 		}
 
@@ -1648,6 +2479,294 @@ internal static class Program
 		Check(trades.Where(t => t.Outcome == "TakeProfit").All(t => Realised(t) == ind.TakeProfitTicks), "a TP is worth exactly +TP ticks");
 		Check(trades.Where(t => t.Outcome == "BreakEven").All(t => Realised(t) == (decimal)beTicks), "a break-even exit is worth exactly the offset");
 		Check(trades.Where(t => t.Outcome == "StopLoss").All(t => Realised(t) == -ind.StopLossTicks), "an SL is worth exactly -SL ticks");
+	}
+
+	// A made-up order book around the streamed price: eight levels each side at random sizes,
+	// eaten by the ticks that trade through them (the book sometimes reports it before the
+	// prints), pulled, shrunk or joined at random, and scrolling out of view at the far end.
+	// It keeps its own record of every order of 70+ by the rules the indicator should follow -
+	// the oracle for the order book.
+	private sealed class BookSimulator
+	{
+		private const int Levels = 8;
+		private const decimal Big = 70;
+
+		private readonly FvgReactionLiquiditySweep _ind;
+		private readonly Random _rng;
+		private readonly SortedDictionary<decimal, decimal> _bids = new SortedDictionary<decimal, decimal>();
+		private readonly SortedDictionary<decimal, decimal> _asks = new SortedDictionary<decimal, decimal>();
+		private readonly Dictionary<(decimal Price, bool Bid), decimal> _traded = new Dictionary<(decimal Price, bool Bid), decimal>();
+		private readonly Dictionary<(decimal Price, bool Bid), Tracked> _open = new Dictionary<(decimal Price, bool Bid), Tracked>();
+		private readonly List<Tracked> _ended = new List<Tracked>();
+		private DateTime _time;
+		private decimal _last;
+		private int _bar;
+
+		public BookSimulator(FvgReactionLiquiditySweep ind, int seed, DateTime start)
+		{
+			_ind = ind;
+			_rng = new Random(seed);
+			_time = start;
+			ind.MarketTime = start;
+		}
+
+		private sealed class Tracked
+		{
+			public decimal Price;
+			public bool Bid;
+			public decimal Max;
+			public decimal TradedAtStart;
+			public int FirstBar;
+			public bool Leaving;
+			public DateTime LeftAt;
+			public bool AtEdge;
+			public int EndBar = -1;
+			public string State = "Active";
+			public decimal Traded;
+		}
+
+		// what happens in the book with one tick of the bar being streamed
+		public void OnTick(decimal price, int bar)
+		{
+			_bar = bar;
+			_time = _time.AddMilliseconds(_rng.Next(100, 900));
+			_ind.MarketTime = _time;
+
+			if (_last != 0)
+			{
+				// a move eats every level it trades through
+				if (price < _last)
+				{
+					foreach (var p in _bids.Keys.Where(p => p >= price).Reverse().ToList())
+						Consume(p, true);
+				}
+				else if (price > _last)
+				{
+					foreach (var p in _asks.Keys.Where(p => p <= price).ToList())
+						Consume(p, false);
+				}
+				else if (_rng.NextDouble() < 0.4)
+					NibbleTouch();
+			}
+
+			_last = price;
+			Refill();
+			Churn();
+		}
+
+		private void Consume(decimal price, bool bid)
+		{
+			var size = (bid ? _bids : _asks)[price];
+
+			if (_rng.NextDouble() < 0.3)
+			{
+				SetLevel(price, bid, 0);
+				Print(price, size, bid);
+			}
+			else
+			{
+				Print(price, size, bid);
+				SetLevel(price, bid, 0);
+			}
+		}
+
+		// part of the best bid or offer trades while price stays put
+		private void NibbleTouch()
+		{
+			var bid = _rng.Next(2) == 0;
+			var book = bid ? _bids : _asks;
+
+			if (book.Count == 0)
+				return;
+
+			var price = bid ? book.Keys.Last() : book.Keys.First();
+			var size = book[price];
+			var part = Math.Max(1, Math.Round(size * (decimal)_rng.NextDouble()));
+			Print(price, part, bid);
+			SetLevel(price, bid, size - part);
+		}
+
+		// eight levels each side of the last price; the far ones leave view, deepest first
+		private void Refill()
+		{
+			for (var i = 1; i <= Levels; i++)
+			{
+				if (!_bids.ContainsKey(_last - i * Tick))
+					SetLevel(_last - i * Tick, true, RandomSize());
+
+				if (!_asks.ContainsKey(_last + i * Tick))
+					SetLevel(_last + i * Tick, false, RandomSize());
+			}
+
+			foreach (var p in _bids.Keys.Where(p => p < _last - Levels * Tick).ToList())
+				SetLevel(p, true, 0);
+
+			foreach (var p in _asks.Keys.Where(p => p > _last + Levels * Tick).Reverse().ToList())
+				SetLevel(p, false, 0);
+		}
+
+		// orders pulled, shrunk or joining without any trade
+		private void Churn()
+		{
+			var roll = _rng.NextDouble();
+			var bid = _rng.Next(2) == 0;
+			var book = bid ? _bids : _asks;
+			var big = book.Where(kv => kv.Value >= Big).Select(kv => kv.Key).ToList();
+
+			if (roll < 0.05 && big.Count > 0)
+				SetLevel(big[_rng.Next(big.Count)], bid, 0);
+			else if (roll < 0.08 && big.Count > 0)
+				SetLevel(big[_rng.Next(big.Count)], bid, _rng.Next(5, 60));
+			else if (roll < 0.11 && book.Count > 0)
+			{
+				var keys = book.Keys.ToList();
+				SetLevel(keys[_rng.Next(keys.Count)], bid, _rng.Next(70, 300));
+			}
+		}
+
+		private decimal RandomSize()
+		{
+			return _rng.NextDouble() < 0.15 ? _rng.Next(70, 300) : _rng.Next(5, 60);
+		}
+
+		private void Print(decimal price, decimal volume, bool intoBids)
+		{
+			_ind.HarnessTrade(new MarketDataArg
+			{
+				Price = price,
+				Volume = volume,
+				DataType = MarketDataType.Trade,
+				Direction = intoBids ? TradeDirection.Sell : TradeDirection.Buy,
+				Time = _time
+			});
+
+			_traded[(price, intoBids)] = TradedAgainst(price, intoBids) + volume;
+			Settle();
+		}
+
+		private void SetLevel(decimal price, bool bid, decimal volume)
+		{
+			var book = bid ? _bids : _asks;
+
+			if (volume > 0)
+				book[price] = volume;
+			else
+				book.Remove(price);
+
+			_ind.HarnessDepth(new MarketDataArg { Price = price, Volume = volume, DataType = bid ? MarketDataType.Bid : MarketDataType.Ask, Time = _time });
+
+			_open.TryGetValue((price, bid), out var order);
+
+			if (volume >= Big)
+			{
+				if (order == null)
+				{
+					order = new Tracked { Price = price, Bid = bid, FirstBar = _bar, TradedAtStart = TradedAgainst(price, bid) };
+					_open[(price, bid)] = order;
+				}
+
+				order.Leaving = false;
+				order.EndBar = -1;
+				order.Max = Math.Max(order.Max, volume);
+			}
+			else if (order != null && !order.Leaving)
+			{
+				order.Leaving = true;
+				order.LeftAt = _time;
+				order.EndBar = _bar;
+				order.AtEdge = volume == 0 && (bid ? !_bids.Keys.Any(p => p < price) : !_asks.Keys.Any(p => p > price));
+			}
+
+			Settle();
+		}
+
+		// the rule under test, written again: filled once half its size traded against it,
+		// otherwise pulled (or out of view) two seconds after it left the book
+		public void Settle()
+		{
+			foreach (var order in _open.Values.Where(o => o.Leaving).ToList())
+			{
+				order.Traded = TradedAgainst(order.Price, order.Bid) - order.TradedAtStart;
+				var filled = order.Traded >= order.Max / 2;
+
+				if (!filled && (_time - order.LeftAt).TotalSeconds < 2)
+					continue;
+
+				order.State = filled ? "Filled" : order.AtEdge ? "OutOfView" : "Pulled";
+				_open.Remove((order.Price, order.Bid));
+				_ended.Add(order);
+			}
+		}
+
+		private decimal TradedAgainst(decimal price, bool bid)
+		{
+			return _traded.TryGetValue((price, bid), out var volume) ? volume : 0;
+		}
+
+		public void Verify(FvgReactionLiquiditySweep ind)
+		{
+			string Key(decimal price, bool bid, string state, decimal max, int first, int end) => $"{price}|{bid}|{state}|{max}|{first}|{end}";
+
+			var expected = _ended.Select(o => Key(o.Price, o.Bid, o.State, o.Max, o.FirstBar, o.EndBar))
+				.Concat(_open.Values.Select(o => Key(o.Price, o.Bid, o.Leaving ? "Leaving" : "Active", o.Max, o.FirstBar, o.EndBar)))
+				.OrderBy(k => k, StringComparer.Ordinal)
+				.ToList();
+
+			var actual = Orders(ind)
+				.Select(o => Key(o.Price, o.IsBid, o.State == "Active" && o.Leaving ? "Leaving" : o.State, o.MaxVolume, o.FirstBar, o.EndBar))
+				.OrderBy(k => k, StringComparer.Ordinal)
+				.ToList();
+
+			var diff = Enumerable.Range(0, Math.Min(actual.Count, expected.Count)).FirstOrDefault(i => actual[i] != expected[i]);
+			Check(actual.SequenceEqual(expected), $"order book: {actual.Count} orders vs {expected.Count} expected; first difference "
+				+ $"{actual.ElementAtOrDefault(diff)} vs {expected.ElementAtOrDefault(diff)}");
+
+			var states = _ended.GroupBy(o => o.State).ToDictionary(g => g.Key, g => g.Count());
+			Check(new[] { "Filled", "Pulled", "OutOfView" }.All(states.ContainsKey),
+				$"the made-up book should fill, pull and scroll away orders: {string.Join(", ", states.Select(kv => $"{kv.Key} {kv.Value}"))}");
+
+			// the orders filled at one bar, price and side mark the footprint fill there with the
+			// biggest of them; without one, they are a fill of their own if at least 150 traded
+			// against one of them, and no fill at all otherwise
+			var fills = Fills(ind);
+			var wrong = new List<string>();
+			var smallOnly = 0;
+
+			foreach (var group in _ended.Where(o => o.State == "Filled").GroupBy(o => (o.EndBar, o.Price, o.Bid)))
+			{
+				var here = fills.Where(f => f.Bar == group.Key.EndBar && f.Price == group.Key.Price && f.BidsFilled == group.Key.Bid).ToList();
+				var biggest = group.Max(o => o.Max);
+				var footprint = here.Where(f => f.FromFootprint).ToList();
+				var own = here.Where(f => !f.FromFootprint).ToList();
+				bool ok;
+
+				if (footprint.Count > 0)
+					ok = footprint.Count == 1 && own.Count == 0 && footprint[0].RestingSize == biggest;
+				else if (group.Any(o => o.Traded >= 150))
+				{
+					// its volume: what traded against the first big one and every one after it
+					var volume = group.SkipWhile(o => o.Traded < 150).Sum(o => o.Traded);
+					ok = own.Count == 1 && own[0].RestingSize == biggest && own[0].Volume == volume;
+				}
+				else
+				{
+					ok = here.Count == 0;
+					smallOnly++;
+				}
+
+				if (!ok)
+					wrong.Add($"{group.Key}: {here.Count} fills");
+			}
+
+			Check(wrong.Count == 0, $"{wrong.Count} filled prices shown wrong, e.g. {wrong.FirstOrDefault()}");
+
+			// and nothing else carries the order book's mark
+			var unexplained = fills.Count(f => (!f.FromFootprint || f.RestingSize > 0)
+				&& !_ended.Any(o => o.State == "Filled" && o.EndBar == f.Bar && o.Price == f.Price && o.Bid == f.BidsFilled));
+			Check(unexplained == 0, $"{unexplained} fills marked by the order book without a filled order");
+			Check(fills.Any(f => !f.FromFootprint) && fills.Any(f => f.FromFootprint && f.RestingSize > 0) && smallOnly > 0,
+				"order-book fills should show on their own, on footprint fills, and not at all when small");
+		}
 	}
 
 	#endregion
@@ -1786,9 +2905,9 @@ internal static class Program
 		public int BreakEvenBar;
 		public decimal TriggerPrice;
 		public decimal BreakEvenPrice;
-		public bool HasAbsorption;
 		public bool WithTrend;
 		public bool DeltaConfirms;
+		public bool FillConfirms;
 		public List<string> CandlePatterns;
 		public string Outcome;
 		public string Trigger;
@@ -1797,6 +2916,10 @@ internal static class Program
 		public decimal TakeProfitPrice;
 		public decimal StopLossPrice;
 		public decimal ExitPrice;
+		public decimal ZoneTop;
+		public decimal ZoneBottom;
+		public decimal FillPrice;
+		public decimal FillVolume;
 		public double TakeProfit;
 		public double BreakEven;
 		public double StopLoss;
@@ -1804,6 +2927,51 @@ internal static class Program
 		public (int Wins, int BreakEvens, int Count) Setup;
 		public (int Wins, int BreakEvens, int Count) TriggerTally;
 		public (int Wins, int BreakEvens, int Count) Direction;
+	}
+
+	private sealed class ZoneView
+	{
+		public int StartBar;
+		public int EndBar;
+		public int LastTouchBar;
+		public decimal Top;
+		public decimal Bottom;
+		public bool IsBullish;
+		public string State;
+		public bool ReactionBullish;
+		public List<string> ReactionPatterns;
+		public bool SignalShown;
+	}
+
+	private sealed class FillView
+	{
+		public int Bar;
+		public decimal Price;
+		public decimal Volume;
+		public bool BidsFilled;
+		public bool FromFootprint;
+		public decimal RestingSize;
+		public int Reaction;
+		public int ReactionBar;
+		public List<string> ReactionPatterns;
+		public bool Decided;
+		public int WatchedBars;
+		public decimal UpTicks;
+		public decimal DownTicks;
+		public bool SignalShown;
+	}
+
+	private sealed class OrderView
+	{
+		public decimal Price;
+		public bool IsBid;
+		public decimal Volume;
+		public decimal MaxVolume;
+		public decimal Traded;
+		public int FirstBar;
+		public int EndBar;
+		public string State;
+		public bool Leaving;
 	}
 
 	private static FvgReactionLiquiditySweep NewIndicator(Action<FvgReactionLiquiditySweep> configure)
@@ -1838,8 +3006,32 @@ internal static class Program
 		return ind;
 	}
 
-	// append a new bar and feed it one tick at a time, like ATAS does in real time
-	private static void StreamBar(FvgReactionLiquiditySweep ind, IList<decimal> path, decimal delta = 0, List<PriceVolumeInfo> levels = null)
+	// history loaded, ticking live from here
+	private static FvgReactionLiquiditySweep LiveIndicator(List<IndicatorCandle> history, Action<FvgReactionLiquiditySweep> configure = null)
+	{
+		var ind = NewIndicator(configure);
+		ind.Candles.AddRange(history);
+		ind.HarnessRecalculate();
+
+		for (var i = 0; i < history.Count; i++)
+			ind.HarnessCalculate(i);
+
+		return ind;
+	}
+
+	// what ATAS does after a settings change: calculate every bar again
+	private static void Recalculate(FvgReactionLiquiditySweep ind)
+	{
+		ind.HarnessRecalculate();
+
+		for (var i = 0; i < ind.Candles.Count; i++)
+			ind.HarnessCalculate(i);
+	}
+
+	// append a new bar and feed it one tick at a time, like ATAS does in real time - with an
+	// order book trading around it if there is one
+	private static void StreamBar(FvgReactionLiquiditySweep ind, IList<decimal> path, decimal delta = 0, List<PriceVolumeInfo> levels = null,
+		BookSimulator book = null)
 	{
 		var candle = new IndicatorCandle { Open = path[0], High = path[0], Low = path[0], Close = path[0], Time = DateTime.MinValue };
 		ind.Candles.Add(candle);
@@ -1857,8 +3049,42 @@ internal static class Program
 				? new List<PriceVolumeInfo>()
 				: levels.Where(l => l.Price >= candle.Low && l.Price <= candle.High).ToList();
 
+			book?.OnTick(path[i], bar);
 			ind.HarnessCalculate(bar);
+			book?.Settle();
 		}
+	}
+
+	// one more tick of the bar being built by hand
+	private static void AddTick(FvgReactionLiquiditySweep ind, IndicatorCandle candle, decimal price)
+	{
+		candle.High = Math.Max(candle.High, price);
+		candle.Low = Math.Min(candle.Low, price);
+		candle.Close = price;
+		ind.HarnessCalculate(ind.Candles.IndexOf(candle));
+	}
+
+	private static void Depth(FvgReactionLiquiditySweep ind, bool bid, decimal price, decimal volume)
+	{
+		ind.HarnessDepth(new MarketDataArg
+		{
+			Price = price,
+			Volume = volume,
+			DataType = bid ? MarketDataType.Bid : MarketDataType.Ask,
+			Time = ind.MarketTime
+		});
+	}
+
+	private static void Print(FvgReactionLiquiditySweep ind, decimal price, decimal volume, bool sell)
+	{
+		ind.HarnessTrade(new MarketDataArg
+		{
+			Price = price,
+			Volume = volume,
+			DataType = MarketDataType.Trade,
+			Direction = sell ? TradeDirection.Sell : TradeDirection.Buy,
+			Time = ind.MarketTime
+		});
 	}
 
 	private static List<TradeView> Trades(FvgReactionLiquiditySweep ind)
@@ -1890,9 +3116,9 @@ internal static class Program
 				BreakEvenBar = (int)Get(t, "BreakEvenBar"),
 				TriggerPrice = (decimal)Get(t, "TriggerPrice"),
 				BreakEvenPrice = (decimal)Get(t, "BreakEvenPrice"),
-				HasAbsorption = (bool)Get(t, "HasAbsorption"),
 				WithTrend = (bool)Get(t, "WithTrend"),
 				DeltaConfirms = (bool)Get(t, "DeltaConfirms"),
+				FillConfirms = (bool)Get(t, "FillConfirms"),
 				CandlePatterns = PatternList(Get(t, "CandlePatterns")),
 				Outcome = Get(t, "Outcome").ToString(),
 				Trigger = Get(t, "Trigger").ToString(),
@@ -1901,6 +3127,10 @@ internal static class Program
 				TakeProfitPrice = (decimal)Get(t, "TakeProfitPrice"),
 				StopLossPrice = (decimal)Get(t, "StopLossPrice"),
 				ExitPrice = (decimal)Get(t, "ExitPrice"),
+				ZoneTop = (decimal)Get(t, "ZoneTop"),
+				ZoneBottom = (decimal)Get(t, "ZoneBottom"),
+				FillPrice = (decimal)Get(t, "FillPrice"),
+				FillVolume = (decimal)Get(t, "FillVolume"),
 				TakeProfit = EstimateValue("TakeProfit"),
 				BreakEven = EstimateValue("BreakEven"),
 				StopLoss = EstimateValue("StopLoss"),
@@ -1912,6 +3142,86 @@ internal static class Program
 		}
 
 		return result;
+	}
+
+	// the live gaps first, then the ones no longer watched, in the order they ended
+	private static List<ZoneView> Zones(FvgReactionLiquiditySweep ind)
+	{
+		var active = (IList)IndicatorType.GetField("_activeZones", Private).GetValue(ind);
+		var retired = (IList)IndicatorType.GetField("_retiredZones", Private).GetValue(ind);
+
+		return active.Cast<object>().Concat(retired.Cast<object>())
+			.Select(z => new ZoneView
+			{
+				StartBar = (int)Get(z, "StartBar"),
+				EndBar = (int)Get(z, "EndBar"),
+				LastTouchBar = (int)Get(z, "LastTouchBar"),
+				Top = (decimal)Get(z, "Top"),
+				Bottom = (decimal)Get(z, "Bottom"),
+				IsBullish = (bool)Get(z, "IsBullish"),
+				State = Get(z, "State").ToString(),
+				ReactionBullish = (bool)Get(z, "ReactionBullish"),
+				ReactionPatterns = PatternList(Get(z, "ReactionPatterns")),
+				SignalShown = (bool)Get(z, "SignalShown")
+			})
+			.ToList();
+	}
+
+	private static List<string> ZoneKeys(FvgReactionLiquiditySweep ind)
+	{
+		return Zones(ind)
+			.Select(z => $"{z.StartBar}|{z.Top}|{z.Bottom}|{z.IsBullish}|{z.State}|{z.EndBar}|{z.LastTouchBar}|{z.State == "Used" && z.ReactionBullish}|"
+				+ string.Join(",", z.ReactionPatterns))
+			.OrderBy(k => k, StringComparer.Ordinal)
+			.ToList();
+	}
+
+	private static List<FillView> Fills(FvgReactionLiquiditySweep ind)
+	{
+		var fills = (IList)IndicatorType.GetField("_fills", Private).GetValue(ind);
+
+		return fills.Cast<object>()
+			.Select(f => new FillView
+			{
+				Bar = (int)Get(f, "Bar"),
+				Price = (decimal)Get(f, "Price"),
+				Volume = (decimal)Get(f, "Volume"),
+				BidsFilled = (bool)Get(f, "BidsFilled"),
+				FromFootprint = (bool)Get(f, "FromFootprint"),
+				RestingSize = (decimal)Get(f, "RestingSize"),
+				Reaction = (int)Get(f, "Reaction"),
+				ReactionBar = (int)Get(f, "ReactionBar"),
+				ReactionPatterns = PatternList(Get(f, "ReactionPatterns")),
+				Decided = (bool)Get(f, "Decided"),
+				WatchedBars = (int)Get(f, "WatchedBars"),
+				UpTicks = (decimal)Get(f, "UpTicks"),
+				DownTicks = (decimal)Get(f, "DownTicks"),
+				SignalShown = (bool)Get(f, "SignalShown")
+			})
+			.ToList();
+	}
+
+	// resting orders still in the book (bids, then offers), then the ended ones in the order they ended
+	private static List<OrderView> Orders(FvgReactionLiquiditySweep ind)
+	{
+		var bids = (IDictionary)IndicatorType.GetField("_restingBids", Private).GetValue(ind);
+		var asks = (IDictionary)IndicatorType.GetField("_restingAsks", Private).GetValue(ind);
+		var ended = (IList)IndicatorType.GetField("_endedOrders", Private).GetValue(ind);
+
+		return bids.Values.Cast<object>().Concat(asks.Values.Cast<object>()).Concat(ended.Cast<object>())
+			.Select(o => new OrderView
+			{
+				Price = (decimal)Get(o, "Price"),
+				IsBid = (bool)Get(o, "IsBid"),
+				Volume = (decimal)Get(o, "Volume"),
+				MaxVolume = (decimal)Get(o, "MaxVolume"),
+				Traded = (decimal)Get(o, "Traded"),
+				FirstBar = (int)Get(o, "FirstBar"),
+				EndBar = (int)Get(o, "EndBar"),
+				State = Get(o, "State").ToString(),
+				Leaving = (bool)Get(o, "Leaving")
+			})
+			.ToList();
 	}
 
 	private static object Get(object obj, string field)
@@ -1928,14 +3238,6 @@ internal static class Program
 	{
 		var model = IndicatorType.GetField("_model", Private).GetValue(ind);
 		return (int)model.GetType().GetProperty("Resolved").GetValue(model);
-	}
-
-	private static List<string> ZoneKeys(FvgReactionLiquiditySweep ind)
-	{
-		var zones = (IList)IndicatorType.GetField("_zones", Private).GetValue(ind);
-		return zones.Cast<object>()
-			.Select(z => $"{Get(z, "StartBar")}|{Get(z, "Top")}|{Get(z, "Bottom")}|{Get(z, "IsBullish")}|{Get(z, "Filled")}|{Get(z, "ReactionMarked")}")
-			.ToList();
 	}
 
 	// a CandlePattern value as sorted member names

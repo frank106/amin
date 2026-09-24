@@ -7,6 +7,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 
@@ -135,6 +136,8 @@ namespace OFT.Rendering.Context
 		public bool Dashed { get; set; }
 		public string Text { get; set; }
 		public float FontSize { get; set; }
+		public Point[] Points { get; set; }
+		public int CornerRadius { get; set; }
 	}
 
 	// harness: records what was drawn so tests can inspect it
@@ -174,7 +177,8 @@ namespace OFT.Rendering.Context
 
 		public void FillRectangle(System.Drawing.Color color, Rectangle rectangle, int cornerRadius)
 		{
-			FillRectangle(color, rectangle);
+			Rectangles++;
+			Operations.Add(new DrawOperation { Kind = "fill", Color = color, Bounds = rectangle, CornerRadius = cornerRadius });
 		}
 
 		public void DrawRectangle(RenderPen pen, Rectangle rectangle)
@@ -201,6 +205,23 @@ namespace OFT.Rendering.Context
 
 		public void FillPolygon(System.Drawing.Color color, Point[] points)
 		{
+			if (points == null || points.Length < 3)
+				throw new ArgumentException("a polygon needs at least three points", nameof(points));
+
+			Operations.Add(new DrawOperation { Kind = "polygon", Color = color, From = points[0], Points = points });
+		}
+
+		public void FillEllipse(System.Drawing.Color color, Rectangle rectangle)
+		{
+			Operations.Add(new DrawOperation { Kind = "ellipse", Color = color, Bounds = rectangle });
+		}
+
+		public void DrawEllipse(RenderPen pen, Rectangle rectangle)
+		{
+			if (pen == null)
+				throw new ArgumentNullException(nameof(pen));
+
+			Operations.Add(new DrawOperation { Kind = "ring", Color = pen.Color, Bounds = rectangle, Width = pen.Width });
 		}
 
 		private static void Guard(string text, RenderFont font)
@@ -265,6 +286,47 @@ namespace ATAS.Indicators
 			return System.Drawing.Color.FromArgb(color.A, color.R, color.G, color.B);
 		}
 #endif
+	}
+
+	public enum MarketDataType
+	{
+		Trade,
+		Bid,
+		Ask
+	}
+
+	public enum TradeDirection
+	{
+		Between,
+		Buy,
+		Sell
+	}
+
+	public class MarketDataArg
+	{
+		public decimal Price { get; set; }
+		public decimal Volume { get; set; }
+		public DateTime Time { get; set; }
+		public MarketDataType DataType { get; set; }
+		public TradeDirection Direction { get; set; }
+		public bool IsBid => DataType == MarketDataType.Bid;
+		public bool IsAsk => DataType == MarketDataType.Ask;
+	}
+
+	public interface IMarketDepthInfo
+	{
+		IEnumerable<MarketDataArg> GetMarketDepthSnapshot();
+	}
+
+	// harness: an order book whose snapshot the test sets
+	public class MarketDepthStub : IMarketDepthInfo
+	{
+		public List<MarketDataArg> Levels { get; } = new List<MarketDataArg>();
+
+		public IEnumerable<MarketDataArg> GetMarketDepthSnapshot()
+		{
+			return Levels.ToArray();
+		}
 	}
 
 	public class PriceVolumeInfo
@@ -394,11 +456,14 @@ namespace ATAS.Indicators
 		public int FirstVisibleBarNumber { get; set; }                // harness setter
 		public int LastVisibleBarNumber { get; set; }                 // harness setter
 		public MouseLocationInfo MouseLocationInfo => ChartInfo?.MouseLocationInfo;
+		public IMarketDepthInfo MarketDepthInfo => Depth;
+		public DateTime MarketTime { get; set; }                      // harness setter
 
 		// harness
 		public List<IndicatorCandle> Candles { get; } = new List<IndicatorCandle>();
 		public HashSet<int> SessionStarts { get; } = new HashSet<int>();
 		public List<string> Alerts { get; } = new List<string>();
+		public MarketDepthStub Depth { get; } = new MarketDepthStub();
 		public DrawingLayouts SubscribedLayouts { get; private set; }
 		public int RecalculateRequests { get; private set; }
 
@@ -453,6 +518,14 @@ namespace ATAS.Indicators
 		{
 		}
 
+		protected virtual void MarketDepthChanged(MarketDataArg depth)
+		{
+		}
+
+		protected virtual void OnNewTrade(MarketDataArg trade)
+		{
+		}
+
 		// harness entry points (ATAS calls these internally)
 		public void HarnessRecalculate()
 		{
@@ -470,6 +543,16 @@ namespace ATAS.Indicators
 		public void HarnessRender(RenderContext context)
 		{
 			OnRender(context, DrawingLayouts.Final);
+		}
+
+		public void HarnessDepth(MarketDataArg depth)
+		{
+			MarketDepthChanged(depth);
+		}
+
+		public void HarnessTrade(MarketDataArg trade)
+		{
+			OnNewTrade(trade);
 		}
 	}
 }
