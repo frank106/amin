@@ -26,14 +26,22 @@ Requires the .NET 8 SDK. What it checks:
   hits TP 80 ticks later, a sweep of highs gives a SHORT, a trade whose stop moved at +40
   ticks exits at +20, a live dip below +20 before the trigger does not stop the trade, a
   signal only appears once its bar has closed, absorption confirms only on the right side
-  and at the right end of the bar, a reacted zone still dies when price closes through it;
+  and at the right end of the bar, a reacted zone still dies when price closes through it,
+  a hammer on the retest bar (or a shooting star on a sweep) is the fourth confirmation
+  and shows in the label, tooltip and alert;
+* candlestick patterns: a hand-built case for every pattern of the cheat sheet and the near
+  misses just outside each rule, checked for buys and again upside down (mirrored) for
+  shorts, with each pattern's switch off, the label order and the average-body yardstick;
 * randomised markets (thousands of bars, historical and tick by tick), compared with an
   independent re-implementation of the rules: every signal, trigger arrow, FVG zone and
-  trade outcome (break-even stop moves included), no look-ahead in any estimate, one trade
+  trade outcome (break-even stop moves included), the candlestick patterns of every bar in
+  both directions (the oracle derives the bearish ones by mirroring the candles, and the
+  market has to show all twenty), no look-ahead in any estimate, one trade
   at a time, cooldowns, filters, expiry, session ends, panel totals, alerts only in real
   time, identical signals between a tick-by-tick stream and a historical load, and
   deterministic recalculation;
-* rendering: labels, levels, panel, hover tooltip, cluster mode.
+* rendering: labels (each one's second line checked word for word), levels, panel, hover
+  tooltip, cluster mode.
 
 ATAS's platform color type differs by edition: classic ATAS uses WPF's
 `System.Windows.Media.Color`, ATAS X uses `System.Drawing.Color`. By default the stubs use a

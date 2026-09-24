@@ -1,10 +1,11 @@
 # FVG Reaction + Liquidity Sweep — ATAS indicator
 
 A custom indicator for the [ATAS](https://atas.net) platform that marks Fair Value Gap
-reactions, liquidity sweeps and footprint absorption, and turns them into **BUY / SHORT
-signals with the probability of each way the trade can end**: the take profit (80 ticks),
-the break-even stop (the stop moves to +20 ticks once the trade is 40 ticks in profit) or
-the stop loss (80 ticks).
+reactions, liquidity sweeps and footprint absorption, checks the signal bar for the
+candlestick patterns of [TraderLion's cheat sheet](https://traderlion.com/technical-analysis/candlestick-patterns-cheat-sheet/),
+and turns it all into **BUY / SHORT signals with the probability of each way the trade can
+end**: the take profit (80 ticks), the break-even stop (the stop moves to +20 ticks once
+the trade is 40 ticks in profit) or the stop loss (80 ticks).
 
 ![Layout preview](docs/preview.png)
 
@@ -18,7 +19,7 @@ screenshot: ATAS draws the candles and arrows itself, with its own fonts and the
 | Green / red boxes | Unfilled bullish / bearish Fair Value Gaps (3-candle imbalances), extended to the right until price closes through them |
 | Small arrows | Triggers: FVG reaction (lime / red) and liquidity sweep of lows / highs (aqua / magenta) |
 | Orange / blue cells | Absorption heatmap from footprint data: orange = aggressive buying absorbed (often resistance), blue = aggressive selling absorbed (often support) |
-| **Large arrows + label** | **BUY / SHORT signal** with its TP, break-even and SL probabilities and expected ticks |
+| **Large arrows + label** | **BUY / SHORT signal** with its TP, break-even and SL probabilities, expected ticks and candlestick pattern |
 | Shaded boxes | Each signal's trade: entry → TP shaded green, entry → SL shaded red, from the signal bar to the bar that settled it |
 | Amber lines | Dotted: the break-even trigger (+40 ticks). Solid: the stop after it moved to +20 ticks |
 | Panel | Results, sample size, the labels' track record and the live odds of the open trade |
@@ -31,16 +32,52 @@ A signal is decided when a bar **closes** (it never repaints) and needs a trigge
 * **Sweep** – the bar wicked beyond the high / low of the last *Swing Lookback* bars and closed back inside (a stop run).
 * **Sweep+FVG** – an FVG reaction within *Sweep → FVG window* bars after a sweep on the same side: liquidity is taken, then price reverses out of an imbalance.
 
-Each signal also counts up to three confirmations: **absorption** of the opposite side
+Each signal also counts up to four confirmations: **absorption** of the opposite side
 near the signal bar's extreme (sellers absorbed near the low for a buy, buyers absorbed
-near the high for a short), **trend** (close above / below the EMA) and **delta** (bar
-delta in the signal's direction). Any of them can be made mandatory.
+near the high for a short), **trend** (close above / below the EMA), **delta** (bar
+delta in the signal's direction) and a **candlestick pattern** pointing the signal's way
+(below). Any of them can be made mandatory.
 
 Entry is the signal bar's close; TP and SL are *Take profit* / *Stop loss* ticks away.
 With the default 80 / 80 on NQ that is 20 points each way ($400 per NQ contract, $40 per
 MNQ). Once the trade is *Break-even trigger* ticks in profit (40), its stop moves to
 *Break-even stop* ticks in profit (+20), so from then on it ends at +80 or +20. Set the
 trigger to 0 to trade the plain 80 / 80 bracket.
+
+### Candlestick patterns
+
+The fourth confirmation uses the patterns of TraderLion's candlestick cheat sheet. The
+signal bar has to *complete* one of them, as the last candle of a two- or three-candle
+pattern, and it has to point the signal's way: bullish patterns for buys, bearish ones
+for shorts.
+
+| Buy | Short | Candles | Rule |
+|---|---|---|---|
+| Hammer, dragonfly doji | Shooting star, gravestone doji | 1 | long wick below (above) at least 2× the body, the other wick at most a tenth of the range; a doji when the body is at most a tenth of the range |
+| Inverted hammer | Hanging man | 1 | the same shapes the other way up |
+| Bullish engulfing | Bearish engulfing | 2 | a bigger body, at least an average one, covering the whole body of the opposite candle before it |
+| Piercing line | Dark cloud cover | 2 | after a long opposite candle, opens at or beyond its close and closes past the middle of its body, but not past its open |
+| Bullish harami | Bearish harami | 2 | a long candle, then a small opposite one whose body stays inside it |
+| Tweezer bottom | Tweezer top | 2 | a bearish then a bullish candle with the same low, within *Tweezer match* ticks (tops: bullish then bearish, same high) |
+| Morning star | Evening star | 3 | a long candle, a small star (often a doji) no further than the middle of its body, then a long opposite candle closing past that middle |
+| Three white soldiers | Three black crows | 3 | three long candles the same way, each opening inside the body before it, closing further and in the last quarter of its range |
+| Bullish marubozu | Bearish marubozu | 1 | a long candle with (almost) no wicks. Not every cheat sheet lists it; switch it off to keep to the reversal patterns |
+
+"Long" and "small" bodies are measured against the average body of the 14 candles before
+the pattern (*Average body*).
+
+* **Context.** The cheat sheet reads bullish patterns after a decline and bearish ones after
+  a rally. The signal supplies that: a buy comes after a dip into an FVG or through a swing
+  low, a short after a rally. That is also what tells a hammer from a hanging man, and an
+  inverted hammer from a shooting star, since those are the same shapes read by where they appear.
+* **Futures rarely gap between bars**, so "opens below the previous close" is read as "at or
+  below", and the star of a morning / evening star needs no gap.
+* A plain **doji** or **spinning top** is indecision and points neither way, so it doesn't
+  count on its own. It shows up as the star of a morning / evening star.
+* A bar can complete several patterns. The label names one of them (three-candle patterns
+  first, e.g. `Morning star +1`) and the tooltip lists them all.
+* All the patterns together count as one confirmation. If pattern-confirmed signals do
+  better on your chart, the odds of their higher "conf" groups show it.
 
 ### Where the probability comes from
 
@@ -63,14 +100,16 @@ positive EV means that kind of signal has paid on this chart so far.
 ### Reading the chart
 
 ```
-BUY  TP 31% | BE 41% | SL 28%          [OPEN]   <- odds of each ending (they add up to 100), result badge
-Sweep+FVG | conf 2/3 | n=14 | EV +11t           <- trigger, confirmations, past trades of this exact setup, expected ticks
+BUY  TP 31% | BE 41% | SL 28%                   [OPEN]   <- odds of each ending (they add up to 100), result badge
+Sweep+FVG | Hammer | conf 3/4 | n=14 | EV +11t           <- trigger, candlestick pattern (if any), confirmations,
+                                                            past trades of this exact setup, expected ticks
 ```
 
 The badge turns **TP** (green), **BE** (amber, stopped at +20), **SL** (red) or **EXP**
 (expired) once the trade settles. Hover a label for the full breakdown: prices, the
 break-even levels, the TP / BE / SL counts behind the estimate at each level, which
-confirmations were present, when the stop moved and how the trade ended.
+confirmations were present (with every candlestick pattern the bar completed), when the
+stop moved and how the trade ended.
 
 By default every signal is shown, weak ones included — a label with a negative EV tells you
 that setup has cost ticks so far. Once the panel's track record shows the labels holding up
@@ -160,11 +199,16 @@ Your original settings keep their names and defaults.
 | | Signal source | FVG reaction or liquidity sweep | or FVG only, sweep only, sweep-then-FVG only |
 | | Sweep → FVG window (bars) | 10 | |
 | | Trend EMA period (0 = off) | 50 | |
-| | Only trade with the trend / Require delta / Require absorption | off | |
+| | Only trade with the trend / Require delta / Require absorption / Require candlestick pattern | off | |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
 | | Min expected ticks to show (0 = off) | 0 | hide signals with a lower EV; they are still learned from |
+| Candlestick Patterns | Use candlestick patterns | on | a pattern on the signal bar counts as the fourth confirmation |
+| | Hammer / Shooting star, Inverted hammer / Hanging man, Engulfing, Piercing line / Dark cloud cover, Harami, Tweezer bottom / top, Morning star / Evening star, Three white soldiers / black crows, Marubozu | on | one switch per pattern pair |
+| | Hammer wick / body (min) | 2 | for hammers, shooting stars, inverted hammers and hanging men |
+| | Average body (bars) | 14 | the yardstick for long and small bodies |
+| | Tweezer match (ticks) | 1 | how far apart a tweezer's two lows (highs) may be |
 | Take Profit / Stop Loss | Take profit (ticks) / Stop loss (ticks) | 80 / 80 | |
 | | Break-even trigger (ticks, 0 = off) | 40 | profit at which the stop moves |
 | | Break-even stop (ticks in profit) | 20 | where it moves to (0 = the entry price); kept below the trigger |

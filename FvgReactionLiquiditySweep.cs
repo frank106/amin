@@ -32,6 +32,9 @@ namespace ATAS.Indicators.Technical
 	//      once the trade is 40 ticks in profit), follows every signal until it ends,
 	//      and labels each new signal with the odds of ending at TP, at the
 	//      break-even stop or at SL.
+	//   6) Checks each signal bar for the candlestick patterns of TraderLion's cheat
+	//      sheet (hammer, engulfing, morning star, three soldiers, ...) that point the
+	//      signal's way - one of them counts as a confirmation.
 	//
 	// How the probabilities are estimated
 	// -----------------------------------
@@ -43,8 +46,9 @@ namespace ATAS.Indicators.Technical
 	// would have shown live.
 	//
 	// Signals are grouped direction -> trigger (FVG / sweep / sweep then FVG) ->
-	// number of confirmations (absorption, EMA trend, bar delta; 0-3). A group with
-	// few trades is shrunk toward its parent group (Dirichlet smoothing, per ending):
+	// number of confirmations (absorption, EMA trend, bar delta, candlestick pattern;
+	// 0-4). A group with few trades is shrunk toward its parent group (Dirichlet
+	// smoothing, per ending):
 	//     p = (count + k * p_parent) / (trades + k)
 	// and the top-level prior is the exact odds of a driftless random walk: 50 / 50
 	// for a plain symmetric bracket, TP 2/9 / BE 4/9 / SL 1/3 for 80 / 80 with the
@@ -123,6 +127,60 @@ namespace ATAS.Indicators.Technical
 			BreakEven,    // stopped at the break-even stop after the trigger was reached
 			StopLoss,
 			Expired
+		}
+
+		// The candlestick cheat sheet's patterns, as found on a signal bar. Each one points one
+		// way, so a buy only ever carries bullish ones and a short bearish ones.
+		[Flags]
+		private enum CandlePattern
+		{
+			None = 0,
+			Hammer = 1 << 0,
+			DragonflyDoji = 1 << 1,
+			ShootingStar = 1 << 2,
+			GravestoneDoji = 1 << 3,
+			InvertedHammer = 1 << 4,
+			HangingMan = 1 << 5,
+			BullishEngulfing = 1 << 6,
+			BearishEngulfing = 1 << 7,
+			PiercingLine = 1 << 8,
+			DarkCloudCover = 1 << 9,
+			BullishHarami = 1 << 10,
+			BearishHarami = 1 << 11,
+			TweezerBottom = 1 << 12,
+			TweezerTop = 1 << 13,
+			MorningStar = 1 << 14,
+			EveningStar = 1 << 15,
+			ThreeWhiteSoldiers = 1 << 16,
+			ThreeBlackCrows = 1 << 17,
+			BullishMarubozu = 1 << 18,
+			BearishMarubozu = 1 << 19
+		}
+
+		// the parts of a candle the patterns are made of
+		private readonly struct CandleShape
+		{
+			public CandleShape(IndicatorCandle candle)
+			{
+				Open = candle.Open;
+				High = candle.High;
+				Low = candle.Low;
+				Close = candle.Close;
+			}
+
+			public decimal Open { get; }
+			public decimal High { get; }
+			public decimal Low { get; }
+			public decimal Close { get; }
+			public decimal Range => High - Low;
+			public decimal Body => Math.Abs(Close - Open);
+			public decimal Top => Math.Max(Open, Close);        // top of the real body
+			public decimal Bottom => Math.Min(Open, Close);     // bottom of the real body
+			public decimal Middle => (Open + Close) / 2;        // middle of the real body
+			public decimal UpperWick => High - Top;
+			public decimal LowerWick => Bottom - Low;
+			public bool IsBullish => Close > Open;
+			public bool IsBearish => Close < Open;
 		}
 
 		private class FvgZone
@@ -330,6 +388,7 @@ namespace ATAS.Indicators.Technical
 			public bool HasAbsorption;
 			public bool WithTrend;
 			public bool DeltaConfirms;
+			public CandlePattern CandlePatterns;   // cheat-sheet patterns completed by the signal bar
 			public int Confirmations;
 			public ProbabilityEstimate Estimate;
 			public bool IsShown;          // false = tracked for the statistics only (filtered, or a position was already open)
@@ -414,11 +473,51 @@ namespace ATAS.Indicators.Technical
 
 		#region Fields
 
-		private const int MaxConfirmations = 3;
+		// absorption, EMA trend, bar delta and a candlestick pattern
+		private const int MaxConfirmations = 4;
 
 		// Share of the bar's range, measured from the low (buys) or high (shorts), that
 		// counts as "at the extreme" for the absorption confirmation.
 		private const decimal AbsorptionEdgeFraction = 0.35m;
+
+		// Candlestick pattern shapes, as shares of the candle's range (high - low):
+		// the "little or no" wick opposite a hammer's or shooting star's long one,
+		private const decimal PinBarMaxOtherWick = 0.1m;
+
+		// a doji's body - open and close "virtually equal",
+		private const decimal DojiMaxBody = 0.1m;
+
+		// how far from its high (low) each of three white soldiers (black crows) may close,
+		private const decimal SoldierMaxCloseGap = 0.25m;
+
+		// and each of a marubozu's (nearly absent) wicks.
+		private const decimal MarubozuMaxWick = 0.05m;
+
+		// Pattern names, in the order a label lists them: three-candle patterns first,
+		// then two-candle, then single candles.
+		private static readonly (CandlePattern Pattern, string Name)[] CandlePatternNames =
+		{
+			(CandlePattern.MorningStar, "Morning star"),
+			(CandlePattern.EveningStar, "Evening star"),
+			(CandlePattern.ThreeWhiteSoldiers, "Three white soldiers"),
+			(CandlePattern.ThreeBlackCrows, "Three black crows"),
+			(CandlePattern.BullishEngulfing, "Bullish engulfing"),
+			(CandlePattern.BearishEngulfing, "Bearish engulfing"),
+			(CandlePattern.PiercingLine, "Piercing line"),
+			(CandlePattern.DarkCloudCover, "Dark cloud cover"),
+			(CandlePattern.TweezerBottom, "Tweezer bottom"),
+			(CandlePattern.TweezerTop, "Tweezer top"),
+			(CandlePattern.BullishHarami, "Bullish harami"),
+			(CandlePattern.BearishHarami, "Bearish harami"),
+			(CandlePattern.Hammer, "Hammer"),
+			(CandlePattern.ShootingStar, "Shooting star"),
+			(CandlePattern.DragonflyDoji, "Dragonfly doji"),
+			(CandlePattern.GravestoneDoji, "Gravestone doji"),
+			(CandlePattern.InvertedHammer, "Inverted hammer"),
+			(CandlePattern.HangingMan, "Hanging man"),
+			(CandlePattern.BullishMarubozu, "Bullish marubozu"),
+			(CandlePattern.BearishMarubozu, "Bearish marubozu")
+		};
 
 		private const int MinHeatmapCellHeight = 3;
 
@@ -555,10 +654,25 @@ namespace ATAS.Indicators.Technical
 		private bool _onlyWithTrend;
 		private bool _requireDeltaConfirmation;
 		private bool _requireAbsorption;
+		private bool _requireCandlePattern;
 		private int _signalCooldownBars = 3;
 		private bool _oneTradeAtATime = true;
 		private int _minProbabilityPercent;
 		private int _minExpectedTicks;
+
+		private bool _useCandlePatterns = true;
+		private bool _patternHammer = true;
+		private bool _patternInvertedHammer = true;
+		private bool _patternEngulfing = true;
+		private bool _patternPiercingLine = true;
+		private bool _patternHarami = true;
+		private bool _patternTweezers = true;
+		private bool _patternStars = true;
+		private bool _patternThreeSoldiers = true;
+		private bool _patternMarubozu = true;
+		private double _pinBarWickRatio = 2.0;
+		private int _patternAverageBars = 14;
+		private int _tweezerToleranceTicks = 1;
 
 		private int _takeProfitTicks = 80;
 		private int _stopLossTicks = 80;
@@ -701,7 +815,7 @@ namespace ATAS.Indicators.Technical
 		}
 
 		[Display(Name = "Trend EMA period (0 = off)", GroupName = "Signals", Order = 104,
-			Description = "Close above the EMA confirms buys, below confirms shorts. Counts as one of the three confirmations.")]
+			Description = "Close above the EMA confirms buys, below confirms shorts. Counts as one of the four confirmations.")]
 		[Range(0, 10000)]
 		public int TrendEmaPeriod
 		{
@@ -732,7 +846,15 @@ namespace ATAS.Indicators.Technical
 			set { _requireAbsorption = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Cooldown between signals (bars)", GroupName = "Signals", Order = 108,
+		[Display(Name = "Require candlestick pattern", GroupName = "Signals", Order = 108,
+			Description = "Only signal when the signal bar completes one of the candlestick patterns switched on under Candlestick Patterns, pointing the signal's way.")]
+		public bool RequireCandlePattern
+		{
+			get => _requireCandlePattern;
+			set { _requireCandlePattern = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Cooldown between signals (bars)", GroupName = "Signals", Order = 109,
 			Description = "Minimum bars before another signal in the same direction, so one move isn't counted several times.")]
 		[Range(0, 1000)]
 		public int SignalCooldownBars
@@ -741,7 +863,7 @@ namespace ATAS.Indicators.Technical
 			set { _signalCooldownBars = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "One trade at a time", GroupName = "Signals", Order = 109,
+		[Display(Name = "One trade at a time", GroupName = "Signals", Order = 110,
 			Description = "While a shown signal's trade is still open, new signals are not shown (they are still tracked for the statistics).")]
 		public bool OneTradeAtATime
 		{
@@ -749,7 +871,7 @@ namespace ATAS.Indicators.Technical
 			set { _oneTradeAtATime = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Min TP probability to show (%)", GroupName = "Signals", Order = 110,
+		[Display(Name = "Min TP probability to show (%)", GroupName = "Signals", Order = 111,
 			Description = "Hide signals whose estimated take-profit probability is below this. Hidden signals are still tracked so the statistics keep learning.")]
 		[Range(0, 100)]
 		public int MinProbabilityPercent
@@ -758,13 +880,120 @@ namespace ATAS.Indicators.Technical
 			set { _minProbabilityPercent = Math.Min(100, Math.Max(0, value)); RecalculateValues(); }
 		}
 
-		[Display(Name = "Min expected ticks to show (0 = off)", GroupName = "Signals", Order = 111,
+		[Display(Name = "Min expected ticks to show (0 = off)", GroupName = "Signals", Order = 112,
 			Description = "Hide signals whose expected result - the TP, break-even and SL ticks weighted by their odds - is below this. Hidden signals are still tracked.")]
 		[Range(0, 100000)]
 		public int MinExpectedTicks
 		{
 			get => _minExpectedTicks;
 			set { _minExpectedTicks = Math.Max(0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Use candlestick patterns", GroupName = "Candlestick Patterns", Order = 150,
+			Description = "A pattern from the candlestick cheat sheet that completes on the signal bar, pointing the signal's way, counts as one of the four confirmations.")]
+		public bool UseCandlePatterns
+		{
+			get => _useCandlePatterns;
+			set { _useCandlePatterns = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Hammer / Shooting star", GroupName = "Candlestick Patterns", Order = 151,
+			Description = "Buys: a small body at the top of the candle, a lower wick at least 'wick / body' times the body and little or no upper wick (a dragonfly doji when the body is almost nil). Shorts: the same upside down - shooting star, gravestone doji.")]
+		public bool PatternHammer
+		{
+			get => _patternHammer;
+			set { _patternHammer = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Inverted hammer / Hanging man", GroupName = "Candlestick Patterns", Order = 152,
+			Description = "The same shapes the other way up. Buys: an inverted hammer (long upper wick) after the dip. Shorts: a hanging man (long lower wick) after the rally.")]
+		public bool PatternInvertedHammer
+		{
+			get => _patternInvertedHammer;
+			set { _patternInvertedHammer = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Engulfing", GroupName = "Candlestick Patterns", Order = 153,
+			Description = "A candle whose body covers the whole body of the opposite-colored candle before it, and is at least an average body.")]
+		public bool PatternEngulfing
+		{
+			get => _patternEngulfing;
+			set { _patternEngulfing = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Piercing line / Dark cloud cover", GroupName = "Candlestick Patterns", Order = 154,
+			Description = "After a long bearish candle, a bullish one from its close or lower that closes above the middle of its body, but not above its open (piercing line). Shorts: the mirror image (dark cloud cover).")]
+		public bool PatternPiercingLine
+		{
+			get => _patternPiercingLine;
+			set { _patternPiercingLine = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Harami", GroupName = "Candlestick Patterns", Order = 155,
+			Description = "A long candle, then a small candle of the other color whose body stays inside the first candle's body.")]
+		public bool PatternHarami
+		{
+			get => _patternHarami;
+			set { _patternHarami = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Tweezer bottom / top", GroupName = "Candlestick Patterns", Order = 156,
+			Description = "A bearish then a bullish candle with the same low (buys), or a bullish then a bearish candle with the same high (shorts).")]
+		public bool PatternTweezers
+		{
+			get => _patternTweezers;
+			set { _patternTweezers = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Morning star / Evening star", GroupName = "Candlestick Patterns", Order = 157,
+			Description = "A long bearish candle, a small one (the star, often a doji) no higher than the middle of its body, then a long bullish candle closing above that middle. Shorts: the mirror image.")]
+		public bool PatternStars
+		{
+			get => _patternStars;
+			set { _patternStars = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Three white soldiers / black crows", GroupName = "Candlestick Patterns", Order = 158,
+			Description = "Three long bullish candles, each opening inside the body before it, closing higher and near its high. Shorts: three long bearish candles the other way.")]
+		public bool PatternThreeSoldiers
+		{
+			get => _patternThreeSoldiers;
+			set { _patternThreeSoldiers = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Marubozu", GroupName = "Candlestick Patterns", Order = 159,
+			Description = "A long candle with (almost) no wicks: it opened at one end of its range and closed at the other.")]
+		public bool PatternMarubozu
+		{
+			get => _patternMarubozu;
+			set { _patternMarubozu = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Hammer wick / body (min)", GroupName = "Candlestick Patterns", Order = 160,
+			Description = "How many times the body the long wick of a hammer, shooting star, inverted hammer or hanging man must be. The cheat sheet says at least 2.")]
+		[Range(1.0, 100.0)]
+		public double PinBarWickRatio
+		{
+			get => _pinBarWickRatio;
+			set { _pinBarWickRatio = Math.Max(1.0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Average body (bars)", GroupName = "Candlestick Patterns", Order = 161,
+			Description = "Long and small bodies are measured against the average body of this many candles before the pattern.")]
+		[Range(1, 1000)]
+		public int PatternAverageBars
+		{
+			get => _patternAverageBars;
+			set { _patternAverageBars = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Tweezer match (ticks)", GroupName = "Candlestick Patterns", Order = 162,
+			Description = "How far apart the two lows of a tweezer bottom (or highs of a tweezer top) may be and still count as the same price.")]
+		[Range(0, 1000)]
+		public int TweezerToleranceTicks
+		{
+			get => _tweezerToleranceTicks;
+			set { _tweezerToleranceTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
 		[Display(Name = "Take profit (ticks)", GroupName = "Take Profit / Stop Loss", Order = 200)]
@@ -1272,6 +1501,204 @@ namespace ATAS.Indicators.Technical
 
 		#endregion
 
+		#region Candlestick patterns
+
+		// The patterns of TraderLion's candlestick cheat sheet that complete on the signal bar
+		// and point the trade's way. The cheat sheet reads them after a decline (bullish ones)
+		// or a rally (bearish ones); the signal supplies that context, since a buy comes after a
+		// dip into an FVG or through a swing low and a short after a rally. It is also what
+		// tells a hammer from a hanging man, and an inverted hammer from a shooting star: the
+		// same shapes, read by where they appear. Only closed bars are read.
+		private CandlePattern FindCandlePatterns(int bar, bool isLong)
+		{
+			if (!UseCandlePatterns)
+				return CandlePattern.None;
+
+			var c = new CandleShape(GetCandle(bar));
+			var found = SingleCandlePatterns(c, AverageBody(bar), isLong);
+
+			if (bar < 1)
+				return found;
+
+			var p = new CandleShape(GetCandle(bar - 1));
+			found |= TwoCandlePatterns(p, c, AverageBody(bar - 1), isLong);
+
+			if (bar < 2)
+				return found;
+
+			var a = new CandleShape(GetCandle(bar - 2));
+			return found | ThreeCandlePatterns(a, p, c, AverageBody(bar - 2), isLong);
+		}
+
+		// Average real body of the candles before a pattern's first candle, the yardstick for
+		// "long" and "small" bodies (0 when there are none)
+		private decimal AverageBody(int firstBar)
+		{
+			var from = Math.Max(0, firstBar - PatternAverageBars);
+
+			if (from >= firstBar)
+				return 0;
+
+			var sum = 0m;
+
+			for (var i = from; i < firstBar; i++)
+			{
+				var candle = GetCandle(i);
+				sum += Math.Abs(candle.Close - candle.Open);
+			}
+
+			return sum / (firstBar - from);
+		}
+
+		private static bool IsLongBody(CandleShape candle, decimal averageBody)
+		{
+			return candle.Body > 0 && candle.Body >= averageBody;
+		}
+
+		private static bool IsSmallBody(CandleShape candle, decimal averageBody)
+		{
+			return candle.Body < averageBody;
+		}
+
+		private CandlePattern SingleCandlePatterns(CandleShape c, decimal averageBody, bool isLong)
+		{
+			if (c.Range <= 0)
+				return CandlePattern.None;
+
+			var ratio = (decimal)PinBarWickRatio;
+			var doji = c.Body <= DojiMaxBody * c.Range;
+
+			// the hammer shape: long wick below a small body, little or no wick above - and upside down
+			var longLowerWick = c.LowerWick >= ratio * c.Body && c.UpperWick <= PinBarMaxOtherWick * c.Range;
+			var longUpperWick = c.UpperWick >= ratio * c.Body && c.LowerWick <= PinBarMaxOtherWick * c.Range;
+			var marubozu = IsLongBody(c, averageBody)
+				&& c.UpperWick <= MarubozuMaxWick * c.Range && c.LowerWick <= MarubozuMaxWick * c.Range;
+
+			var found = CandlePattern.None;
+
+			if (isLong)
+			{
+				if (PatternHammer && longLowerWick)
+					found |= doji ? CandlePattern.DragonflyDoji : CandlePattern.Hammer;
+
+				if (PatternInvertedHammer && longUpperWick)
+					found |= CandlePattern.InvertedHammer;
+
+				if (PatternMarubozu && marubozu && c.IsBullish)
+					found |= CandlePattern.BullishMarubozu;
+			}
+			else
+			{
+				if (PatternHammer && longUpperWick)
+					found |= doji ? CandlePattern.GravestoneDoji : CandlePattern.ShootingStar;
+
+				if (PatternInvertedHammer && longLowerWick)
+					found |= CandlePattern.HangingMan;
+
+				if (PatternMarubozu && marubozu && c.IsBearish)
+					found |= CandlePattern.BearishMarubozu;
+			}
+
+			return found;
+		}
+
+		// p = the candle before the signal bar c. Futures rarely gap between bars, so "opens
+		// below the previous close" is taken as "at or below".
+		private CandlePattern TwoCandlePatterns(CandleShape p, CandleShape c, decimal averageBody, bool isLong)
+		{
+			var tolerance = TweezerToleranceTicks * TickSize;
+			var found = CandlePattern.None;
+
+			if (isLong)
+			{
+				// a bearish candle, then a bigger bullish one whose body covers all of it
+				if (PatternEngulfing && p.IsBearish && c.IsBullish && c.Open <= p.Close && c.Close >= p.Open
+					&& c.Body > p.Body && IsLongBody(c, averageBody))
+					found |= CandlePattern.BullishEngulfing;
+
+				// a long bearish candle, then a bullish one back above the middle of its body
+				if (PatternPiercingLine && p.IsBearish && IsLongBody(p, averageBody) && c.IsBullish
+					&& c.Open <= p.Close && c.Close > p.Middle && c.Close < p.Open)
+					found |= CandlePattern.PiercingLine;
+
+				// a long bearish candle, then a small bullish one inside its body
+				if (PatternHarami && p.IsBearish && IsLongBody(p, averageBody) && c.IsBullish && IsSmallBody(c, averageBody)
+					&& c.Open >= p.Close && c.Close <= p.Open)
+					found |= CandlePattern.BullishHarami;
+
+				// a bearish and a bullish candle bottoming at the same price
+				if (PatternTweezers && p.IsBearish && c.IsBullish && Math.Abs(c.Low - p.Low) <= tolerance)
+					found |= CandlePattern.TweezerBottom;
+			}
+			else
+			{
+				if (PatternEngulfing && p.IsBullish && c.IsBearish && c.Open >= p.Close && c.Close <= p.Open
+					&& c.Body > p.Body && IsLongBody(c, averageBody))
+					found |= CandlePattern.BearishEngulfing;
+
+				if (PatternPiercingLine && p.IsBullish && IsLongBody(p, averageBody) && c.IsBearish
+					&& c.Open >= p.Close && c.Close < p.Middle && c.Close > p.Open)
+					found |= CandlePattern.DarkCloudCover;
+
+				if (PatternHarami && p.IsBullish && IsLongBody(p, averageBody) && c.IsBearish && IsSmallBody(c, averageBody)
+					&& c.Open <= p.Close && c.Close >= p.Open)
+					found |= CandlePattern.BearishHarami;
+
+				if (PatternTweezers && p.IsBullish && c.IsBearish && Math.Abs(c.High - p.High) <= tolerance)
+					found |= CandlePattern.TweezerTop;
+			}
+
+			return found;
+		}
+
+		// a, p = the two candles before the signal bar c
+		private CandlePattern ThreeCandlePatterns(CandleShape a, CandleShape p, CandleShape c, decimal averageBody, bool isLong)
+		{
+			var found = CandlePattern.None;
+
+			// each candle opens inside the previous body
+			var opensInside = p.Open >= a.Bottom && p.Open <= a.Top && c.Open >= p.Bottom && c.Open <= p.Top;
+
+			if (isLong)
+			{
+				// a long bearish candle, a small star no higher than the middle of its body, then a
+				// long bullish candle closing above that middle
+				if (PatternStars && a.IsBearish && IsLongBody(a, averageBody) && IsSmallBody(p, averageBody) && p.Top <= a.Middle
+					&& c.IsBullish && IsLongBody(c, averageBody) && c.Close > a.Middle)
+					found |= CandlePattern.MorningStar;
+
+				if (PatternThreeSoldiers && IsSoldier(a, averageBody) && IsSoldier(p, averageBody) && IsSoldier(c, averageBody)
+					&& opensInside && p.Close > a.Close && c.Close > p.Close)
+					found |= CandlePattern.ThreeWhiteSoldiers;
+			}
+			else
+			{
+				if (PatternStars && a.IsBullish && IsLongBody(a, averageBody) && IsSmallBody(p, averageBody) && p.Bottom >= a.Middle
+					&& c.IsBearish && IsLongBody(c, averageBody) && c.Close < a.Middle)
+					found |= CandlePattern.EveningStar;
+
+				if (PatternThreeSoldiers && IsCrow(a, averageBody) && IsCrow(p, averageBody) && IsCrow(c, averageBody)
+					&& opensInside && p.Close < a.Close && c.Close < p.Close)
+					found |= CandlePattern.ThreeBlackCrows;
+			}
+
+			return found;
+		}
+
+		// a long bullish candle closing near its high
+		private static bool IsSoldier(CandleShape candle, decimal averageBody)
+		{
+			return candle.IsBullish && IsLongBody(candle, averageBody) && candle.High - candle.Close <= SoldierMaxCloseGap * candle.Range;
+		}
+
+		// a long bearish candle closing near its low
+		private static bool IsCrow(CandleShape candle, decimal averageBody)
+		{
+			return candle.IsBearish && IsLongBody(candle, averageBody) && candle.Close - candle.Low <= SoldierMaxCloseGap * candle.Range;
+		}
+
+		#endregion
+
 		#region Signals and TP / SL tracking
 
 		private void GenerateSignals(int bar, IndicatorCandle candle, bool bullReaction, bool bearReaction,
@@ -1351,13 +1778,16 @@ namespace ATAS.Indicators.Technical
 			var withTrend = TrendEmaPeriod > 0 && bar >= TrendEmaPeriod
 				&& (isLong ? candle.Close > _ema[bar] : candle.Close < _ema[bar]);
 			var deltaConfirms = isLong ? candle.Delta > 0 : candle.Delta < 0;
+			var patterns = FindCandlePatterns(bar, isLong);
+			var hasPattern = patterns != CandlePattern.None;
 
 			if ((OnlyWithTrend && !withTrend)
 				|| (RequireDeltaConfirmation && !deltaConfirms)
-				|| (RequireAbsorption && !absorption))
+				|| (RequireAbsorption && !absorption)
+				|| (RequireCandlePattern && !hasPattern))
 				return null;
 
-			var confirmations = (absorption ? 1 : 0) + (withTrend ? 1 : 0) + (deltaConfirms ? 1 : 0);
+			var confirmations = (absorption ? 1 : 0) + (withTrend ? 1 : 0) + (deltaConfirms ? 1 : 0) + (hasPattern ? 1 : 0);
 			var tickSize = TickSize;
 			var entry = candle.Close;
 			var direction = isLong ? 1 : -1;
@@ -1380,6 +1810,7 @@ namespace ATAS.Indicators.Technical
 				HasAbsorption = absorption,
 				WithTrend = withTrend,
 				DeltaConfirms = deltaConfirms,
+				CandlePatterns = patterns,
 				Confirmations = confirmations,
 				Estimate = _model.Estimate(isLong, trigger, confirmations, PriorOdds(), ProbabilitySmoothing,
 					TakeProfitTicks, breakEven ? EffectiveBreakEvenStopTicks : 0, StopLossTicks)
@@ -1422,7 +1853,8 @@ namespace ATAS.Indicators.Technical
 
 			if (_realtime && UseAlerts)
 			{
-				var message = $"{Side(trade)} @ {FormatPrice(trade.EntryPrice)} ({TriggerLabel(trade.Trigger)}): {OddsText(trade, " / ")}"
+				var setup = string.Join(", ", PatternNames(trade.CandlePatterns).Prepend(TriggerLabel(trade.Trigger)));
+				var message = $"{Side(trade)} @ {FormatPrice(trade.EntryPrice)} ({setup}): {OddsText(trade, " / ")}"
 					+ $"  -  TP {FormatPrice(trade.TakeProfitPrice)}, SL {FormatPrice(trade.StopLossPrice)}";
 
 				QueueAlert(ref alerts, message, trade.IsLong ? BuyColor : ShortColor);
@@ -1960,10 +2392,11 @@ namespace ATAS.Indicators.Technical
 		}
 
 		// Two-line label under a buy / above a short:
-		//   BUY  TP 31% | BE 41% | SL 28%            [OPEN / TP / BE / SL / EXP]
-		//   Sweep+FVG | conf 2/3 | n=14 | EV +6t
-		// n = past signals with exactly this setup, EV = the ticks those odds are worth.
-		// Returns the label under the mouse.
+		//   BUY  TP 31% | BE 41% | SL 28%                    [OPEN / TP / BE / SL / EXP]
+		//   Sweep+FVG | Hammer | conf 3/4 | n=14 | EV +6t
+		// n = past signals with exactly this setup, EV = the ticks those odds are worth. The
+		// candlestick pattern, when the bar completed one, is the first in label order ("+1"
+		// when there are more). Returns the label under the mouse.
 		private SignalTrade RenderSignalLabels(RenderContext context, List<SignalTrade> trades, int firstBar, int lastBar)
 		{
 			const int pad = 4;
@@ -1983,7 +2416,11 @@ namespace ATAS.Indicators.Technical
 					continue;
 
 				var line1 = $"{Side(trade)}  {OddsText(trade.HasBreakEven, trade.Estimate.Odds, " | ")}";
-				var line2 = $"{TriggerLabel(trade.Trigger)} | conf {trade.Confirmations}/{MaxConfirmations} | n={trade.Estimate.Setup.Count}"
+				var patterns = PatternNames(trade.CandlePatterns);
+				var pattern = patterns.Count == 0 ? string.Empty
+					: patterns.Count == 1 ? $" | {patterns[0]}"
+					: $" | {patterns[0]} +{patterns.Count - 1}";
+				var line2 = $"{TriggerLabel(trade.Trigger)}{pattern} | conf {trade.Confirmations}/{MaxConfirmations} | n={trade.Estimate.Setup.Count}"
 					+ $" | EV {SignedTicks(LabelExpectedTicks(trade))}t";
 				var badge = OutcomeBadge(trade.Outcome);
 
@@ -2105,7 +2542,12 @@ namespace ATAS.Indicators.Technical
 			lines.Add(($"This setup: {TallyText(estimate.Setup, trade.HasBreakEven)}", Color.Silver));
 			lines.Add(($"All {TriggerLabel(trade.Trigger)} {side}: {TallyText(estimate.Trigger, trade.HasBreakEven)}", Color.Silver));
 			lines.Add(($"All {side}: {TallyText(estimate.Direction, trade.HasBreakEven)}", Color.Silver));
-			lines.Add(($"Absorption {YesNo(trade.HasAbsorption)}   Trend {YesNo(trade.WithTrend)}   Delta {YesNo(trade.DeltaConfirms)}", Color.Silver));
+			var patterns = PatternNames(trade.CandlePatterns);
+			lines.Add(($"Absorption {YesNo(trade.HasAbsorption)}   Trend {YesNo(trade.WithTrend)}   Delta {YesNo(trade.DeltaConfirms)}"
+				+ $"   Pattern {YesNo(patterns.Count > 0)}", Color.Silver));
+
+			if (patterns.Count > 0)
+				lines.Add(($"Candlestick pattern{(patterns.Count > 1 ? "s" : string.Empty)}: {string.Join(", ", patterns)}", Color.Silver));
 
 			if (trade.BreakEvenActive)
 				lines.Add(($"Stop moved to +{EffectiveBreakEvenStopTicks}t on bar {trade.BreakEvenBar}", BreakEvenPen.Color.Convert()));
@@ -2322,6 +2764,12 @@ namespace ATAS.Indicators.Technical
 		private static string Side(SignalTrade trade)
 		{
 			return trade.IsLong ? "BUY" : "SHORT";
+		}
+
+		// the names of the patterns in `patterns`, in label order
+		private static List<string> PatternNames(CandlePattern patterns)
+		{
+			return CandlePatternNames.Where(p => (patterns & p.Pattern) != 0).Select(p => p.Name).ToList();
 		}
 
 		// whole percentages that add up to 100: the leftover points go to the largest remainders

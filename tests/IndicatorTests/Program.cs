@@ -42,6 +42,8 @@ internal static class Program
 		Run("Live ticks: a dip before the trigger is not a break-even exit", LiveBreakEvenFollowsTheTicks);
 		Run("Absorption: heatmap cells and buy confirmation", AbsorptionConfirmation);
 		Run("FVG: a reacted zone still dies when price closes through", ReactedZoneIsInvalidated);
+		Run("Candlestick patterns: shapes and near misses, both ways", CandlePatternShapes);
+		Run("Candlestick patterns: the fourth confirmation", CandlePatternConfirmation);
 		Run("Fuzz: historical run vs oracle", () => FuzzHistorical(seed: 7, configure: null));
 		Run("Fuzz: expiry + session end + cooldown 0", () => FuzzHistorical(seed: 11, configure: i =>
 		{
@@ -74,6 +76,15 @@ internal static class Program
 			i.StopLossTicks = 60;
 			i.BreakEvenTriggerTicks = 30;
 			i.BreakEvenStopTicks = 0;
+		}));
+		Run("Fuzz: candlestick pattern required, other shapes", () => FuzzHistorical(seed: 43, configure: i =>
+		{
+			i.RequireCandlePattern = true;
+			i.PinBarWickRatio = 1.5;
+			i.PatternAverageBars = 5;
+			i.TweezerToleranceTicks = 0;
+			i.PatternHarami = false;
+			i.PatternMarubozu = false;
 		}));
 		Run("Fuzz: filters hide signals, the model still learns", FuzzFilters);
 		Run("Fuzz: live tick stream matches history", FuzzLiveMatchesHistory);
@@ -277,6 +288,7 @@ internal static class Program
 		CheckClose(one.Tp + one.Be + one.Sl, 1, 1e-12, "odds add up to 1");
 		CheckClose(one.Ev, one.Tp * 80 + one.Be * 20 - one.Sl * 80, 1e-12, "expected ticks");
 		CheckClose(Estimate(true, fvg, 2).Tp, trigger.Item1, 1e-12, "one TP, same trigger, other confirmations");
+		CheckClose(Estimate(true, fvg, 4).Tp, trigger.Item1, 1e-12, "all four confirmations is a setup of its own");
 		CheckClose(Estimate(true, sweep, 1).Tp, direction.Item1, 1e-12, "one TP, other trigger");
 		CheckClose(Estimate(false, fvg, 1).Tp, prior.Item1, 1e-12, "shorts are unaffected by longs");
 
@@ -378,6 +390,138 @@ internal static class Program
 			Check(sl < last && sl > 0 && sl < 1, $"SL odds should fall as price rises ({price})");
 			last = sl;
 		}
+	}
+
+	// Hand-built cases for every pattern and the near misses that fall just outside it. Each
+	// case is checked for buys, and again upside down (mirrored) for shorts, where it must give
+	// the bearish twin; then with its pattern's switch off.
+	private static void CandlePatternShapes()
+	{
+		var cases = new (string Name, decimal[][] Candles, string[] Expected, Action<FvgReactionLiquiditySweep> Configure)[]
+		{
+			("hammer", new[] { C(100, 101, 97, 100.75m) }, new[] { "Hammer" }, null),
+			("hammer, upper wick over a tenth of the range", new[] { C(100, 101.5m, 97, 100.75m) }, new string[0], null),
+			("hammer, lower wick 1.67x the body", new[] { C(100, 100.75m, 98.75m, 100.75m) }, new string[0], null),
+			("... is a hammer with wick / body 1.5", new[] { C(100, 100.75m, 98.75m, 100.75m) }, new[] { "Hammer" }, i => i.PinBarWickRatio = 1.5),
+			("dragonfly doji", new[] { C(100, 100.25m, 97, 100) }, new[] { "DragonflyDoji" }, null),
+			("inverted hammer", new[] { C(100, 103, 99.75m, 100.75m) }, new[] { "InvertedHammer" }, null),
+			("gravestone shape at a buy is an inverted hammer", new[] { C(100, 103, 99.75m, 100) }, new[] { "InvertedHammer" }, null),
+			("marubozu", new[] { C(100, 102, 100, 102) }, new[] { "BullishMarubozu" }, null),
+			("marubozu with a 1-tick wick", new[] { C(100, 102.25m, 100, 102) }, new string[0], null),
+			("marubozu under the average body", new[] { C(100, 100.75m, 100, 100.75m) }, new string[0], null),
+			("bullish engulfing", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.75m, 99.25m, 101.5m) }, new[] { "BullishEngulfing" }, null),
+			("short of the open: piercing line and harami", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101, 99.25m, 100.75m) },
+				new[] { "BullishHarami", "PiercingLine" }, null),
+			("engulfing body no bigger", new[] { C(101, 101.25m, 99.75m, 100), C(100, 101.25m, 99.25m, 101) }, new string[0], null),
+			("engulfing under the average body", new[] { C(100.25m, 100.5m, 99.75m, 100), C(100, 100.75m, 99.25m, 100.5m) }, new string[0], null),
+			("engulfing after a gap, closing right on the open", new[] { C(101, 101.25m, 99.75m, 100), C(99.5m, 101.25m, 99.25m, 101) },
+				new[] { "BullishEngulfing" }, null),
+			("engulfing opening above the close before", new[] { C(101, 101.25m, 99.75m, 100), C(100.25m, 101.75m, 100.25m, 101.5m) }, new string[0], null),
+			("piercing line", new[] { C(102, 102.25m, 99.75m, 100), C(100, 101.5m, 99.25m, 101.25m) }, new[] { "PiercingLine" }, null),
+			("piercing line closing on the middle", new[] { C(102, 102.25m, 99.75m, 100), C(100, 101.25m, 99.25m, 101) }, new string[0], null),
+			("piercing line opening above the close before", new[] { C(102, 102.25m, 99.75m, 100), C(100.25m, 101.5m, 100.25m, 101.25m) }, new string[0], null),
+			("bullish harami", new[] { C(102, 102.25m, 99.75m, 100), C(100.5m, 101.25m, 100.25m, 101) }, new[] { "BullishHarami" }, null),
+			("harami body poking out above", new[] { C(102, 102.25m, 99.75m, 100), C(101.5m, 102.5m, 101.25m, 102.25m) }, new string[0], null),
+			("harami body poking out below", new[] { C(102, 102.25m, 99.75m, 100), C(99.75m, 100.75m, 99.25m, 100.5m) }, new string[0], null),
+			("harami body not small", new[] { C(102, 102.25m, 99.75m, 100), C(100.25m, 101.75m, 100.25m, 101.5m) }, new string[0], null),
+			("tweezer bottom", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.25m, 101, 99.75m, 100.75m) }, new[] { "TweezerBottom" }, null),
+			("tweezer lows 2 ticks apart", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.25m, 101, 100, 100.75m) }, new string[0], null),
+			("... match within 2 ticks", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.25m, 101, 100, 100.75m) }, new[] { "TweezerBottom" },
+				i => i.TweezerToleranceTicks = 2),
+			("tweezer, second candle bearish", new[] { C(101, 101.25m, 99.5m, 100.25m), C(100.75m, 101, 99.75m, 100.25m) }, new string[0], null),
+			("morning star", new[] { C(103, 103.25m, 100.75m, 101), C(101, 101.5m, 100.5m, 101.25m), C(101.25m, 102.75m, 101, 102.5m) },
+				new[] { "MorningStar" }, null),
+			("star above the middle of the first body", new[] { C(103, 103.25m, 100.75m, 101), C(102.25m, 102.75m, 102, 102.5m), C(101.25m, 102.75m, 101, 102.5m) },
+				new string[0], null),
+			("star with an average body", new[] { C(103, 103.25m, 100.75m, 101), C(101, 102.25m, 100.75m, 102), C(101.75m, 103, 101.5m, 102.75m) },
+				new string[0], null),
+			("third candle closing on the middle", new[] { C(103, 103.25m, 100.75m, 101), C(101, 101.5m, 100.5m, 101.25m), C(101, 102.25m, 100.75m, 102) },
+				new string[0], null),
+			("first candle under the average body", new[] { C(102, 102.25m, 100.75m, 101.25m), C(101.25m, 101.75m, 100.75m, 101.5m), C(101.5m, 103, 101.25m, 102.75m) },
+				new string[0], null),
+			("three white soldiers", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(102.25m, 104, 102, 103.75m) },
+				new[] { "ThreeWhiteSoldiers" }, null),
+			("soldier opening above the body before", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101.5m, 102.75m, 101.25m, 102.5m), C(102.25m, 104, 102, 103.75m) },
+				new string[0], null),
+			("soldier closing far from its high", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(102.25m, 104.75m, 102, 103.75m) },
+				new string[0], null),
+			("soldiers not closing higher", new[] { C(100, 101.5m, 99.75m, 101.25m), C(101, 102.75m, 100.75m, 102.5m), C(101.25m, 102.75m, 101, 102.5m) },
+				new string[0], null)
+		};
+
+		// the switch that covers each pattern
+		var family = new Dictionary<string, Action<FvgReactionLiquiditySweep>>
+		{
+			["Hammer"] = i => i.PatternHammer = false,
+			["DragonflyDoji"] = i => i.PatternHammer = false,
+			["InvertedHammer"] = i => i.PatternInvertedHammer = false,
+			["BullishMarubozu"] = i => i.PatternMarubozu = false,
+			["BullishEngulfing"] = i => i.PatternEngulfing = false,
+			["PiercingLine"] = i => i.PatternPiercingLine = false,
+			["BullishHarami"] = i => i.PatternHarami = false,
+			["TweezerBottom"] = i => i.PatternTweezers = false,
+			["MorningStar"] = i => i.PatternStars = false,
+			["ThreeWhiteSoldiers"] = i => i.PatternThreeSoldiers = false
+		};
+
+		foreach (var (name, candles, expected, configure) in cases)
+		{
+			var bars = PatternBars(candles);
+			var buy = PatternsAt(bars, true, configure);
+			Check(buy.SequenceEqual(expected), $"{name}: got [{string.Join(",", buy)}]");
+
+			// upside down it is the bearish twin, for a short
+			var twin = expected.Select(n => BearishTwin[n]).OrderBy(n => n, StringComparer.Ordinal).ToList();
+			var sell = PatternsAt(Mirror(bars, 400), false, configure);
+			Check(sell.SequenceEqual(twin), $"{name}, mirrored: got [{string.Join(",", sell)}]");
+
+			foreach (var pattern in expected)
+			{
+				var off = PatternsAt(bars, true, i => { configure?.Invoke(i); family[pattern](i); });
+				Check(!off.Contains(pattern), $"{name}: still found with its switch off");
+
+				var twinOff = PatternsAt(Mirror(bars, 400), false, i => { configure?.Invoke(i); family[pattern](i); });
+				Check(!twinOff.Contains(BearishTwin[pattern]), $"{name}, mirrored: still found with its switch off");
+			}
+
+			Check(PatternsAt(bars, true, i => { configure?.Invoke(i); i.UseCandlePatterns = false; }).Count == 0, $"{name}: found with patterns off");
+		}
+
+		// label order: three candles, then two, then one
+		var patternType = IndicatorType.GetNestedType("CandlePattern", BindingFlags.NonPublic);
+		var namesOf = IndicatorType.GetMethod("PatternNames", PrivateStatic);
+		List<string> Names(string flags) => (List<string>)namesOf.Invoke(null, new[] { Enum.Parse(patternType, flags) });
+		Check(Names("Hammer, TweezerBottom, MorningStar").SequenceEqual(new[] { "Morning star", "Tweezer bottom", "Hammer" }), "label order");
+		Check(Names("None").Count == 0, "no pattern, no names");
+
+		// the average body only counts the candles before the pattern that exist
+		var average = IndicatorType.GetMethod("AverageBody", Private);
+		var short1 = NewIndicator(null);
+		short1.Candles.AddRange(new[] { Bar(100, 102, 99, 101), Bar(101, 103, 100, 103), Bar(103, 104, 102, 103.5m) });
+		Check((decimal)average.Invoke(short1, new object[] { 2 }) == 1.5m && (decimal)average.Invoke(short1, new object[] { 0 }) == 0,
+			"average body of the bars that exist");
+	}
+
+	private static decimal[] C(decimal open, decimal high, decimal low, decimal close)
+	{
+		return new[] { open, high, low, close };
+	}
+
+	// 20 identical candles with a 1.00 body far above the pattern, so they only set the
+	// average body, then the pattern's candles
+	private static List<IndicatorCandle> PatternBars(decimal[][] pattern)
+	{
+		var bars = Enumerable.Range(0, 20).Select(_ => Bar(200, 201.5m, 199.5m, 201)).ToList();
+		bars.AddRange(pattern.Select(p => Bar(p[0], p[1], p[2], p[3])));
+		return bars;
+	}
+
+	// the patterns the indicator finds on the last of `bars`
+	private static List<string> PatternsAt(List<IndicatorCandle> bars, bool isLong, Action<FvgReactionLiquiditySweep> configure)
+	{
+		var ind = NewIndicator(configure);
+		ind.Candles.AddRange(bars);
+		return PatternList(IndicatorType.GetMethod("FindCandlePatterns", Private).Invoke(ind, new object[] { bars.Count - 1, isLong }));
 	}
 
 		#endregion
@@ -559,6 +703,70 @@ internal static class Program
 		Check(required.Count == 0, "RequireAbsorption drops the unconfirmed buy");
 	}
 
+	private static void CandlePatternConfirmation()
+	{
+		// the FVG retest bar, once as a hammer (2-tick body at the top, 5-tick lower wick, no
+		// upper wick) and once with a 1-tick upper wick on its 8-tick range - too much for a hammer
+		List<IndicatorCandle> Bars(bool hammer)
+		{
+			var bars = FvgSetup();
+			bars.Add(hammer ? Bar(103, 103.5m, 101.75m, 103.5m, delta: 50) : Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));
+			bars.Add(Bar(103.5m, 104, 103, 103.75m));
+			return bars;
+		}
+
+		var trades = Trades(RunHistorical(Bars(true)));
+		Check(trades.Count == 1 && trades[0].CandlePatterns.SequenceEqual(new[] { "Hammer" }) && trades[0].Confirmations == 2,
+			"hammer + delta = 2 confirmations");
+
+		var plain = Trades(RunHistorical(Bars(false)));
+		Check(plain.Count == 1 && plain[0].CandlePatterns.Count == 0 && plain[0].Confirmations == 1, "no pattern, delta only");
+
+		Check(Trades(RunHistorical(Bars(false), i => i.RequireCandlePattern = true)).Count == 0, "RequireCandlePattern drops the signal without one");
+		Check(Trades(RunHistorical(Bars(true), i => i.RequireCandlePattern = true)).Count == 1, "RequireCandlePattern keeps the hammer");
+
+		var off = Trades(RunHistorical(Bars(true), i => i.PatternHammer = false));
+		Check(off.Count == 1 && off[0].CandlePatterns.Count == 0 && off[0].Confirmations == 1, "hammers switched off");
+
+		var unused = Trades(RunHistorical(Bars(true), i => i.UseCandlePatterns = false));
+		Check(unused.Count == 1 && unused[0].CandlePatterns.Count == 0 && unused[0].Confirmations == 1, "patterns switched off");
+
+		// short: the bar sweeping the 100.5 highs is a shooting star - 1-tick body at its low,
+		// 5-tick upper wick - after a doji, so no two-candle pattern
+		var sweep = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		sweep.Add(Bar(100.25m, 101.5m, 100, 100));
+		sweep.Add(Bar(100, 100.25m, 99.75m, 100));
+		var shorts = Trades(RunHistorical(sweep));
+		Check(shorts.Count == 1 && !shorts[0].IsLong && shorts[0].Trigger == "Sweep" && shorts[0].CandlePatterns.SequenceEqual(new[] { "ShootingStar" })
+			&& shorts[0].Confirmations == 1, "shooting star confirms the sweep short");
+
+		// the label names it, the tooltip lists it with the other confirmations
+		var ind = RunHistorical(Bars(true));
+		var chart = (FakeChart)ind.ChartInfo;
+		ind.FirstVisibleBarNumber = 0;
+		ind.LastVisibleBarNumber = 20;
+		chart.MouseLocationInfo.LastPosition = new Point(chart.GetXByBar(19, false), chart.GetYByPrice(101.75m - 2 * Tick, false) + ind.LabelOffset + 4);
+		var context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Any(s => s == "FVG | Hammer | conf 2/4 | n=0 | EV 0t"), "label names the pattern");
+		Check(context.Strings.Any(s => s == "Absorption no   Trend no   Delta yes   Pattern yes"), "tooltip: the four confirmations");
+		Check(context.Strings.Any(s => s == "Candlestick pattern: Hammer"), "tooltip: the pattern");
+
+		// a new-signal alert names it too
+		var live = NewIndicator(i => i.UseAlerts = true);
+		var history = FvgSetup();
+		live.Candles.AddRange(history);
+		live.HarnessRecalculate();
+
+		for (var i = 0; i < history.Count; i++)
+			live.HarnessCalculate(i);
+
+		StreamBar(live, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.5m }, delta: 50);
+		StreamBar(live, new[] { 103.5m, 104m });
+		Check(live.Alerts.Count == 1 && live.Alerts[0].StartsWith("BUY @ 103.50 (FVG, Hammer): TP 22% / BE 45% / SL 33%"),
+			$"alert names the pattern: {string.Join(" / ", live.Alerts)}");
+	}
+
 	private static void LiveBreakEvenFollowsTheTicks()
 	{
 		var ind = NewIndicator(null);
@@ -630,6 +838,15 @@ internal static class Program
 		VerifyOutcomes(ind, market, trades, liveFromBar: int.MaxValue);
 		VerifyInvariants(ind, trades, market.Candles.Count);
 		VerifySignalsAgainstOracle(ind, market, trades);
+
+		var patterns = VerifyPatternsOnEveryBar(ind, market.Candles);
+
+		// with the default shapes the market has every pattern of the cheat sheet somewhere
+		if (configure == null)
+		{
+			var missing = BearishTwin.Keys.Concat(BearishTwin.Values).Where(n => !patterns.ContainsKey(n)).ToList();
+			Check(missing.Count == 0, $"fuzz market never shows {string.Join(", ", missing)}");
+		}
 	}
 
 	private static void FuzzFilters()
@@ -769,6 +986,26 @@ internal static class Program
 			"label odds add up to 100%");
 		Check(context.Strings.Any(s => s.Contains(" | EV ")), "labels show expected ticks");
 
+		// second label line: trigger | first pattern (+ how many more) | conf x/4 | n | EV,
+		// labels drawn left to right
+		var patternType = IndicatorType.GetNestedType("CandlePattern", BindingFlags.NonPublic);
+		var namesOf = IndicatorType.GetMethod("PatternNames", PrivateStatic);
+		var triggerNames = new Dictionary<string, string> { ["Fvg"] = "FVG", ["Sweep"] = "Sweep", ["SweepThenFvg"] = "Sweep+FVG" };
+
+		string SetupLine(TradeView t)
+		{
+			var names = (List<string>)namesOf.Invoke(null, new[] { Enum.Parse(patternType, t.CandlePatterns.Count == 0 ? "None" : string.Join(", ", t.CandlePatterns)) });
+			var pattern = names.Count == 0 ? "" : names.Count == 1 ? $" | {names[0]}" : $" | {names[0]} +{names.Count - 1}";
+			var ev = (int)Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero);
+			return $"{triggerNames[t.Trigger]}{pattern} | conf {t.Confirmations}/4 | n={t.Setup.Count} | EV {ev.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t";
+		}
+
+		var setupLines = context.Strings.Where(s => s.Contains(" | conf ")).ToList();
+		var expectedLines = visibleShown.OrderBy(t => t.EntryBar).Select(SetupLine).ToList();
+		Check(setupLines.SequenceEqual(expectedLines), $"label setup lines differ, first: {setupLines.FirstOrDefault()} vs {expectedLines.FirstOrDefault()}");
+		Check(visibleShown.Any(t => t.CandlePatterns.Count == 1) && visibleShown.Any(t => t.CandlePatterns.Count > 1),
+			"render test needs labels with one and with several patterns");
+
 		// an activated trade draws its break-even stop line in the break-even color
 		var moved = visibleShown.FirstOrDefault(t => t.BreakEvenActive);
 
@@ -791,6 +1028,9 @@ internal static class Program
 		context = new RenderContext();
 		ind.HarnessRender(context);
 		Check(context.Strings.Any(s => s.StartsWith("P(TP) ") && s.Contains("P(BE) ")), "tooltip drawn on hover");
+		Check(context.Strings.Any(s => s.StartsWith("Absorption ") && s.Contains("   Pattern ")), "tooltip lists the four confirmations");
+		var patternLine = target.CandlePatterns.Count > 1 ? "Candlestick patterns: " : "Candlestick pattern: ";
+		Check(context.Strings.Any(s => s.StartsWith(patternLine)) == (target.CandlePatterns.Count > 0), "tooltip names the pattern(s) when there are any");
 
 		// cluster mode + everything switched on/off still renders
 		chart.ChartVisualMode = ChartVisualModes.Clusters;
@@ -857,6 +1097,7 @@ internal static class Program
 	private static void VerifySignalsAgainstOracle(FvgReactionLiquiditySweep ind, Market market, List<TradeView> trades)
 	{
 		var candles = market.Candles;
+		var mirrored = Mirror(candles);
 		var zones = new List<OracleZone>();
 		var ema = new List<decimal>();
 		var expected = new List<string>();
@@ -955,12 +1196,14 @@ internal static class Program
 				var absorption = OracleAbsorption(ind, candles, b, isLong);
 				var withTrend = ind.TrendEmaPeriod > 0 && b >= ind.TrendEmaPeriod && (isLong ? c.Close > ema[b] : c.Close < ema[b]);
 				var delta = isLong ? c.Delta > 0 : c.Delta < 0;
+				var patterns = OraclePatterns(ind, candles, mirrored, b, isLong);
 
-				if ((ind.OnlyWithTrend && !withTrend) || (ind.RequireDeltaConfirmation && !delta) || (ind.RequireAbsorption && !absorption))
+				if ((ind.OnlyWithTrend && !withTrend) || (ind.RequireDeltaConfirmation && !delta) || (ind.RequireAbsorption && !absorption)
+					|| (ind.RequireCandlePattern && patterns.Count == 0))
 					continue;
 
-				var confirmations = (absorption ? 1 : 0) + (withTrend ? 1 : 0) + (delta ? 1 : 0);
-				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{absorption}|{withTrend}|{delta}");
+				var confirmations = (absorption ? 1 : 0) + (withTrend ? 1 : 0) + (delta ? 1 : 0) + (patterns.Count > 0 ? 1 : 0);
+				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{absorption}|{withTrend}|{delta}|{string.Join(",", patterns)}");
 
 				if (isLong)
 					lastLong = b;
@@ -971,7 +1214,7 @@ internal static class Program
 
 		var actual = trades
 			.OrderBy(t => t.EntryBar).ThenBy(t => !t.IsLong)
-			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.HasAbsorption}|{t.WithTrend}|{t.DeltaConfirms}")
+			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.HasAbsorption}|{t.WithTrend}|{t.DeltaConfirms}|{string.Join(",", t.CandlePatterns)}")
 			.ToList();
 
 		var firstDiff = Enumerable.Range(0, Math.Min(actual.Count, expected.Count)).FirstOrDefault(i => actual[i] != expected[i]);
@@ -979,7 +1222,8 @@ internal static class Program
 			$"signals differ from the oracle ({actual.Count} vs {expected.Count}); first difference: "
 			+ $"{actual.ElementAtOrDefault(firstDiff)} vs {expected.ElementAtOrDefault(firstDiff)}");
 
-		Check(trades.Any(t => t.HasAbsorption) && (ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms),
+		Check(trades.Any(t => t.HasAbsorption) && (ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms)
+			&& (!ind.UseCandlePatterns || trades.Any(t => t.CandlePatterns.Count > 0)),
 			"fuzz market should exercise every confirmation");
 
 		// trigger arrows: set where the oracle found a trigger, unless a shown signal took its place
@@ -1036,6 +1280,150 @@ internal static class Program
 		}
 
 		return false;
+	}
+
+	// The candles upside down around a pivot: a bearish pattern is exactly the bullish one in
+	// this mirror, so the oracle only spells out the bullish definitions.
+	private static List<IndicatorCandle> Mirror(List<IndicatorCandle> candles, decimal pivot = 100000)
+	{
+		return candles
+			.Select(c => new IndicatorCandle { Open = pivot - c.Open, High = pivot - c.Low, Low = pivot - c.High, Close = pivot - c.Close, Time = c.Time })
+			.ToList();
+	}
+
+	private static readonly Dictionary<string, string> BearishTwin = new Dictionary<string, string>
+	{
+		["Hammer"] = "ShootingStar",
+		["DragonflyDoji"] = "GravestoneDoji",
+		["InvertedHammer"] = "HangingMan",
+		["BullishEngulfing"] = "BearishEngulfing",
+		["PiercingLine"] = "DarkCloudCover",
+		["BullishHarami"] = "BearishHarami",
+		["TweezerBottom"] = "TweezerTop",
+		["MorningStar"] = "EveningStar",
+		["ThreeWhiteSoldiers"] = "ThreeBlackCrows",
+		["BullishMarubozu"] = "BearishMarubozu"
+	};
+
+	// Independent re-implementation of the cheat-sheet patterns completing on bar b that point
+	// the trade's way, as sorted pattern names. Bearish ones are the bullish definitions read
+	// on the mirrored candles.
+	private static List<string> OraclePatterns(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<IndicatorCandle> mirrored,
+		int b, bool isLong)
+	{
+		var names = !ind.UseCandlePatterns ? new List<string>()
+			: isLong ? BullishPatterns(ind, candles, b)
+			: BullishPatterns(ind, mirrored, b).Select(n => BearishTwin[n]).ToList();
+
+		names.Sort(StringComparer.Ordinal);
+		return names;
+	}
+
+	private static List<string> BullishPatterns(FvgReactionLiquiditySweep ind, List<IndicatorCandle> k, int b)
+	{
+		var names = new List<string>();
+
+		decimal Body(IndicatorCandle x) => Math.Abs(x.Close - x.Open);
+		decimal BodyTop(IndicatorCandle x) => Math.Max(x.Open, x.Close);
+		decimal BodyBottom(IndicatorCandle x) => Math.Min(x.Open, x.Close);
+		decimal Middle(IndicatorCandle x) => (x.Open + x.Close) / 2;
+		bool Up(IndicatorCandle x) => x.Close > x.Open;
+		bool Down(IndicatorCandle x) => x.Close < x.Open;
+
+		// long / small against the average body of the candles before the pattern's first one,
+		// compared without dividing: body * n against the sum of those n bodies
+		(int N, decimal Sum) Yardstick(int first)
+		{
+			var from = Math.Max(0, first - ind.PatternAverageBars);
+			return (first - from, Enumerable.Range(from, first - from).Sum(i => Body(k[i])));
+		}
+
+		bool Long(IndicatorCandle x, (int N, decimal Sum) y) => Body(x) > 0 && Body(x) * y.N >= y.Sum;
+		bool Small(IndicatorCandle x, (int N, decimal Sum) y) => Body(x) * y.N < y.Sum;
+
+		var c = k[b];
+		var range = c.High - c.Low;
+
+		if (range > 0)
+		{
+			var upperWick = c.High - BodyTop(c);
+			var lowerWick = BodyBottom(c) - c.Low;
+			var wickRatio = (decimal)ind.PinBarWickRatio;
+
+			if (ind.PatternHammer && lowerWick >= wickRatio * Body(c) && upperWick * 10 <= range)
+				names.Add(Body(c) * 10 <= range ? "DragonflyDoji" : "Hammer");
+
+			if (ind.PatternInvertedHammer && upperWick >= wickRatio * Body(c) && lowerWick * 10 <= range)
+				names.Add("InvertedHammer");
+
+			if (ind.PatternMarubozu && Up(c) && Long(c, Yardstick(b)) && upperWick * 20 <= range && lowerWick * 20 <= range)
+				names.Add("BullishMarubozu");
+		}
+
+		if (b >= 1)
+		{
+			var p = k[b - 1];
+			var y = Yardstick(b - 1);
+
+			if (ind.PatternEngulfing && Down(p) && Up(c) && c.Open <= p.Close && c.Close >= p.Open && Body(c) > Body(p) && Long(c, y))
+				names.Add("BullishEngulfing");
+
+			if (ind.PatternPiercingLine && Down(p) && Long(p, y) && Up(c) && c.Open <= p.Close && c.Close > Middle(p) && c.Close < p.Open)
+				names.Add("PiercingLine");
+
+			if (ind.PatternHarami && Down(p) && Long(p, y) && Up(c) && Small(c, y) && c.Open >= p.Close && c.Close <= p.Open)
+				names.Add("BullishHarami");
+
+			if (ind.PatternTweezers && Down(p) && Up(c) && Math.Abs(c.Low - p.Low) <= ind.TweezerToleranceTicks * Tick)
+				names.Add("TweezerBottom");
+		}
+
+		if (b >= 2)
+		{
+			var a = k[b - 2];
+			var p = k[b - 1];
+			var y = Yardstick(b - 2);
+
+			if (ind.PatternStars && Down(a) && Long(a, y) && Small(p, y) && BodyTop(p) <= Middle(a) && Up(c) && Long(c, y) && c.Close > Middle(a))
+				names.Add("MorningStar");
+
+			bool Soldier(IndicatorCandle x) => Up(x) && Long(x, y) && (x.High - x.Close) * 4 <= x.High - x.Low;
+			bool OpensIn(IndicatorCandle x, IndicatorCandle before) => x.Open >= BodyBottom(before) && x.Open <= BodyTop(before);
+
+			if (ind.PatternThreeSoldiers && Soldier(a) && Soldier(p) && Soldier(c) && OpensIn(p, a) && OpensIn(c, p)
+				&& p.Close > a.Close && c.Close > p.Close)
+				names.Add("ThreeWhiteSoldiers");
+		}
+
+		return names;
+	}
+
+	// every bar, both ways: the indicator's pattern finder against the oracle; returns how
+	// often each pattern was found
+	private static Dictionary<string, int> VerifyPatternsOnEveryBar(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles)
+	{
+		var find = IndicatorType.GetMethod("FindCandlePatterns", Private);
+		var mirrored = Mirror(candles);
+		var counts = new Dictionary<string, int>();
+		var wrong = 0;
+
+		for (var b = 0; b < candles.Count; b++)
+		{
+			foreach (var isLong in new[] { true, false })
+			{
+				var actual = PatternList(find.Invoke(ind, new object[] { b, isLong }));
+				var expected = OraclePatterns(ind, candles, mirrored, b, isLong);
+
+				if (!actual.SequenceEqual(expected) && wrong++ < 3)
+					Failures.Add($"bar {b} {(isLong ? "buy" : "short")}: indicator [{string.Join(",", actual)}], oracle [{string.Join(",", expected)}]");
+
+				foreach (var name in actual)
+					counts[name] = counts.TryGetValue(name, out var n) ? n + 1 : 1;
+			}
+		}
+
+		Check(wrong == 0, $"{wrong} bars whose candlestick patterns differ from the oracle");
+		return counts;
 	}
 
 	private static void VerifyOutcomes(FvgReactionLiquiditySweep ind, Market market, List<TradeView> trades, int liveFromBar)
@@ -1401,6 +1789,7 @@ internal static class Program
 		public bool HasAbsorption;
 		public bool WithTrend;
 		public bool DeltaConfirms;
+		public List<string> CandlePatterns;
 		public string Outcome;
 		public string Trigger;
 		public int Confirmations;
@@ -1504,6 +1893,7 @@ internal static class Program
 				HasAbsorption = (bool)Get(t, "HasAbsorption"),
 				WithTrend = (bool)Get(t, "WithTrend"),
 				DeltaConfirms = (bool)Get(t, "DeltaConfirms"),
+				CandlePatterns = PatternList(Get(t, "CandlePatterns")),
 				Outcome = Get(t, "Outcome").ToString(),
 				Trigger = Get(t, "Trigger").ToString(),
 				Confirmations = (int)Get(t, "Confirmations"),
@@ -1546,6 +1936,15 @@ internal static class Program
 		return zones.Cast<object>()
 			.Select(z => $"{Get(z, "StartBar")}|{Get(z, "Top")}|{Get(z, "Bottom")}|{Get(z, "IsBullish")}|{Get(z, "Filled")}|{Get(z, "ReactionMarked")}")
 			.ToList();
+	}
+
+	// a CandlePattern value as sorted member names
+	private static List<string> PatternList(object patterns)
+	{
+		var text = patterns.ToString();
+		var names = text == "None" ? new List<string>() : text.Split(", ").ToList();
+		names.Sort(StringComparer.Ordinal);
+		return names;
 	}
 
 	private static string SignalKey(TradeView t)
