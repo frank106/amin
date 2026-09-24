@@ -27,14 +27,19 @@ internal static class Program
 
 	public static int Main()
 	{
-		Run("EvaluateBar: bracket rules", EvaluateBarRules);
+		Run("Bar settlement: TP / SL and the same-bar rules", SettleWithoutBreakEven);
+		Run("Bar settlement: break-even trigger and stop", SettleWithBreakEven);
 		Run("Hit probability: closed forms", HitProbabilityClosedForms);
 		Run("Hit probability: Monte Carlo with drift", HitProbabilityMonteCarlo);
-		Run("Probability model: shrinkage math", ModelShrinkage);
+		Run("Probability model: three-outcome shrinkage", ModelShrinkage);
+		Run("Prior odds and label percentages", PriorOddsAndPercentages);
+		Run("Live odds of an open trade", LiveOddsOfOpenTrade);
 		Run("FVG: completing candle is not a retest", FvgCompletingCandleIsNotReaction);
 		Run("FVG retest: BUY at close, TP 80 ticks later", FvgRetestBuyHitsTakeProfit);
-		Run("Sweep of highs: SHORT, same-bar rule", SweepShortSameBarRule);
+		Run("Sweep of highs: SHORT, same-bar rules", SweepShortSameBarRule);
+		Run("Break-even: stop moves at +40t, exits at +20t", BreakEvenStopAfterTrigger);
 		Run("Live ticks: signal only after the bar closes", LiveSignalAppearsAfterClose);
+		Run("Live ticks: a dip before the trigger is not a break-even exit", LiveBreakEvenFollowsTheTicks);
 		Run("Absorption: heatmap cells and buy confirmation", AbsorptionConfirmation);
 		Run("FVG: a reacted zone still dies when price closes through", ReactedZoneIsInvalidated);
 		Run("Fuzz: historical run vs oracle", () => FuzzHistorical(seed: 7, configure: null));
@@ -50,7 +55,27 @@ internal static class Program
 			i.OneTradeAtATime = false;
 			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.SweepThenFvg;
 		}));
-		Run("Fuzz: min probability filter hides, still learns", FuzzMinProbability);
+		Run("Fuzz: no break-even, worst-case rule", () => FuzzHistorical(seed: 29, configure: i =>
+		{
+			i.BreakEvenTriggerTicks = 0;
+			i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+		}));
+		Run("Fuzz: tight bracket, break-even, worst-case rule", () => FuzzHistorical(seed: 37, configure: i =>
+		{
+			i.TakeProfitTicks = 40;
+			i.StopLossTicks = 120;
+			i.BreakEvenTriggerTicks = 20;
+			i.BreakEvenStopTicks = 10;
+			i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+		}));
+		Run("Fuzz: break-even at entry, 120 / 60 bracket", () => FuzzHistorical(seed: 31, configure: i =>
+		{
+			i.TakeProfitTicks = 120;
+			i.StopLossTicks = 60;
+			i.BreakEvenTriggerTicks = 30;
+			i.BreakEvenStopTicks = 0;
+		}));
+		Run("Fuzz: filters hide signals, the model still learns", FuzzFilters);
 		Run("Fuzz: live tick stream matches history", FuzzLiveMatchesHistory);
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
 		Run("Render: labels, levels, panel, tooltip", RenderSmoke);
@@ -66,27 +91,75 @@ internal static class Program
 
 	#region Unit checks
 
-	private static void EvaluateBarRules()
+	private static void SettleWithoutBreakEven()
 	{
-		var stopFirst = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+		var worst = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
 		var byCandle = FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection;
+		var nearest = FvgReactionLiquiditySweep.SameBarHitRule.NearestExtremeFirst;
+		var longTrade = MakeTrade(true, breakEven: false);
+		var shortTrade = MakeTrade(false, breakEven: false);
 
-		// long, TP 120 / SL 80
-		Expect(Evaluate(true, 120, 80, 100, 119, 81, 110, stopFirst), "Open", false, "long untouched");
-		Expect(Evaluate(true, 120, 80, 100, 120, 90, 118, stopFirst), "TakeProfit", false, "long TP touched exactly");
-		Expect(Evaluate(true, 120, 80, 100, 110, 80, 90, stopFirst), "StopLoss", false, "long SL touched exactly");
-		Expect(Evaluate(true, 120, 80, 100, 121, 79, 110, stopFirst), "StopLoss", true, "long both, conservative");
-		Expect(Evaluate(true, 120, 80, 100, 121, 79, 110, byCandle), "StopLoss", true, "long both, bullish bar -> low first");
-		Expect(Evaluate(true, 120, 80, 100, 121, 79, 90, byCandle), "TakeProfit", true, "long both, bearish bar -> high first");
-		Expect(Evaluate(true, 120, 80, 125, 126, 70, 75, stopFirst), "TakeProfit", false, "long gaps over TP at the open");
-		Expect(Evaluate(true, 120, 80, 75, 130, 70, 128, stopFirst), "StopLoss", false, "long gaps under SL at the open");
+		// long: entry 100, TP 120, SL 80
+		Expect(Settle(longTrade, 100, 119, 81, 110, worst), "Open", false, "long untouched");
+		Expect(Settle(longTrade, 100, 120, 90, 118, worst), "TakeProfit", false, "long TP touched exactly");
+		Expect(Settle(longTrade, 100, 110, 80, 90, worst), "StopLoss", false, "long SL touched exactly");
+		Expect(Settle(longTrade, 100, 121, 79, 110, worst), "StopLoss", true, "long both, worst case");
+		Expect(Settle(longTrade, 100, 121, 79, 110, byCandle), "StopLoss", true, "long both, bullish bar -> low first");
+		Expect(Settle(longTrade, 100, 121, 79, 90, byCandle), "TakeProfit", true, "long both, bearish bar -> high first");
+		Expect(Settle(longTrade, 100, 121, 79, 110, nearest), "StopLoss", true, "long both, equal distance -> worst case");
+		Expect(Settle(longTrade, 100, 121, 80, 110, nearest), "StopLoss", true, "long both, low nearer the open");
+		Expect(Settle(longTrade, 100, 120, 79, 110, nearest), "TakeProfit", true, "long both, high nearer the open");
+		Expect(Settle(longTrade, 125, 126, 70, 75, worst), "TakeProfit", false, "long gaps over TP at the open");
+		Expect(Settle(longTrade, 75, 130, 70, 128, worst), "StopLoss", false, "long gaps under SL at the open");
 
-		// short, TP 80 / SL 120
-		Expect(Evaluate(false, 80, 120, 100, 119, 80, 90, stopFirst), "TakeProfit", false, "short TP");
-		Expect(Evaluate(false, 80, 120, 100, 120, 81, 110, stopFirst), "StopLoss", false, "short SL");
-		Expect(Evaluate(false, 80, 120, 100, 121, 79, 110, byCandle), "TakeProfit", true, "short both, bullish bar -> low first");
-		Expect(Evaluate(false, 80, 120, 100, 121, 79, 90, byCandle), "StopLoss", true, "short both, bearish bar -> high first");
-		Expect(Evaluate(false, 80, 120, 100, 121, 79, 90, stopFirst), "StopLoss", true, "short both, conservative");
+		// short: entry 100, TP 80, SL 120
+		Expect(Settle(shortTrade, 100, 119, 80, 90, worst), "TakeProfit", false, "short TP");
+		Expect(Settle(shortTrade, 100, 120, 81, 110, worst), "StopLoss", false, "short SL");
+		Expect(Settle(shortTrade, 100, 121, 79, 110, byCandle), "TakeProfit", true, "short both, bullish bar -> low first");
+		Expect(Settle(shortTrade, 100, 121, 79, 90, byCandle), "StopLoss", true, "short both, bearish bar -> high first");
+		Expect(Settle(shortTrade, 100, 121, 79, 90, worst), "StopLoss", true, "short both, worst case");
+		Expect(Settle(shortTrade, 100, 121, 79.5m, 110, nearest), "TakeProfit", true, "short both, low nearer the open");
+	}
+
+	private static void SettleWithBreakEven()
+	{
+		var worst = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+		var byCandle = FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection;
+		var nearest = FvgReactionLiquiditySweep.SameBarHitRule.NearestExtremeFirst;
+
+		// long: entry 100, TP 120, SL 80, trigger 110 moves the stop to 105
+		var t = MakeTrade(true, breakEven: true);
+		ExpectWalk(Walk(t, 100, 111, 104), "BreakEven", true, 105, "trigger, then back through the break-even stop");
+		ExpectWalk(Walk(t, 100, 110, 105), "BreakEven", true, 105, "trigger and stop touched exactly");
+		ExpectWalk(Walk(t, 100, 109, 81), "Open", false, "", "no trigger, SL not reached");
+		ExpectWalk(Walk(t, 100, 109, 80), "StopLoss", false, 80, "no trigger, full stop");
+		ExpectWalk(Walk(t, 100, 111, 121), "TakeProfit", true, 120, "trigger, then TP");
+		ExpectWalk(Walk(t, 112, 104), "BreakEven", true, 105, "gap over the trigger at the open");
+		ExpectWalk(Walk(t, 100, 104, 109, 104.5m), "Open", false, "", "dip before the trigger is harmless");
+
+		var active = MakeTrade(true, breakEven: true, active: true);
+		ExpectWalk(Walk(active, 108, 104), "BreakEven", true, 105, "stop already at break-even");
+		ExpectWalk(Walk(active, 108, 120), "TakeProfit", true, 120, "already at break-even, then TP");
+
+		// first bar after entry: dips a tick, runs through the trigger, closes near the high.
+		// Only the worst case assumes the dip came after the high.
+		ExpectBar(Settle(t, 100, 112, 99.75m, 111, worst), "BreakEven", true, true, "worst case -> stopped at break-even");
+		ExpectBar(Settle(t, 100, 112, 99.75m, 111, byCandle), "Open", true, true, "bullish bar -> low first -> still open");
+		ExpectBar(Settle(t, 100, 112, 99.75m, 111, nearest), "Open", true, true, "low nearer the open -> still open");
+
+		// opens at its low: only the worst case lets price come back to the open after the trigger
+		ExpectBar(Settle(t, 100, 112, 100, 111, worst), "BreakEven", true, true, "worst case: open revisited after the trigger");
+		ExpectBar(Settle(t, 100, 112, 100, 111, nearest), "Open", true, true, "nearer extreme: the low was the open");
+		ExpectBar(Settle(t, 100, 112, 100, 111, byCandle), "Open", true, true, "bullish bar: the low was the open");
+
+		// falls back through the break-even stop after the trigger in either order
+		ExpectBar(Settle(t, 106, 112, 104, 104.5m, worst), "BreakEven", true, false, "both orders hit break-even");
+
+		// short: entry 100, TP 80, SL 120, trigger 90 moves the stop to 95
+		var s = MakeTrade(false, breakEven: true);
+		ExpectWalk(Walk(s, 100, 89, 96), "BreakEven", true, 95, "short: trigger, then back through the stop");
+		ExpectWalk(Walk(s, 100, 91, 119), "Open", false, "", "short: no trigger, SL not reached");
+		ExpectWalk(Walk(s, 100, 89, 80), "TakeProfit", true, 80, "short: trigger, then TP");
 	}
 
 	private static void HitProbabilityClosedForms()
@@ -160,42 +233,154 @@ internal static class Program
 	{
 		var modelType = IndicatorType.GetNestedType("ProbabilityModel", BindingFlags.NonPublic);
 		var triggerType = IndicatorType.GetNestedType("TriggerType", BindingFlags.NonPublic);
+		var outcomeType = IndicatorType.GetNestedType("TradeOutcome", BindingFlags.NonPublic);
 		var model = Activator.CreateInstance(modelType);
 		var record = modelType.GetMethod("Record");
 		var estimate = modelType.GetMethod("Estimate");
 		var fvg = Enum.Parse(triggerType, "Fvg");
 		var sweep = Enum.Parse(triggerType, "Sweep");
+		var prior = (2.0 / 9, 4.0 / 9, 1.0 / 3);
 
-		double Estimate(object trigger, int confirmations)
+		(double Tp, double Be, double Sl, double Ev) Estimate(bool isLong, object trigger, int confirmations)
 		{
-			var e = estimate.Invoke(model, new[] { true, trigger, confirmations, 0.5, 10.0 });
-			return (double)e.GetType().GetProperty("TakeProfit").GetValue(e);
+			var e = estimate.Invoke(model, new[] { isLong, trigger, confirmations, Odds(prior.Item1, prior.Item2, prior.Item3), 10.0, 80.0, 20.0, 80.0 });
+			double P(string name) => (double)e.GetType().GetProperty(name).GetValue(e);
+			return (P("TakeProfit"), P("BreakEven"), P("StopLoss"), P("ExpectedTicks"));
 		}
 
-		CheckClose(Estimate(fvg, 1), 0.5, 1e-12, "no history = prior");
+		void Record(bool isLong, object trigger, int confirmations, string outcome)
+		{
+			record.Invoke(model, new[] { isLong, trigger, confirmations, Enum.Parse(outcomeType, outcome) });
+		}
 
-		record.Invoke(model, new[] { true, fvg, 1, true });
+		var none = Estimate(true, fvg, 1);
+		CheckClose(none.Tp, prior.Item1, 1e-12, "no history = prior TP");
+		CheckClose(none.Be, prior.Item2, 1e-12, "no history = prior BE");
+		CheckClose(none.Ev, 0, 1e-12, "no edge = 0 expected ticks");
 
-		var pDirection = (1 + 10 * 0.5) / 11;
-		var pTrigger = (1 + 10 * pDirection) / 11;
-		var pSetup = (1 + 10 * pTrigger) / 11;
-		CheckClose(Estimate(fvg, 1), pSetup, 1e-12, "one win, same setup");
-		CheckClose(Estimate(fvg, 2), pTrigger, 1e-12, "one win, same trigger, other confirmations");
-		CheckClose(Estimate(sweep, 1), pDirection, 1e-12, "one win, other trigger");
+		Record(true, fvg, 1, "TakeProfit");
 
-		// shorts are unaffected by long outcomes
-		var shortEstimate = estimate.Invoke(model, new[] { false, fvg, 1, 0.5, 10.0 });
-		CheckClose((double)shortEstimate.GetType().GetProperty("TakeProfit").GetValue(shortEstimate), 0.5, 1e-12, "shorts independent");
+		// each level: (count + 10 * parent) / (n + 10)
+		(double, double, double) Level((double Tp, double Be, double Sl) parent, int tp, int be, int sl)
+		{
+			double n = tp + be + sl + 10;
+			return ((tp + 10 * parent.Tp) / n, (be + 10 * parent.Be) / n, (sl + 10 * parent.Sl) / n);
+		}
 
-		// a long losing streak drags the estimate well under 50%
+		var direction = Level(prior, 1, 0, 0);
+		var trigger = Level(direction, 1, 0, 0);
+		var setup = Level(trigger, 1, 0, 0);
+		var one = Estimate(true, fvg, 1);
+		CheckClose(one.Tp, setup.Item1, 1e-12, "one TP, same setup: TP");
+		CheckClose(one.Be, setup.Item2, 1e-12, "one TP, same setup: BE");
+		CheckClose(one.Sl, setup.Item3, 1e-12, "one TP, same setup: SL");
+		CheckClose(one.Tp + one.Be + one.Sl, 1, 1e-12, "odds add up to 1");
+		CheckClose(one.Ev, one.Tp * 80 + one.Be * 20 - one.Sl * 80, 1e-12, "expected ticks");
+		CheckClose(Estimate(true, fvg, 2).Tp, trigger.Item1, 1e-12, "one TP, same trigger, other confirmations");
+		CheckClose(Estimate(true, sweep, 1).Tp, direction.Item1, 1e-12, "one TP, other trigger");
+		CheckClose(Estimate(false, fvg, 1).Tp, prior.Item1, 1e-12, "shorts are unaffected by longs");
+
+		Record(true, fvg, 1, "BreakEven");
+		Check(Estimate(true, fvg, 1).Be > setup.Item2, "a break-even exit raises the BE share");
+
 		for (var i = 0; i < 40; i++)
-			record.Invoke(model, new[] { true, sweep, 0, false });
+			Record(true, sweep, 0, "StopLoss");
 
-		Check(Estimate(sweep, 0) < 0.1, "40 losses -> estimate under 10%");
-		Check(Estimate(fvg, 1) > Estimate(sweep, 0), "winning setup stays above losing one");
+		var losing = Estimate(true, sweep, 0);
+		Check(losing.Sl > 0.8 && losing.Ev < -40, "40 full stops -> mostly SL, clearly negative EV");
+		Check(Estimate(true, fvg, 1).Ev > losing.Ev, "winning setup stays above the losing one");
 	}
 
-	#endregion
+	private static void PriorOddsAndPercentages()
+	{
+		(double Tp, double Be, double Sl) Prior(Action<FvgReactionLiquiditySweep> configure)
+		{
+			var ind = NewIndicator(configure);
+			var odds = IndicatorType.GetMethod("PriorOdds", Private).Invoke(ind, null);
+			double P(string name) => (double)odds.GetType().GetProperty(name).GetValue(odds);
+			return (P("TakeProfit"), P("BreakEven"), P("StopLoss"));
+		}
+
+		var defaults = Prior(null);
+		CheckClose(defaults.Tp, 2.0 / 9, 1e-12, "80/80 with +40 -> +20: TP 2/9");
+		CheckClose(defaults.Be, 4.0 / 9, 1e-12, "80/80 with +40 -> +20: BE 4/9");
+		CheckClose(defaults.Sl, 1.0 / 3, 1e-12, "80/80 with +40 -> +20: SL 1/3");
+
+		var off = Prior(i => i.BreakEvenTriggerTicks = 0);
+		Check(Math.Abs(off.Tp - 0.5) < 1e-12 && off.Be == 0 && Math.Abs(off.Sl - 0.5) < 1e-12, "break-even off -> 50 / 0 / 50");
+
+		var beyondTarget = Prior(i => i.BreakEvenTriggerTicks = 80);
+		Check(beyondTarget.Be == 0, "a trigger at the TP never fires");
+
+		// a stop at or above the trigger is kept one tick below it: (40 - 39) / (80 - 39)
+		var clamped = Prior(i => i.BreakEvenStopTicks = 50);
+		CheckClose(clamped.Tp, 80.0 / 120 * (1.0 / 41), 1e-12, "break-even stop kept below the trigger");
+
+		var percentages = IndicatorType.GetMethod("Percentages", PrivateStatic);
+		int[] Split(params double[] p) => (int[])percentages.Invoke(null, new object[] { p });
+
+		Check(Split(2.0 / 9, 4.0 / 9, 1.0 / 3).SequenceEqual(new[] { 22, 45, 33 }), "2/9, 4/9, 1/3 -> 22 / 45 / 33");
+		Check(Split(0.505, 0.495).SequenceEqual(new[] { 51, 49 }), "a half rounds up on the first");
+		Check(Split(1.0 / 3, 1.0 / 3, 1.0 / 3).SequenceEqual(new[] { 34, 33, 33 }), "thirds -> 34 / 33 / 33");
+
+		var rng = new Random(9);
+
+		for (var i = 0; i < 2000; i++)
+		{
+			var a = rng.NextDouble();
+			var b = rng.NextDouble() * (1 - a);
+			var p = new[] { a, b, 1 - a - b };
+			var split = Split(p);
+			Check(split.Sum() == 100 && split.Select((v, k) => Math.Abs(v - p[k] * 100) < 1).All(x => x), $"split of {a:R}/{b:R} is off");
+		}
+	}
+
+	private static void LiveOddsOfOpenTrade()
+	{
+		var ind = NewIndicator(null);
+		var liveOdds = IndicatorType.GetMethod("LiveOdds", Private);
+
+		// entry 100 with the default 80 / 80 bracket in 0.25 ticks: TP 120, SL 80, +40t = 110, +20t = 105
+		var trade = MakeTrade(true, breakEven: true);
+		SetEstimate(trade, 0.3, 0.4, 0.3);
+
+		(double Tp, double Be, double Sl) At(decimal price, bool activated)
+		{
+			Set(trade, "BreakEvenActive", activated);
+			var odds = liveOdds.Invoke(ind, new[] { trade, (object)price });
+			double P(string name) => (double)odds.GetType().GetProperty(name).GetValue(odds);
+			return (P("TakeProfit"), P("BreakEven"), P("StopLoss"));
+		}
+
+		var entry = At(100, false);
+		Check(Math.Abs(entry.Tp - 0.3) < 1e-6 && Math.Abs(entry.Be - 0.4) < 1e-6 && Math.Abs(entry.Sl - 0.3) < 1e-6, "entry odds as labelled");
+
+		var trigger = At(110, true);
+		Check(Math.Abs(trigger.Tp - 0.3 / 0.7) < 1e-6 && trigger.Sl == 0, "at the trigger: TP share of the non-SL odds, no SL left");
+
+		Check(At(105, true).Be == 1 && At(120, true).Tp == 1 && At(80, false).Sl == 1, "at the levels");
+		Check(At(109.75m, false).Sl < 0.05, "a tick below the trigger, the full stop is almost out of reach");
+
+		// no edge (the prior odds) means no drift: at +20t, reaching +40t before -80t is
+		// (20 + 80) / (40 + 80), then TP before the break-even stop is (40 - 20) / (80 - 20)
+		SetEstimate(trade, 2.0 / 9, 4.0 / 9, 1.0 / 3);
+		var driftless = At(105, false);
+		CheckClose(driftless.Sl, 1.0 / 6, 1e-6, "driftless SL odds at +20t");
+		CheckClose(driftless.Tp, 5.0 / 6 * (1.0 / 3), 1e-6, "driftless TP odds at +20t");
+		CheckClose(driftless.Be, 5.0 / 6 * (2.0 / 3), 1e-6, "driftless BE odds at +20t");
+		CheckClose(At(112.5m, true).Tp, 0.5, 1e-6, "driftless, stop moved, +50t is halfway between +20t and +80t");
+
+		var last = 2.0;
+
+		for (var price = 80.25m; price < 110; price += 1.25m)
+		{
+			var sl = At(price, false).Sl;
+			Check(sl < last && sl > 0 && sl < 1, $"SL odds should fall as price rises ({price})");
+			last = sl;
+		}
+	}
+
+		#endregion
 
 	#region Scenarios
 
@@ -243,9 +428,12 @@ internal static class Program
 		var t = trades[0];
 		Check(t.IsLong && t.IsShown && t.EntryBar == 19, "BUY on the retest bar");
 		Check(t.EntryPrice == 103.5m && t.TakeProfitPrice == 123.5m && t.StopLossPrice == 83.5m, "80-tick bracket from the close");
+		Check(t.HasBreakEven && t.TriggerPrice == 113.5m && t.BreakEvenPrice == 108.5m, "break-even at +40t moves the stop to +20t");
 		Check(t.Trigger == "Fvg" && t.Confirmations == 1, $"trigger/confirmations {t.Trigger}/{t.Confirmations}");
-		CheckClose(t.TakeProfit, 0.5, 1e-12, "no history -> 50%");
-		Check(t.Outcome == "TakeProfit" && t.ExitBar == 21, $"outcome {t.Outcome} on bar {t.ExitBar}");
+		CheckClose(t.TakeProfit, 2.0 / 9, 1e-12, "no history -> TP 2/9");
+		CheckClose(t.BreakEven, 4.0 / 9, 1e-12, "no history -> BE 4/9");
+		CheckClose(t.ExpectedTicks, 0, 1e-12, "no history -> 0 expected ticks");
+		Check(t.Outcome == "TakeProfit" && t.ExitBar == 21 && t.BreakEvenBar == 21, $"outcome {t.Outcome} on bar {t.ExitBar}");
 		Check(Series(ind, "_buySignal")[19] == 101.25m, "buy arrow 2 ticks under the low");
 		Check(Series(ind, "_bullReaction")[19] == 0, "signal arrow replaces the reaction arrow");
 		Check((int)IndicatorType.GetField("_longWins", Private).GetValue(ind) == 1, "panel counts the win");
@@ -253,20 +441,60 @@ internal static class Program
 
 	private static void SweepShortSameBarRule()
 	{
-		List<IndicatorCandle> Bars()
+		// short at 100 from the sweep: TP 80, SL 120; bar 16 (forming) spans both
+		List<IndicatorCandle> Bars(decimal low)
 		{
 			var bars = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
 			bars.Add(Bar(100, 101, 99.75m, 100));   // 15 wicks over the 100.5 high, closes back under
-			bars.Add(Bar(100, 121, 79, 110));       // 16 (forming) covers TP 80 and SL 120, bullish bar
+			bars.Add(Bar(100, 121, low, 110));      // 16 bullish bar through both levels
 			return bars;
 		}
 
-		var conservative = Trades(RunHistorical(Bars()));
-		Check(conservative.Count == 1 && !conservative[0].IsLong && conservative[0].Trigger == "Sweep", "SHORT from the sweep");
-		Check(conservative.Count == 1 && conservative[0].Outcome == "StopLoss" && conservative[0].AmbiguousExit, "conservative rule -> SL");
+		string Outcome(decimal low, FvgReactionLiquiditySweep.SameBarHitRule? rule)
+		{
+			var trades = Trades(RunHistorical(Bars(low), rule.HasValue ? (Action<FvgReactionLiquiditySweep>)(i => i.SameBarRule = rule.Value) : null));
+			return trades.Count == 1 && !trades[0].IsLong && trades[0].Trigger == "Sweep" ? trades[0].Outcome : "no single SHORT";
+		}
 
-		var byCandle = Trades(RunHistorical(Bars(), i => i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection));
-		Check(byCandle.Count == 1 && byCandle[0].Outcome == "TakeProfit", "bullish bar trades the low first -> short TP");
+		Check(Outcome(79, FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst) == "StopLoss", "worst case -> SL");
+		Check(Outcome(79, FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection) == "TakeProfit", "bullish bar trades the low first -> TP");
+		Check(Outcome(79, null) == "StopLoss", "default nearer-extreme rule, 21 points each way -> tie -> worst case");
+		Check(Outcome(79.5m, null) == "TakeProfit", "low nearer the open -> low first -> TP");
+	}
+
+	private static void BreakEvenStopAfterTrigger()
+	{
+		// BUY at 103.5: TP 123.5, SL 83.5, trigger 113.5 (+40t), break-even stop 108.5 (+20t)
+		List<IndicatorCandle> Bars()
+		{
+			var bars = FvgSetup();
+			bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));   // 19 BUY
+			bars.Add(Bar(103.5m, 114, 103.25m, 113.75m));              // 20 dips a tick, then runs through the trigger
+			bars.Add(Bar(113.75m, 113.75m, 108, 108.25m));             // 21 falls back through the break-even stop
+			bars.Add(Bar(108.25m, 109, 107, 108));                     // 22 forming
+			return bars;
+		}
+
+		var ind = RunHistorical(Bars());
+		var trades = Trades(ind);
+		Check(trades.Count == 1, $"expected 1 trade, got {trades.Count}");
+
+		if (trades.Count != 1)
+			return;
+
+		var t = trades[0];
+		Check(t.BreakEvenActive && t.BreakEvenBar == 20, "stop moved on the bar that reached +40t");
+		Check(t.Outcome == "BreakEven" && t.ExitBar == 21 && t.ExitPrice == 108.5m, $"exit {t.Outcome} on bar {t.ExitBar} at {t.ExitPrice}");
+		Check((t.ExitPrice - t.EntryPrice) / Tick == 20, "a break-even exit is worth +20 ticks");
+		Check((int)IndicatorType.GetField("_longBreakEvens", Private).GetValue(ind) == 1, "panel counts the break-even exit");
+
+		// worst case: bar 20's low may have come after its high, i.e. after the trigger
+		var worst = Trades(RunHistorical(Bars(), i => i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst));
+		Check(worst.Count == 1 && worst[0].Outcome == "BreakEven" && worst[0].ExitBar == 20 && worst[0].AmbiguousExit,
+			"worst case stops the trade at break-even on bar 20");
+
+		var plain = Trades(RunHistorical(Bars(), i => i.BreakEvenTriggerTicks = 0));
+		Check(plain.Count == 1 && !plain[0].HasBreakEven && plain[0].Outcome == "Open", "without break-even the trade is still open");
 	}
 
 	private static void ReactedZoneIsInvalidated()
@@ -331,6 +559,32 @@ internal static class Program
 		Check(required.Count == 0, "RequireAbsorption drops the unconfirmed buy");
 	}
 
+	private static void LiveBreakEvenFollowsTheTicks()
+	{
+		var ind = NewIndicator(null);
+		var history = FvgSetup();
+		ind.Candles.AddRange(history);
+		ind.HarnessRecalculate();
+
+		for (var i = 0; i < history.Count; i++)
+			ind.HarnessCalculate(i);
+
+		StreamBar(ind, new[] { 103m, 102.5m, 101.75m, 102.75m, 103.25m, 103.75m, 103.5m }, delta: 50); // 19: BUY at 103.5
+
+		// 20: trades under the break-even stop BEFORE reaching the trigger, then holds above it -
+		// the bar's low (103.25) is below 108.5, but it came first
+		StreamBar(ind, new[] { 103.5m, 103.25m, 108m, 110m, 113.5m, 112m, 110m, 113m });
+		var trades = Trades(ind);
+		Check(trades.Count == 1 && trades[0].BreakEvenActive && trades[0].BreakEvenBar == 20 && trades[0].Outcome == "Open",
+			"a dip before the trigger does not stop the trade");
+
+		// 21: back to the break-even stop
+		StreamBar(ind, new[] { 113m, 111m, 109m, 108.5m, 109m });
+		trades = Trades(ind);
+		Check(trades.Count == 1 && trades[0].Outcome == "BreakEven" && trades[0].ExitBar == 21 && trades[0].ExitPrice == 108.5m,
+			"stopped at break-even on the tick that reached it");
+	}
+
 	private static void LiveSignalAppearsAfterClose()
 	{
 		var history = FvgSetup();
@@ -378,23 +632,30 @@ internal static class Program
 		VerifySignalsAgainstOracle(ind, market, trades);
 	}
 
-	private static void FuzzMinProbability()
+	private static void FuzzFilters()
 	{
 		var market = Generate(6000, 5);
-		var ind = RunHistorical(market.Candles, i => i.MinProbabilityPercent = 60, market.SessionStarts);
-		var trades = Trades(ind);
 
-		Check(trades.Where(t => t.IsShown).All(t => Math.Round(t.TakeProfit * 100, MidpointRounding.AwayFromZero) >= 60),
-			"every shown signal is labelled >= 60%");
-		Check(trades.Count(t => !t.IsShown) > 0, "filter hides some signals");
-		Check((int)IndicatorType.GetField("_filtered", Private).GetValue(ind) == trades.Count(t => !t.IsShown), "filtered count");
+		foreach (var (name, configure, passes) in new (string, Action<FvgReactionLiquiditySweep>, Func<TradeView, bool>)[]
+		{
+			("min TP 30%", i => i.MinProbabilityPercent = 30, t => LabelPercentsOf(t)[0] >= 30),
+			("min EV +4t", i => i.MinExpectedTicks = 4, t => Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero) >= 4)
+		})
+		{
+			var ind = RunHistorical(market.Candles, configure, market.SessionStarts);
+			var trades = Trades(ind);
 
-		// hidden signals still feed the model
-		var resolved = trades.Count(t => t.Outcome == "TakeProfit" || t.Outcome == "StopLoss");
-		Check(ModelResolved(ind) == resolved, "model learns from hidden signals too");
+			Check(trades.Where(t => t.IsShown).All(passes), $"{name}: a shown signal fails the filter");
+			Check(trades.Any(t => !t.IsShown && !passes(t)), $"{name}: the filter should hide some signals");
+			Check((int)IndicatorType.GetField("_filtered", Private).GetValue(ind) == trades.Count(t => !t.IsShown), $"{name}: hidden count");
 
-		VerifyOutcomes(ind, market, trades, liveFromBar: int.MaxValue);
-		VerifyInvariants(ind, trades, market.Candles.Count);
+			// hidden signals still feed the model
+			var settled = trades.Count(t => t.Outcome == "TakeProfit" || t.Outcome == "BreakEven" || t.Outcome == "StopLoss");
+			Check(ModelResolved(ind) == settled, $"{name}: the model learns from hidden signals too");
+
+			VerifyOutcomes(ind, market, trades, liveFromBar: int.MaxValue);
+			VerifyInvariants(ind, trades, market.Candles.Count);
+		}
 	}
 
 	private static void FuzzLiveMatchesHistory()
@@ -444,11 +705,14 @@ internal static class Program
 		// alerts: every shown signal and result that happened after the history load, nothing else
 		var expectedSignals = liveTrades.Count(t => t.IsShown && t.EntryBar >= historyBars - 1);
 		var expectedResults = liveTrades.Count(t => t.IsShown && t.Outcome != "Open" && t.ExitBar >= historyBars);
+		var expectedMoves = liveTrades.Count(t => t.IsShown && t.BreakEvenActive && t.BreakEvenBar >= historyBars);
 		var signalAlerts = live.Alerts.Count(a => a.StartsWith("BUY @") || a.StartsWith("SHORT @"));
-		var resultAlerts = live.Alerts.Count(a => a.Contains(" from "));
+		var moveAlerts = live.Alerts.Count(a => a.Contains("stop moved to"));
+		var resultAlerts = live.Alerts.Count(a => a.Contains(" from ") && !a.Contains("stop moved to"));
 		Check(signalAlerts == expectedSignals, $"signal alerts {signalAlerts}, expected {expectedSignals}");
 		Check(resultAlerts == expectedResults, $"result alerts {resultAlerts}, expected {expectedResults}");
-		Check(expectedSignals > 0 && expectedResults > 0, "live part should contain signals and results");
+		Check(moveAlerts == expectedMoves, $"stop-moved alerts {moveAlerts}, expected {expectedMoves}");
+		Check(expectedSignals > 0 && expectedResults > 0 && expectedMoves > 0, "live part should contain signals, results and stop moves");
 	}
 
 	private static void RecalculateIsDeterministic()
@@ -495,8 +759,25 @@ internal static class Program
 		Check(context.Strings.Count(s => s.StartsWith("BUY  TP ") || s.StartsWith("SHORT  TP ")) == visibleShown.Count,
 			"one probability label per visible signal");
 		Check(context.Strings.Any(s => s.StartsWith("FVG / Sweep signals")), "stats panel drawn");
-		Check(context.Strings.Any(s => s.StartsWith("Labelled >=60%: ") && s.Contains("<=40%: ")), "track record line drawn");
+		Check(context.Strings.Any(s => s.StartsWith("Labelled EV>0: ") && s.Contains("EV<=0: ")), "track record line drawn");
+		Check(context.Strings.Any(s => s.StartsWith("Longs ") && s.Contains(" BE ")), "panel rows count break-even exits");
 		Check(context.Rectangles > 0 && context.Lines > 0, "levels and boxes drawn");
+
+		// labels read "BUY  TP x% | BE y% | SL z%" and the three add up to 100
+		var labels = context.Strings.Where(s => s.StartsWith("BUY  TP ") || s.StartsWith("SHORT  TP ")).ToList();
+		Check(labels.All(l => l.Contains("% | BE ") && l.Split('%').Take(3).Sum(part => int.Parse(new string(part.Reverse().TakeWhile(char.IsDigit).Reverse().ToArray()))) == 100),
+			"label odds add up to 100%");
+		Check(context.Strings.Any(s => s.Contains(" | EV ")), "labels show expected ticks");
+
+		// an activated trade draws its break-even stop line in the break-even color
+		var moved = visibleShown.FirstOrDefault(t => t.BreakEvenActive);
+
+		if (moved != null)
+		{
+			var yBreakEven = chart.GetYByPrice(moved.BreakEvenPrice, false);
+			var beColor = ind.BreakEvenPen.RenderObject.Color;
+			Check(context.Operations.Any(o => o.Kind == "line" && o.From.Y == yBreakEven && o.Color.ToArgb() == beColor.ToArgb()), "break-even stop line drawn");
+		}
 
 		// hover the first visible label (drawn first, so never nudged) -> tooltip
 		var target = visibleShown.OrderBy(t => t.EntryBar).First();
@@ -509,7 +790,7 @@ internal static class Program
 
 		context = new RenderContext();
 		ind.HarnessRender(context);
-		Check(context.Strings.Any(s => s.StartsWith("P(TP first)")), "tooltip drawn on hover");
+		Check(context.Strings.Any(s => s.StartsWith("P(TP) ") && s.Contains("P(BE) ")), "tooltip drawn on hover");
 
 		// cluster mode + everything switched on/off still renders
 		chart.ChartVisualMode = ChartVisualModes.Clusters;
@@ -535,8 +816,28 @@ internal static class Program
 		((FakeChart)openInd.ChartInfo).TopPrice = 130;
 		context = new RenderContext();
 		openInd.HarnessRender(context);
-		Check(context.Strings.Any(s => s.StartsWith("Live BUY +16t:")), "live line for the open trade (+16 ticks)");
-		Check(context.Strings.Any(s => s.StartsWith("TP ") && s.Contains("123.50")), "price tag on the open trade");
+		Check(context.Strings.Any(s => s.StartsWith("Live BUY +16t:  TP ")), "live line for the open trade (+16 ticks)");
+		Check(context.Strings.Any(s => s.StartsWith("TP ") && s.Contains("123.50")), "TP price tag on the open trade");
+		Check(context.Strings.Any(s => s.StartsWith("SL ") && s.Contains("83.50")), "SL price tag before the stop moves");
+
+		// once +40t is reached the stop tag moves to break-even and SL odds drop to 0
+		var movedInd = NewIndicator(null);
+		bars = FvgSetup();
+		bars.Add(Bar(103, 103.75m, 101.75m, 103.5m, delta: 50));
+		bars.Add(Bar(103.5m, 114.5m, 103.25m, 114.5m));
+		movedInd.Candles.AddRange(bars);
+		movedInd.HarnessRecalculate();
+
+		for (var i = 0; i < bars.Count; i++)
+			movedInd.HarnessCalculate(i);
+
+		movedInd.FirstVisibleBarNumber = 0;
+		movedInd.LastVisibleBarNumber = bars.Count - 1;
+		((FakeChart)movedInd.ChartInfo).TopPrice = 130;
+		context = new RenderContext();
+		movedInd.HarnessRender(context);
+		Check(context.Strings.Any(s => s.StartsWith("Live BUY +44t, stop +20t:  TP ") && s.EndsWith("| SL 0%")), "live line after the stop moved");
+		Check(context.Strings.Any(s => s.StartsWith("BE ") && s.Contains("108.50")), "stop tag moved to break-even");
 	}
 
 	private sealed class OracleZone
@@ -744,114 +1045,147 @@ internal static class Program
 
 		foreach (var t in trades)
 		{
-			var (outcome, exitBar) = Oracle(ind, market, t, last, liveFromBar);
+			var expected = Oracle(ind, market, t, last, liveFromBar);
+			var ok = expected.Outcome == t.Outcome && expected.ExitBar == t.ExitBar && expected.BreakEvenBar == t.BreakEvenBar
+				&& (t.Outcome == "Open" || expected.Exit == t.ExitPrice);
 
-			if (outcome == t.Outcome && exitBar == t.ExitBar)
+			if (ok)
 				continue;
 
 			if (mismatches++ < 5)
-				Failures.Add($"trade @{t.EntryBar} {(t.IsLong ? "L" : "S")}: indicator {t.Outcome}/{t.ExitBar}, oracle {outcome}/{exitBar}");
+			{
+				Failures.Add($"trade @{t.EntryBar} {(t.IsLong ? "L" : "S")}: indicator {t.Outcome}/{t.ExitBar}/BE {t.BreakEvenBar}/{t.ExitPrice}, "
+					+ $"oracle {expected.Outcome}/{expected.ExitBar}/BE {expected.BreakEvenBar}/{expected.Exit}");
+			}
 		}
 
 		Check(mismatches == 0, $"{mismatches} trade outcomes differ from the oracle");
-
-		if (!ind.ExpireAtSessionEnd)
-			return;
-
-		// no trade opens on the last bar of a session
-		Check(trades.All(t => !market.SessionStarts.Contains(t.EntryBar + 1)), "trade opened on a session's last bar");
+		Check(!ind.ExpireAtSessionEnd || trades.All(t => !market.SessionStarts.Contains(t.EntryBar + 1)), "trade opened on a session's last bar");
 	}
 
-	// independent re-implementation of how a trade should settle
-	private static (string Outcome, int ExitBar) Oracle(FvgReactionLiquiditySweep ind, Market market, TradeView t, int lastBar, int liveFromBar)
+	// independent re-implementation of how a trade should settle, break-even included
+	private static (string Outcome, int ExitBar, int BreakEvenBar, decimal Exit) Oracle(FvgReactionLiquiditySweep ind, Market market, TradeView t,
+		int lastBar, int liveFromBar)
 	{
+		var active = false;
+		var movedAt = -1;
+
 		for (var b = t.EntryBar + 1; b <= lastBar; b++)
 		{
-			var outcome = b >= liveFromBar
-				? FirstTouch(t, market.Paths[b])
-				: HistoricalBar(t, market.Candles[b], ind.SameBarRule);
+			var step = b >= liveFromBar
+				? OracleWalk(t, market.Paths[b], active)
+				: OracleBar(t, market.Candles[b], active, ind.SameBarRule);
 
-			if (outcome != "Open")
-				return (outcome, b);
+			if (step.Active && !active)
+				movedAt = b;
+
+			active = step.Active;
+
+			if (step.Outcome != "Open")
+				return (step.Outcome, b, movedAt, step.Exit);
 
 			if (b == lastBar)
 				break; // still forming - no end-of-bar expiry yet
 
 			if (ind.MaxBarsInTrade > 0 && b - t.EntryBar >= ind.MaxBarsInTrade)
-				return ("Expired", b);
+				return ("Expired", b, movedAt, market.Candles[b].Close);
 
 			if (ind.ExpireAtSessionEnd && market.SessionStarts.Contains(b + 1))
-				return ("Expired", b);
+				return ("Expired", b, movedAt, market.Candles[b].Close);
 		}
 
-		return ("Open", -1);
+		return ("Open", -1, movedAt, 0);
 	}
 
-	private static string HistoricalBar(TradeView t, IndicatorCandle c, FvgReactionLiquiditySweep.SameBarHitRule rule)
+	// one historical bar: open, both extremes in the order the rule picks, close
+	private static (string Outcome, bool Active, decimal Exit) OracleBar(TradeView t, IndicatorCandle c, bool active,
+		FvgReactionLiquiditySweep.SameBarHitRule rule)
 	{
-		var tp = t.IsLong ? c.High >= t.TakeProfitPrice : c.Low <= t.TakeProfitPrice;
-		var sl = t.IsLong ? c.Low <= t.StopLossPrice : c.High >= t.StopLossPrice;
+		var lowFirst = OracleWalk(t, new List<decimal> { c.Open, c.Low, c.High, c.Close }, active);
+		var highFirst = OracleWalk(t, new List<decimal> { c.Open, c.High, c.Low, c.Close }, active);
 
-		if (tp && sl)
-		{
-			if (t.IsLong ? c.Open >= t.TakeProfitPrice : c.Open <= t.TakeProfitPrice)
-				return "TakeProfit";
+		if (lowFirst.Outcome == highFirst.Outcome && lowFirst.Active == highFirst.Active)
+			return lowFirst;
 
-			if (t.IsLong ? c.Open <= t.StopLossPrice : c.Open >= t.StopLossPrice)
-				return "StopLoss";
+		if (rule == FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection)
+			return c.Close >= c.Open ? lowFirst : highFirst;
 
-			if (rule == FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst)
-				return "StopLoss";
+		if (rule == FvgReactionLiquiditySweep.SameBarHitRule.NearestExtremeFirst && c.High - c.Open != c.Open - c.Low)
+			return c.High - c.Open < c.Open - c.Low ? highFirst : lowFirst;
 
-			var lowFirst = c.Close >= c.Open;
-			return t.IsLong == lowFirst ? "StopLoss" : "TakeProfit";
-		}
+		int Score((string Outcome, bool Active, decimal Exit) r) =>
+			r.Outcome == "StopLoss" ? 0 : r.Outcome == "BreakEven" ? 2 : r.Outcome == "TakeProfit" ? 4 : r.Active ? 3 : 1;
 
-		return tp ? "TakeProfit" : sl ? "StopLoss" : "Open";
+		return Score(lowFirst) <= Score(highFirst) ? lowFirst : highFirst;
 	}
 
-	private static string FirstTouch(TradeView t, List<decimal> path)
+	// price by price: TP, then the break-even trigger, then whichever stop applies
+	private static (string Outcome, bool Active, decimal Exit) OracleWalk(TradeView t, List<decimal> prices, bool active)
 	{
-		foreach (var price in path)
+		foreach (var price in prices)
 		{
-			if (t.IsLong ? price >= t.TakeProfitPrice : price <= t.TakeProfitPrice)
-				return "TakeProfit";
+			var inFavour = t.IsLong ? price - t.EntryPrice : t.EntryPrice - price;
+			var reachedTrigger = t.HasBreakEven && inFavour >= Math.Abs(t.TriggerPrice - t.EntryPrice);
 
-			if (t.IsLong ? price <= t.StopLossPrice : price >= t.StopLossPrice)
-				return "StopLoss";
+			if (inFavour >= Math.Abs(t.TakeProfitPrice - t.EntryPrice))
+				return ("TakeProfit", active || reachedTrigger, t.TakeProfitPrice);
+
+			active |= reachedTrigger;
+
+			var stop = active ? t.BreakEvenPrice : t.StopLossPrice;
+
+			if (t.IsLong ? price <= stop : price >= stop)
+				return (active ? "BreakEven" : "StopLoss", active, stop);
 		}
 
-		return "Open";
+		return ("Open", active, 0);
 	}
 
 	private static void VerifyInvariants(FvgReactionLiquiditySweep ind, List<TradeView> trades, int barCount)
 	{
 		// 1) walk-forward: each estimate uses exactly the trades settled by its signal bar
 		var lookAhead = 0;
+		var prior = PriorOf(ind);
+		double beTicks = ind.BreakEvenTriggerTicks > 0 && ind.BreakEvenTriggerTicks < ind.TakeProfitTicks
+			? Math.Min(ind.BreakEvenStopTicks, ind.BreakEvenTriggerTicks - 1)
+			: 0;
 
 		foreach (var t in trades)
 		{
 			var settled = trades.Where(o => o.IsLong == t.IsLong && o.ExitBar >= 0 && o.ExitBar <= t.EntryBar
-				&& (o.Outcome == "TakeProfit" || o.Outcome == "StopLoss")).ToList();
+				&& (o.Outcome == "TakeProfit" || o.Outcome == "BreakEven" || o.Outcome == "StopLoss")).ToList();
 			var sameTrigger = settled.Where(o => o.Trigger == t.Trigger).ToList();
 			var sameSetup = sameTrigger.Where(o => o.Confirmations == t.Confirmations).ToList();
 
-			var ok = t.DirectionCount == settled.Count && t.DirectionWins == settled.Count(o => o.Outcome == "TakeProfit")
-				&& t.TriggerCount == sameTrigger.Count && t.TriggerWins == sameTrigger.Count(o => o.Outcome == "TakeProfit")
-				&& t.SetupCount == sameSetup.Count && t.SetupWins == sameSetup.Count(o => o.Outcome == "TakeProfit");
+			bool Matches(List<TradeView> group, (int Wins, int BreakEvens, int Count) tally) =>
+				tally.Count == group.Count && tally.Wins == group.Count(o => o.Outcome == "TakeProfit")
+				&& tally.BreakEvens == group.Count(o => o.Outcome == "BreakEven");
+
+			var ok = Matches(settled, t.Direction) && Matches(sameTrigger, t.TriggerTally) && Matches(sameSetup, t.Setup);
 
 			double k = ind.ProbabilitySmoothing;
-			var prior = (double)ind.StopLossTicks / (ind.TakeProfitTicks + ind.StopLossTicks);
-			var p = (t.DirectionWins + k * prior) / (t.DirectionCount + k);
-			p = (t.TriggerWins + k * p) / (t.TriggerCount + k);
-			p = (t.SetupWins + k * p) / (t.SetupCount + k);
-			ok &= Math.Abs(p - t.TakeProfit) < 1e-12 && t.TakeProfit > 0 && t.TakeProfit < 1;
+			var p = prior;
+
+			foreach (var tally in new[] { t.Direction, t.TriggerTally, t.Setup })
+			{
+				double n = tally.Count + k;
+				p = ((tally.Wins + k * p.Tp) / n, (tally.BreakEvens + k * p.Be) / n, (tally.Count - tally.Wins - tally.BreakEvens + k * p.Sl) / n);
+			}
+
+			var ev = p.Tp * ind.TakeProfitTicks + p.Be * beTicks - p.Sl * ind.StopLossTicks;
+			ok &= Math.Abs(p.Tp - t.TakeProfit) < 1e-12 && Math.Abs(p.Be - t.BreakEven) < 1e-12 && Math.Abs(ev - t.ExpectedTicks) < 1e-9;
+			ok &= t.TakeProfit > 0 && t.StopLoss > 0 && (beTicks > 0 || t.HasBreakEven || t.BreakEven == 0);
 
 			if (!ok && lookAhead++ < 3)
 				Failures.Add($"estimate of trade @{t.EntryBar} does not match the trades settled before it");
 		}
 
 		Check(lookAhead == 0, $"{lookAhead} estimates use data they could not have had");
+
+		// break-even bookkeeping
+		Check(trades.All(t => t.HasBreakEven || !t.BreakEvenActive), "break-even moved on a trade without it");
+		Check(trades.Where(t => t.Outcome == "BreakEven").All(t => t.BreakEvenActive && t.BreakEvenBar <= t.ExitBar), "break-even exit without a stop move");
+		Check(trades.Where(t => t.BreakEvenActive).All(t => t.BreakEvenBar > t.EntryBar), "stop moved on the signal bar");
 
 		// 2) one position at a time
 		if (ind.OneTradeAtATime)
@@ -899,27 +1233,33 @@ internal static class Program
 
 		var shownTrades = trades.Where(t => t.IsShown).ToList();
 		Check(PanelInt("_longWins") == shownTrades.Count(t => t.IsLong && t.Outcome == "TakeProfit"), "long wins");
+		Check(PanelInt("_longBreakEvens") == shownTrades.Count(t => t.IsLong && t.Outcome == "BreakEven"), "long break-evens");
+		Check(PanelInt("_shortBreakEvens") == shownTrades.Count(t => !t.IsLong && t.Outcome == "BreakEven"), "short break-evens");
 		Check(PanelInt("_longLosses") == shownTrades.Count(t => t.IsLong && t.Outcome == "StopLoss"), "long losses");
 		Check(PanelInt("_shortWins") == shownTrades.Count(t => !t.IsLong && t.Outcome == "TakeProfit"), "short wins");
 		Check(PanelInt("_shortLosses") == shownTrades.Count(t => !t.IsLong && t.Outcome == "StopLoss"), "short losses");
 		Check(PanelInt("_expired") == shownTrades.Count(t => t.Outcome == "Expired"), "expired");
 		Check(PanelInt("_filtered") == trades.Count(t => !t.IsShown), "filtered");
-		Check(ModelResolved(ind) == trades.Count(t => t.Outcome == "TakeProfit" || t.Outcome == "StopLoss"), "model sample size");
+		var settledAll = trades.Where(t => t.Outcome == "TakeProfit" || t.Outcome == "BreakEven" || t.Outcome == "StopLoss").ToList();
+		Check(ModelResolved(ind) == settledAll.Count, "model sample size");
 
-		var settledAll = trades.Where(t => t.Outcome == "TakeProfit" || t.Outcome == "StopLoss").ToList();
-		int Labelled(TradeView t) => (int)Math.Round(t.TakeProfit * 100, MidpointRounding.AwayFromZero);
-		Check(PanelInt("_highOddsCount") == settledAll.Count(t => Labelled(t) >= 60)
-			&& PanelInt("_highOddsWins") == settledAll.Count(t => Labelled(t) >= 60 && t.Outcome == "TakeProfit")
-			&& PanelInt("_lowOddsCount") == settledAll.Count(t => Labelled(t) <= 40)
-			&& PanelInt("_lowOddsWins") == settledAll.Count(t => Labelled(t) <= 40 && t.Outcome == "TakeProfit"), "track record counters");
+		// track record: realised ticks of every settled signal, split by the sign of its labelled EV
+		decimal Realised(TradeView t) => (t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1);
+		bool PositiveLabel(TradeView t) => Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero) > 0;
+		decimal PanelTicks(string name) => (decimal)IndicatorType.GetField(name, Private).GetValue(ind);
+		Check(PanelInt("_positiveEvCount") == settledAll.Count(PositiveLabel)
+			&& PanelInt("_negativeEvCount") == settledAll.Count(t => !PositiveLabel(t))
+			&& PanelTicks("_positiveEvTicks") == settledAll.Where(PositiveLabel).Sum(Realised)
+			&& PanelTicks("_negativeEvTicks") == settledAll.Where(t => !PositiveLabel(t)).Sum(Realised), "track record counters");
 
 		var net = (decimal)IndicatorType.GetField("_longNetTicks", Private).GetValue(ind)
 			+ (decimal)IndicatorType.GetField("_shortNetTicks", Private).GetValue(ind);
 		var expectedNet = shownTrades.Where(t => t.Outcome != "Open")
 			.Sum(t => (t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1));
 		Check(net == expectedNet, $"net ticks {net} vs {expectedNet}");
-		Check(shownTrades.Where(t => t.Outcome == "TakeProfit").All(t => (t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1) == ind.TakeProfitTicks),
-			"a TP is worth exactly +TP ticks");
+		Check(trades.Where(t => t.Outcome == "TakeProfit").All(t => Realised(t) == ind.TakeProfitTicks), "a TP is worth exactly +TP ticks");
+		Check(trades.Where(t => t.Outcome == "BreakEven").All(t => Realised(t) == (decimal)beTicks), "a break-even exit is worth exactly the offset");
+		Check(trades.Where(t => t.Outcome == "StopLoss").All(t => Realised(t) == -ind.StopLossTicks), "an SL is worth exactly -SL ticks");
 	}
 
 	#endregion
@@ -1053,6 +1393,11 @@ internal static class Program
 		public bool IsLong;
 		public bool IsShown;
 		public bool AmbiguousExit;
+		public bool HasBreakEven;
+		public bool BreakEvenActive;
+		public int BreakEvenBar;
+		public decimal TriggerPrice;
+		public decimal BreakEvenPrice;
 		public bool HasAbsorption;
 		public bool WithTrend;
 		public bool DeltaConfirms;
@@ -1064,12 +1409,12 @@ internal static class Program
 		public decimal StopLossPrice;
 		public decimal ExitPrice;
 		public double TakeProfit;
-		public int SetupWins;
-		public int SetupCount;
-		public int TriggerWins;
-		public int TriggerCount;
-		public int DirectionWins;
-		public int DirectionCount;
+		public double BreakEven;
+		public double StopLoss;
+		public double ExpectedTicks;
+		public (int Wins, int BreakEvens, int Count) Setup;
+		public (int Wins, int BreakEvens, int Count) TriggerTally;
+		public (int Wins, int BreakEvens, int Count) Direction;
 	}
 
 	private static FvgReactionLiquiditySweep NewIndicator(Action<FvgReactionLiquiditySweep> configure)
@@ -1135,7 +1480,14 @@ internal static class Program
 		foreach (var t in list)
 		{
 			var estimate = Get(t, "Estimate");
-			int EstimateInt(string name) => (int)estimate.GetType().GetProperty(name).GetValue(estimate);
+			double EstimateValue(string name) => (double)estimate.GetType().GetProperty(name).GetValue(estimate);
+
+			(int, int, int) Tally(string name)
+			{
+				var tally = estimate.GetType().GetProperty(name).GetValue(estimate);
+				int Count(string property) => (int)tally.GetType().GetProperty(property).GetValue(tally);
+				return (Count("Wins"), Count("BreakEvens"), Count("Count"));
+			}
 
 			result.Add(new TradeView
 			{
@@ -1144,6 +1496,11 @@ internal static class Program
 				IsLong = (bool)Get(t, "IsLong"),
 				IsShown = (bool)Get(t, "IsShown"),
 				AmbiguousExit = (bool)Get(t, "AmbiguousExit"),
+				HasBreakEven = (bool)Get(t, "HasBreakEven"),
+				BreakEvenActive = (bool)Get(t, "BreakEvenActive"),
+				BreakEvenBar = (int)Get(t, "BreakEvenBar"),
+				TriggerPrice = (decimal)Get(t, "TriggerPrice"),
+				BreakEvenPrice = (decimal)Get(t, "BreakEvenPrice"),
 				HasAbsorption = (bool)Get(t, "HasAbsorption"),
 				WithTrend = (bool)Get(t, "WithTrend"),
 				DeltaConfirms = (bool)Get(t, "DeltaConfirms"),
@@ -1154,13 +1511,13 @@ internal static class Program
 				TakeProfitPrice = (decimal)Get(t, "TakeProfitPrice"),
 				StopLossPrice = (decimal)Get(t, "StopLossPrice"),
 				ExitPrice = (decimal)Get(t, "ExitPrice"),
-				TakeProfit = (double)estimate.GetType().GetProperty("TakeProfit").GetValue(estimate),
-				SetupWins = EstimateInt("SetupWins"),
-				SetupCount = EstimateInt("SetupCount"),
-				TriggerWins = EstimateInt("TriggerWins"),
-				TriggerCount = EstimateInt("TriggerCount"),
-				DirectionWins = EstimateInt("DirectionWins"),
-				DirectionCount = EstimateInt("DirectionCount")
+				TakeProfit = EstimateValue("TakeProfit"),
+				BreakEven = EstimateValue("BreakEven"),
+				StopLoss = EstimateValue("StopLoss"),
+				ExpectedTicks = EstimateValue("ExpectedTicks"),
+				Setup = Tally("Setup"),
+				TriggerTally = Tally("Trigger"),
+				Direction = Tally("Direction")
 			});
 		}
 
@@ -1201,18 +1558,104 @@ internal static class Program
 		return new IndicatorCandle { Open = open, High = high, Low = low, Close = close, Delta = delta, Time = new DateTime(2026, 3, 2) };
 	}
 
-	private static (string Outcome, bool Ambiguous) Evaluate(bool isLong, decimal tp, decimal sl, decimal open, decimal high, decimal low,
-		decimal close, FvgReactionLiquiditySweep.SameBarHitRule rule)
+	// driftless random-walk odds, derived independently of the indicator
+	private static (double Tp, double Be, double Sl) PriorOf(FvgReactionLiquiditySweep ind)
 	{
-		var method = IndicatorType.GetMethod("EvaluateBar", PrivateStatic);
-		var args = new object[] { isLong, tp, sl, open, high, low, close, rule, false };
-		var outcome = method.Invoke(null, args);
-		return (outcome.ToString(), (bool)args[8]);
+		double tp = ind.TakeProfitTicks;
+		double sl = ind.StopLossTicks;
+
+		if (ind.BreakEvenTriggerTicks <= 0 || ind.BreakEvenTriggerTicks >= ind.TakeProfitTicks)
+			return (sl / (tp + sl), 0, tp / (tp + sl));
+
+		double trigger = ind.BreakEvenTriggerTicks;
+		double stop = Math.Min(ind.BreakEvenStopTicks, ind.BreakEvenTriggerTicks - 1);
+		var reach = sl / (trigger + sl);
+		var after = (trigger - stop) / (tp - stop);
+		return (reach * after, reach * (1 - after), 1 - reach);
 	}
 
-	private static void Expect((string Outcome, bool Ambiguous) actual, string outcome, bool ambiguous, string name)
+	// whole percentages adding to 100, largest remainders first - as the labels show them
+	private static int[] LabelPercentsOf(TradeView t)
+	{
+		var p = t.HasBreakEven ? new[] { t.TakeProfit, t.BreakEven, t.StopLoss } : new[] { t.TakeProfit, t.StopLoss };
+		var result = p.Select(x => (int)Math.Floor(x * 100)).ToArray();
+		var byRemainder = Enumerable.Range(0, p.Length).OrderByDescending(i => p[i] * 100 - result[i]).ThenBy(i => i).ToList();
+		var left = 100 - result.Sum();
+
+		for (var i = 0; i < left; i++)
+			result[byRemainder[i]]++;
+
+		return result;
+	}
+
+	private static readonly Type TradeType = IndicatorType.GetNestedType("SignalTrade", BindingFlags.NonPublic);
+
+	// entry 100, TP / SL 20 away, break-even at +10 moving the stop to +5
+	private static object MakeTrade(bool isLong, bool breakEven, bool active = false)
+	{
+		var trade = Activator.CreateInstance(TradeType);
+		var direction = isLong ? 1 : -1;
+		Set(trade, "IsLong", isLong);
+		Set(trade, "EntryPrice", 100m);
+		Set(trade, "TakeProfitPrice", 100m + direction * 20);
+		Set(trade, "StopLossPrice", 100m - direction * 20);
+		Set(trade, "HasBreakEven", breakEven);
+		Set(trade, "TriggerPrice", 100m + direction * 10);
+		Set(trade, "BreakEvenPrice", 100m + direction * 5);
+		Set(trade, "BreakEvenActive", active);
+		return trade;
+	}
+
+	private static void Set(object obj, string field, object value)
+	{
+		obj.GetType().GetField(field).SetValue(obj, value);
+	}
+
+	private static object Odds(double tp, double be, double sl)
+	{
+		return Activator.CreateInstance(IndicatorType.GetNestedType("OutcomeOdds", BindingFlags.NonPublic), tp, be, sl);
+	}
+
+	private static void SetEstimate(object trade, double tp, double be, double sl)
+	{
+		var counter = Activator.CreateInstance(IndicatorType.GetNestedType("OutcomeCounter", BindingFlags.NonPublic));
+		var estimateType = IndicatorType.GetNestedType("ProbabilityEstimate", BindingFlags.NonPublic);
+		Set(trade, "Estimate", Activator.CreateInstance(estimateType, Odds(tp, be, sl), 0.0, counter, counter, counter));
+	}
+
+	// a whole historical bar, as the indicator sees it the first time
+	private static (string Outcome, bool Active, bool Ambiguous, object Exit) Settle(object trade, decimal open, decimal high, decimal low,
+		decimal close, FvgReactionLiquiditySweep.SameBarHitRule rule)
+	{
+		var method = IndicatorType.GetMethod("SettleStretch", PrivateStatic);
+		var args = new object[] { trade, open, high, low, close, rule, false };
+		var result = method.Invoke(null, args);
+		object R(string name) => result.GetType().GetProperty(name).GetValue(result);
+		return (R("Outcome").ToString(), (bool)R("BreakEvenActive"), (bool)args[6], R("ExitPrice"));
+	}
+
+	private static (string Outcome, bool Active, bool Ambiguous, object Exit) Walk(object trade, params decimal[] path)
+	{
+		var result = IndicatorType.GetMethod("WalkPath", PrivateStatic).Invoke(null, new[] { trade, (object)path });
+		object R(string name) => result.GetType().GetProperty(name).GetValue(result);
+		return (R("Outcome").ToString(), (bool)R("BreakEvenActive"), false, R("ExitPrice"));
+	}
+
+	private static void Expect((string Outcome, bool Active, bool Ambiguous, object Exit) actual, string outcome, bool ambiguous, string name)
 	{
 		Check(actual.Outcome == outcome && actual.Ambiguous == ambiguous, $"{name}: got {actual.Outcome}/{actual.Ambiguous}");
+	}
+
+	private static void ExpectBar((string Outcome, bool Active, bool Ambiguous, object Exit) actual, string outcome, bool active, bool ambiguous, string name)
+	{
+		Check(actual.Outcome == outcome && actual.Active == active && actual.Ambiguous == ambiguous,
+			$"{name}: got {actual.Outcome}/{actual.Active}/{actual.Ambiguous}");
+	}
+
+	private static void ExpectWalk((string Outcome, bool Active, bool Ambiguous, object Exit) actual, string outcome, bool active, object exit, string name)
+	{
+		var exitOk = outcome == "Open" || (actual.Outcome != "Open" && (decimal)actual.Exit == Convert.ToDecimal(exit, CultureInfo.InvariantCulture));
+		Check(actual.Outcome == outcome && actual.Active == active && exitOk, $"{name}: got {actual.Outcome}/{actual.Active}/{actual.Exit}");
 	}
 
 	private static double Hit(double theta, double excursion, double tp, double sl)

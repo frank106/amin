@@ -2,8 +2,9 @@
 
 A custom indicator for the [ATAS](https://atas.net) platform that marks Fair Value Gap
 reactions, liquidity sweeps and footprint absorption, and turns them into **BUY / SHORT
-signals with the probability of hitting the take profit (80 ticks) before the stop loss
-(80 ticks)**.
+signals with the probability of each way the trade can end**: the take profit (80 ticks),
+the break-even stop (the stop moves to +20 ticks once the trade is 40 ticks in profit) or
+the stop loss (80 ticks).
 
 ![Layout preview](docs/preview.png)
 
@@ -17,8 +18,9 @@ screenshot: ATAS draws the candles and arrows itself, with its own fonts and the
 | Green / red boxes | Unfilled bullish / bearish Fair Value Gaps (3-candle imbalances), extended to the right until price closes through them |
 | Small arrows | Triggers: FVG reaction (lime / red) and liquidity sweep of lows / highs (aqua / magenta) |
 | Orange / blue cells | Absorption heatmap from footprint data: orange = aggressive buying absorbed (often resistance), blue = aggressive selling absorbed (often support) |
-| **Large arrows + label** | **BUY / SHORT signal** with its TP and SL probabilities |
+| **Large arrows + label** | **BUY / SHORT signal** with its TP, break-even and SL probabilities and expected ticks |
 | Shaded boxes | Each signal's trade: entry → TP shaded green, entry → SL shaded red, from the signal bar to the bar that settled it |
+| Amber lines | Dotted: the break-even trigger (+40 ticks). Solid: the stop after it moved to +20 ticks |
 | Panel | Results, sample size, the labels' track record and the live odds of the open trade |
 
 ## Signals
@@ -36,50 +38,57 @@ delta in the signal's direction). Any of them can be made mandatory.
 
 Entry is the signal bar's close; TP and SL are *Take profit* / *Stop loss* ticks away.
 With the default 80 / 80 on NQ that is 20 points each way ($400 per NQ contract, $40 per
-MNQ).
+MNQ). Once the trade is *Break-even trigger* ticks in profit (40), its stop moves to
+*Break-even stop* ticks in profit (+20), so from then on it ends at +80 or +20. Set the
+trigger to 0 to trade the plain 80 / 80 bracket.
 
 ### Where the probability comes from
 
-Every signal on the chart is followed forward until the TP or the SL trades. When a new
-signal fires, its probability is the share of **earlier, already finished** signals of the
-same kind that hit TP first — so the number on an old signal is exactly what the indicator
-would have shown live (no look-ahead).
+Every signal on the chart is followed forward until it ends: at the TP, at the break-even
+stop or at the SL. When a new signal fires, its odds are the shares of **earlier, already
+finished** signals of the same kind that ended each way — so the numbers on an old signal
+are exactly what the indicator would have shown live (no look-ahead).
 
 "The same kind" is layered: same direction → same trigger → same number of
 confirmations. A narrow group with only a few past trades is blended with its broader
-parent group (`p = (wins + k·p_parent) / (trades + k)`, *k* = *Probability smoothing*).
-The starting point is SL / (TP + SL) — the odds of a coin-flip market, **50% for an 80 / 80
-bracket** — so a fresh chart shows 50% everywhere and the numbers only move as real
-outcomes accumulate. Load more history for more reliable estimates.
+parent group (`p = (count + k·p_parent) / (trades + k)` for each ending, *k* =
+*Probability smoothing*). The starting point is the odds of a coin-flip market: for 80 / 80
+with the stop moving to +20 at +40 that is **TP 22%, BE 45%, SL 33%**, worth 0 ticks on
+average (without break-even: 50 / 50). A fresh chart shows those numbers everywhere, and
+they only move as real outcomes accumulate. Load more history for more reliable estimates.
+
+**EV** (expected value) combines the three: `TP% × 80 + BE% × 20 − SL% × 80` ticks. A
+positive EV means that kind of signal has paid on this chart so far.
 
 ### Reading the chart
 
 ```
-BUY  TP 62% | SL 38%            [OPEN]   <- probability of TP first / SL first, result badge
-Sweep+FVG | conf 2/3 | n=14              <- trigger, confirmations, past trades of this exact setup
+BUY  TP 31% | BE 41% | SL 28%          [OPEN]   <- odds of each ending (they add up to 100), result badge
+Sweep+FVG | conf 2/3 | n=14 | EV +11t           <- trigger, confirmations, past trades of this exact setup, expected ticks
 ```
 
-The badge turns **TP** (green), **SL** (red) or **EXP** (expired) once the trade settles.
-Hover a label for the full breakdown: prices, the win counts behind the estimate at each
-level, which confirmations were present and how the trade ended.
+The badge turns **TP** (green), **BE** (amber, stopped at +20), **SL** (red) or **EXP**
+(expired) once the trade settles. Hover a label for the full breakdown: prices, the
+break-even levels, the TP / BE / SL counts behind the estimate at each level, which
+confirmations were present, when the stop moved and how the trade ended.
 
-By default every signal is shown, weak ones included — a BUY at 22% tells you that setup
-has mostly run into its stop. Once the panel's track record shows the labels holding up on
-your chart, set **Min TP probability to show** (e.g. 55–60%) to keep only the better odds on
+By default every signal is shown, weak ones included — a label with a negative EV tells you
+that setup has cost ticks so far. Once the panel's track record shows the labels holding up
+on your chart, set **Min expected ticks to show** (e.g. 5) to keep only the better setups on
 screen; hidden signals are still followed, so the statistics keep learning from them.
 
 The panel shows:
 
-* wins / losses, win rate and net ticks for longs, shorts and total (signals shown on the chart);
+* TP / BE / SL counts and net ticks for longs, shorts and total (signals shown on the chart);
 * open, expired and hidden signals, and how many settled trades the model has learned from;
-* **track record** — how often signals labelled ≥ 60% and ≤ 40% actually hit TP, so you can see whether the labels have been reliable on this chart;
-* for an open trade, **live odds** from the current price (a random walk with the drift implied by the entry probability — at +40 ticks on a 50% signal it reads 75%).
+* **track record** — the average ticks actually made by signals labelled with a positive EV and by the rest, so you can see whether the labels have been reliable on this chart;
+* for an open trade, **live odds** from the current price, e.g. `Live BUY +44t, stop +20t: TP 38% | BE 62% | SL 0%`. Each leg (reaching +40 before the stop, then TP before the break-even stop) is a random walk with the drift implied by the entry odds.
 
 ### Honest limits
 
 * The probability is a frequency from the history loaded on the chart, not a guarantee. Markets change; small samples stay close to 50% by design.
 * Fills are idealised: entry at the close, exact TP / SL, no slippage or commission.
-* On historical bars the order of the high and low inside one bar is unknown. If TP and SL are both inside a bar, the conservative default counts it as a stop loss. Live bars are settled tick by tick, so reloading the chart can occasionally settle such a trade differently.
+* On historical bars the order of the high and low inside one bar is unknown, and it matters whenever a bar holds both the TP and the SL, or reaches +40 and also trades back to +20. By default the indicator assumes price went from the open to the **nearer extreme first** (the assumption TradingView's strategy tester makes). *Worst case* assumes the order that hurts the trade — with break-even on, that means any bar that reaches +40 from an open below +20 counts as stopped at break-even, which is very pessimistic on 1-minute charts. Live bars follow the trades as they happen, so reloading the chart can occasionally settle such a trade differently.
 * Signals close together often ride the same move; the cooldown limits that, but *n* can still overstate the independent evidence.
 
 ## Install
@@ -154,14 +163,17 @@ Your original settings keep their names and defaults.
 | | Only trade with the trend / Require delta / Require absorption | off | |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
-| | Min TP probability to show (%) | 0 | hide weaker signals; they are still learned from |
+| | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
+| | Min expected ticks to show (0 = off) | 0 | hide signals with a lower EV; they are still learned from |
 | Take Profit / Stop Loss | Take profit (ticks) / Stop loss (ticks) | 80 / 80 | |
+| | Break-even trigger (ticks, 0 = off) | 40 | profit at which the stop moves |
+| | Break-even stop (ticks in profit) | 20 | where it moves to (0 = the entry price); kept below the trigger |
 | | Max bars in trade (0 = no limit) | 0 | expired trades are left out of the probabilities |
 | | Close trades at session end | off | also takes no new signal on a session's last bar |
-| | TP and SL inside one bar | Stop loss first | or decide by candle direction (O-L-H-C / O-H-L-C) |
+| | Order of high and low inside a bar | Open to the nearer extreme first | or worst case for the trade, or candle direction (O-L-H-C / O-H-L-C) |
 | | Probability smoothing (virtual trades) | 10 | higher = steadier numbers that need more history to move |
-| Display | labels, TP / SL levels, panel and its corner, label offset, font, TP / SL line style | | |
-| Alerts | Alert on new signal / Alert when TP / SL is hit / sound file | off / off / alert1 | only in real time, never while history loads |
+| Display | labels, TP / SL levels, panel and its corner, label offset, font, TP / SL / break-even line style | | |
+| Alerts | Alert on new signal / Alert on TP / SL / break-even / sound file | off / off / alert1 | the second also fires when a stop moves to break-even; only in real time, never while history loads |
 
 The signal arrows are regular data series (*Buy Signal*, *Short Signal*), so ATAS can also
 use them for alerts or automation.
