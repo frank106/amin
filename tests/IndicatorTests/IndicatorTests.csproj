@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Builds FvgReactionLiquiditySweep.cs against the stubs and runs the checks in Program.cs.
+       See tests/README.md for the command line. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <!-- -p:WpfColor=true: compile (not run) against the real WPF System.Windows.Media.Color
+       that classic ATAS uses for CrossColor, taken from the Windows Desktop reference pack -->
+  <PropertyGroup Condition=" '$(WpfColor)' == 'true' ">
+    <DefineConstants>$(DefineConstants);WPF_COLOR</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition=" '$(WpfColor)' == 'true' ">
+    <PackageDownload Include="Microsoft.WindowsDesktop.App.Ref" Version="[8.0.10]" />
+    <Reference Include="$(NuGetPackageRoot)microsoft.windowsdesktop.app.ref/8.0.10/ref/net8.0/PresentationCore.dll" />
+    <Reference Include="$(NuGetPackageRoot)microsoft.windowsdesktop.app.ref/8.0.10/ref/net8.0/WindowsBase.dll" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\..\FvgReactionLiquiditySweep.cs" Link="FvgReactionLiquiditySweep.cs" />
+    <ProjectReference Include="..\AtasApiStubs\AtasApiStubs.csproj" />
+  </ItemGroup>
+</Project>
