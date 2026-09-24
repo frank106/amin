@@ -12,10 +12,16 @@ using System.Drawing.Drawing2D;
 
 using OFT.Rendering.Context;
 
-// On classic (WPF) ATAS, CrossColor is System.Windows.Media.Color; keeping it a
-// separate type here makes the compiler flag any missing .Convert(). Build with
-// -p:WpfColor=true to use the real WPF type instead (see tests/README.md).
-#if !WPF_COLOR
+// ATAS's platform color ("CrossColor") is System.Windows.Media.Color on classic ATAS and
+// System.Drawing.Color on ATAS X. -p:WpfColor=true uses the real WPF type, -p:CrossColor=true
+// the ATAS X model; by default a stand-in WPF-like struct makes any missing .Convert() fail.
+#if CROSS_COLOR
+using CrossColor = System.Drawing.Color;
+#else
+using CrossColor = System.Windows.Media.Color;
+#endif
+
+#if !WPF_COLOR && !CROSS_COLOR
 namespace System.Windows.Media
 {
 	public struct Color
@@ -107,7 +113,7 @@ namespace OFT.Rendering.Settings
 
 	public class PenSettings
 	{
-		public System.Windows.Media.Color Color { get; set; } = System.Windows.Media.Color.FromArgb(255, 0, 0, 0);
+		public CrossColor Color { get; set; } = CrossColor.FromArgb(255, 0, 0, 0);
 		public int Width { get; set; } = 1;
 		public RenderPen RenderObject => new RenderPen(ATAS.Indicators.ColorExtensions.Convert(Color), Width);
 	}
@@ -242,15 +248,23 @@ namespace ATAS.Indicators
 
 	public static class ColorExtensions
 	{
-		public static System.Windows.Media.Color Convert(this System.Drawing.Color color)
+#if CROSS_COLOR
+		// ATAS X: the platform color already is System.Drawing.Color
+		public static System.Drawing.Color Convert(this System.Drawing.Color color)
 		{
-			return System.Windows.Media.Color.FromArgb(color.A, color.R, color.G, color.B);
+			return color;
+		}
+#else
+		public static CrossColor Convert(this System.Drawing.Color color)
+		{
+			return CrossColor.FromArgb(color.A, color.R, color.G, color.B);
 		}
 
-		public static System.Drawing.Color Convert(this System.Windows.Media.Color color)
+		public static System.Drawing.Color Convert(this CrossColor color)
 		{
 			return System.Drawing.Color.FromArgb(color.A, color.R, color.G, color.B);
 		}
+#endif
 	}
 
 	public class PriceVolumeInfo
@@ -303,7 +317,7 @@ namespace ATAS.Indicators
 		public string Id { get; }
 		public string Name { get; }
 		public VisualMode VisualType { get; set; }
-		public System.Windows.Media.Color Color { get; set; }
+		public CrossColor Color { get; set; }
 		public int Width { get; set; }
 		public bool ShowZeroValue { get; set; } = true;
 		public bool ShowCurrentValue { get; set; } = true;
@@ -419,7 +433,7 @@ namespace ATAS.Indicators
 		}
 
 		public void AddAlert(string soundFile, string instrument, string message,
-			System.Windows.Media.Color backgroundColor, System.Windows.Media.Color foregroundColor)
+			CrossColor backgroundColor, CrossColor foregroundColor)
 		{
 			Alerts.Add(message);
 		}

@@ -84,7 +84,38 @@ The panel shows:
 
 ## Install
 
-1. Build the DLL on Windows (needs ATAS installed and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)):
+### Mac (ATAS X)
+
+On a Mac, ATAS runs as **ATAS X**. You build the indicator once with Microsoft's free .NET
+tools, then copy one file into ATAS X.
+
+1. Install **ATAS X** for macOS if you haven't already, in the usual Applications folder.
+2. Install the **.NET 10 SDK** from [dotnet.microsoft.com](https://dotnet.microsoft.com/download/dotnet/10.0)
+   using the macOS installer: **Arm64** for Apple Silicon (M1–M4), **x64** for an Intel Mac.
+   (Apple menu → About This Mac shows which chip you have.)
+3. On this repository's GitHub page, click **Code → Download ZIP** and double-click the ZIP to unzip it.
+4. Open **Terminal**, type `cd ` (with a space), drag the unzipped folder onto the Terminal
+   window, press Return, then run:
+
+   ```
+   dotnet build FvgReactionLiquiditySweep.csproj -c Release
+   ```
+
+   It finds the ATAS X libraries in `/Applications/ATAS X.app/Contents/MonoBundle`. If ATAS X is
+   somewhere else, add `-p:ATAS_BASE="/path/to/ATAS X.app/Contents/MonoBundle"`.
+5. Copy the result into ATAS X's indicator folder:
+
+   ```
+   mkdir -p ~/Library/Application\ Support/ATAS/Indicators
+   cp bin/Release/net10.0/FvgReactionLiquiditySweep.dll ~/Library/Application\ Support/ATAS/Indicators/
+   ```
+
+6. ATAS X loads new or updated indicator files automatically. Add **FVG Reaction + Liquidity
+   Sweep** to a chart from the *My Indicators* group.
+
+### Windows (classic ATAS Platform)
+
+1. Build the DLL (needs ATAS installed and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)):
 
    ```
    dotnet build FvgReactionLiquiditySweep.csproj -c Release
@@ -97,12 +128,11 @@ The panel shows:
    `bin\Release\net8.0-windows` instead.
 3. Restart ATAS and add **FVG Reaction + Liquidity Sweep** from the *My Indicators* group.
 
+According to the ATAS docs, this Windows DLL also loads in ATAS X, since the indicator has no
+custom WPF editors. On Windows you can also build a native ATAS X DLL with `-p:AtasX=true`.
+
 The absorption heatmap and the absorption / delta confirmations read footprint data, so they
 need a feed with tick data (e.g. Rithmic).
-
-The project targets classic ATAS. For ATAS X, reference the DLLs from the ATAS X folder and
-target `net10.0` without WPF, as in the official
-[AtasPlatform/Indicators](https://github.com/AtasPlatform/Indicators) project.
 
 ## Settings
 

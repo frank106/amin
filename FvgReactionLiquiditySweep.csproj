@@ -1,47 +1,77 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Builds FvgReactionLiquiditySweep.dll against an installed ATAS Platform (Windows).
-       One DLL per runtime, as docs.atas.net recommends: copy the one matching your ATAS
-       version from bin\Release\net8.0-windows or bin\Release\net10.0-windows into
-       %APPDATA%\ATAS\Indicators (or Documents\ATAS\Indicators) and restart ATAS.
-       Building the net10.0 target needs the .NET 10 SDK. -->
+  <!-- Builds FvgReactionLiquiditySweep.dll against an installed ATAS.
+
+       Windows, classic ATAS Platform: one DLL per runtime, as docs.atas.net recommends.
+       Copy the one matching your ATAS version from bin\Release\net8.0-windows or
+       bin\Release\net10.0-windows into %APPDATA%\ATAS\Indicators (or Documents\ATAS\Indicators).
+       Building the net10.0 target needs the .NET 10 SDK.
+
+       macOS, ATAS X: builds against the libraries inside the ATAS X app. Copy
+       bin/Release/net10.0/FvgReactionLiquiditySweep.dll into
+       ~/Library/Application Support/ATAS/Indicators. Needs the .NET 10 SDK.
+       (On Windows, add -p:AtasX=true to build for ATAS X the same way.) -->
   <PropertyGroup>
-    <TargetFrameworks>net8.0-windows;net10.0-windows</TargetFrameworks>
-    <UseWPF>true</UseWPF>
+    <AtasX Condition=" '$(AtasX)' == '' And $([MSBuild]::IsOSPlatform('OSX')) ">true</AtasX>
     <LangVersion>latest</LangVersion>
     <AssemblyName>FvgReactionLiquiditySweep</AssemblyName>
     <RootNamespace>ATAS.Indicators.Technical</RootNamespace>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
-    <!-- override with -p:ATAS_BASE=... if ATAS is installed elsewhere -->
-    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:\Program Files (x86)\ATAS Platform</ATAS_BASE>
+  </PropertyGroup>
+
+  <!-- override ATAS_BASE with -p:ATAS_BASE=... if ATAS is installed elsewhere -->
+  <PropertyGroup Condition=" '$(AtasX)' != 'true' ">
+    <TargetFrameworks>net8.0-windows;net10.0-windows</TargetFrameworks>
+    <UseWPF>true</UseWPF>
+    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files (x86)/ATAS Platform</ATAS_BASE>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(AtasX)' == 'true' ">
+    <TargetFramework>net10.0</TargetFramework>
+    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' And $([MSBuild]::IsOSPlatform('OSX')) ">/Applications/ATAS X.app/Contents/MonoBundle</ATAS_BASE>
+    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files/ATAS X</ATAS_BASE>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- the API stubs under tests\ must never end up in the real indicator -->
-    <Compile Remove="tests\**" />
-    <None Remove="tests\**" />
+    <!-- the API stubs under tests/ must never end up in the real indicator -->
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
   </ItemGroup>
 
   <!-- ATAS loads its own copies of these, so they are not copied next to the indicator -->
   <ItemGroup>
     <Reference Include="ATAS.Indicators">
-      <HintPath>$(ATAS_BASE)\ATAS.Indicators.dll</HintPath>
+      <HintPath>$(ATAS_BASE)/ATAS.Indicators.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="ATAS.DataFeedsCore">
-      <HintPath>$(ATAS_BASE)\ATAS.DataFeedsCore.dll</HintPath>
+      <HintPath>$(ATAS_BASE)/ATAS.DataFeedsCore.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="OFT.Attributes">
-      <HintPath>$(ATAS_BASE)\OFT.Attributes.dll</HintPath>
+      <HintPath>$(ATAS_BASE)/OFT.Attributes.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OFT.Localization">
+      <HintPath>$(ATAS_BASE)/OFT.Localization.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="OFT.Rendering">
-      <HintPath>$(ATAS_BASE)\OFT.Rendering.dll</HintPath>
+      <HintPath>$(ATAS_BASE)/OFT.Rendering.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Utils.Common">
-      <HintPath>$(ATAS_BASE)\Utils.Common.dll</HintPath>
+      <HintPath>$(ATAS_BASE)/Utils.Common.dll</HintPath>
       <Private>false</Private>
     </Reference>
+  </ItemGroup>
+
+  <!-- ATAS X draws with Avalonia and keeps System.Drawing only for its types, as in the
+       official AtasPlatform/Indicators cross-platform build -->
+  <ItemGroup Condition=" '$(AtasX)' == 'true' ">
+    <Reference Include="Avalonia.Base">
+      <HintPath>$(ATAS_BASE)/Avalonia.Base.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" ExcludeAssets="runtime" />
   </ItemGroup>
 </Project>

@@ -31,9 +31,11 @@ Requires the .NET 8 SDK. What it checks:
   tick-by-tick stream and a historical load, and deterministic recalculation;
 * rendering: labels, levels, panel, hover tooltip, cluster mode.
 
-Classic ATAS uses WPF's `System.Windows.Media.Color` for series colors. To compile (not
-run) against that real type instead of the stand-in:
+ATAS's platform color type differs by edition: classic ATAS uses WPF's
+`System.Windows.Media.Color`, ATAS X uses `System.Drawing.Color`. By default the stubs use a
+WPF-like stand-in. Two switches cover the real models:
 
 ```
-dotnet build -c Release -p:WpfColor=true tests/IndicatorTests
+dotnet run -c Release --project tests/IndicatorTests -p:CrossColor=true   # ATAS X model, runs all checks
+dotnet build -c Release tests/IndicatorTests -p:WpfColor=true              # real WPF type, compile only
 ```

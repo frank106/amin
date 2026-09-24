@@ -14,6 +14,10 @@
   <PropertyGroup Condition=" '$(WpfColor)' == 'true' ">
     <DefineConstants>$(DefineConstants);WPF_COLOR</DefineConstants>
   </PropertyGroup>
+  <!-- -p:CrossColor=true: ATAS X model, where the platform color is System.Drawing.Color -->
+  <PropertyGroup Condition=" '$(CrossColor)' == 'true' ">
+    <DefineConstants>$(DefineConstants);CROSS_COLOR</DefineConstants>
+  </PropertyGroup>
   <ItemGroup Condition=" '$(WpfColor)' == 'true' ">
     <PackageDownload Include="Microsoft.WindowsDesktop.App.Ref" Version="[8.0.10]" />
     <Reference Include="$(NuGetPackageRoot)microsoft.windowsdesktop.app.ref/8.0.10/ref/net8.0/PresentationCore.dll" />
