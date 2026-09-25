@@ -584,4 +584,5 @@ The fixes made to the original file are all still in:
 
 `tests/` builds the indicator against stand-ins for the ATAS API and checks it on scripted and
 randomised markets, including a simulated order book — see [tests/README.md](tests/README.md).
-They are not part of the indicator build.
+`tests/Backtest` replays a CSV of bars through the same code, for a backtest over any stretch of
+history outside ATAS. They are not part of the indicator build.
