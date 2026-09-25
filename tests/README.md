@@ -64,6 +64,15 @@ Requires the .NET 8 SDK. What it checks:
     the book is thin;
 * **scoreboard**: the rows per setup and per pattern and the odds buckets, recounted from the
   trades, shown on hover of the panel or kept open;
+* **filters**: a sweep needs the minimum depth in ATRs (a 1-tick poke isn't one, 3 ticks is), a
+  gap the minimum size in ATRs, and with confirmed swings only the sweep of a real swing counts,
+  once, and never after the swing was broken. Key levels end the same way whatever the depth;
+* **brackets**: ATR multiples, the stop beyond the signal bar with its reward : risk, the Min /
+  Max stop bounds that keep the ratio, the break-even shares, and the prior odds of each trade's
+  own bracket;
+* **limit entries**: an order that fills on a pullback (and one that fills on a gap through it,
+  at the limit price), one that doesn't fill before it expires (a *No fill* chip, no tag, left out
+  of the statistics), the bracket counted from the limit price, and the panel's waiting line;
 * **randomised markets** (thousands of bars, historical and tick by tick), compared with an
   independent re-implementation of the rules:
   * every signal, trigger, FVG zone and its end, footprint fill and its reaction, and trade
@@ -71,6 +80,10 @@ Requires the .NET 8 SDK. What it checks:
   * every key level (where it started, how and where it ended) and the level each key sweep
     took, with the new defaults, around the clock and under each hours choice. The oracle has its
     own New York clock from the time-zone database, and its own big-fill size;
+  * the filters, brackets and entries of the latest version: ATR-sized sweeps and gaps, confirmed
+    swings, custom windows (one over midnight), ATR and signal-bar brackets, limit entries with
+    expiry and session ends (also tick by tick), and the odds split by time of day, volatility
+    and trend. The oracle computes its own ATR, brackets, fills and odds groups;
   * the candlestick patterns of every bar in both directions and both contexts. The oracle
     derives the bearish ones by mirroring the candles, and the market has to show every pattern;
   * no look-ahead in any estimate, one trade at a time, cooldowns, filters, expiry and session
@@ -115,20 +128,56 @@ dotnet run -c Release --project tests/Backtest -- nq-1min.csv --tz America/New_Y
   mixes contracts, each trading day keeps its most traded one.
 * **Settings**: the indicator's defaults, `--preset 1min` (Swing Lookback 30, Min FVG Size 8,
   cooldown 10), and `--set Name=Value` for any setting.
+* **Costs**: `--commission` ticks a round trip (1) and `--slippage` ticks on each market order
+  (1): the entry at the close and every exit. A trade entered at the close costs 3 ticks, one with
+  a limit entry 2.
 * **Output**:
-  * TP / BE / SL / expired, net ticks and dollars, before and after costs;
-  * the largest drawdown and the longest run of stops;
-  * tables by year, month, setup, key level, hour, weekday and pattern;
-  * the odds check, and a check that the totals match the panel's.
+  * TP / BE / SL / expired, ticks per trade before and after costs, net ticks and dollars, and
+    how many standard errors the average is from zero;
+  * the largest drawdown, the months up and the longest run of stops;
+  * **the same history replayed with the worst-case high / low order** inside each bar, next to
+    the result. OHLC bars can't show the path inside a bar, so the truth usually lies between the
+    two; when they are far apart, the bars can't judge that bracket;
+  * tables by year, month, setup, key level, hour, weekday, pattern and the expected ticks on the
+    labels;
+  * the odds check, and a check that the totals match the panel's;
+  * `--split <date>` reports the signals before and from a date apart: pick settings on the first
+    stretch and judge them once on the second;
+  * `--summary` prints all of it as one line of JSON instead, for scripted searches;
   * `--trades file.csv` lists every signal. The top of `Program.cs` lists all options.
 * **What it can't test**: plain OHLC bars have no footprint, so it can't test the Fill signals or
   the order-flow and delta confirmations.
 * **Checked**:
-  * two years of 1-minute bars run in about 10 seconds;
+  * two years of 1-minute bars run in about 12 seconds, the worst-case replay included;
   * the six common file layouts read into identical bars;
   * on driftless noise a plain 80 / 80 bracket ends 50.0% TP with a net of 0, so there is no
     look-ahead.
-* **The high / low order**: with the break-even stop on, the order of the high and low inside a
-  bar matters. On noise with NQ-like 1-minute ranges, the default rule (open to the nearer extreme
-  first) was within +0.5 ticks per trade of settling each trade on the path inside its bars.
-  *Worst case* came out 9 ticks per trade too pessimistic.
+* **The high / low order**: with the break-even stop on, the path inside a bar matters. On
+  simulated tick paths (60 steps a minute) with NQ's 1-minute ranges, settling on the bars with the
+  default rule (open to the nearer extreme first) overstated the default 80 / 80 bracket
+  (break-even +40 → +20) by 1–2 ticks a trade, and a 40 / 40 bracket with break-even at +20 → +10
+  by 4–5 ticks: price that reaches the trigger inside a bar often comes back to the moved stop
+  before the close. Brackets without break-even and ATR-sized ones came out within about half a
+  tick. *Worst case* was about 9 ticks too pessimistic for the default bracket and 1–2 for the
+  40 / 40 one. With 240 steps a minute the overstatement grew from 4.1 to 5.2 ticks, so the finer
+  real ticks likely widen it further.
+
+## PathCheck
+
+`PathCheck` measures how far a backtest on 1-minute bars is off for given settings. It builds
+driftless noise on the CME schedule step by step (60 steps a minute), then settles the same
+signals on the path inside the bars (as a live chart does) and on the finished bars with each
+high / low order rule:
+
+```
+dotnet run -c Release --project tests/PathCheck -- --set TakeProfitTicks=40 --set StopLossTicks=40 \
+    --set BreakEvenTriggerTicks=20 --set BreakEvenStopTicks=10
+```
+
+It prints the TP / BE / SL shares and ticks a trade of each, how many signals ended another way
+than on the path, and the ticks a trade each rule adds. `--volatility` scales the moves (1.4, the
+default, gives bars of about 50 ticks in regular hours, like NQ in 2024–2026), `--steps` the
+steps a minute, `--days` and `--seed` the sample, and `--set` takes any setting. The figures
+under *The high / low order* above come from it (seeds 1 and 7, 60 to 250 days, volatility 1.4
+and 1.7).
+

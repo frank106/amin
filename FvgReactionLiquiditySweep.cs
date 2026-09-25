@@ -112,7 +112,10 @@ namespace ATAS.Indicators.Technical
 			FirstTwoHours,
 
 			[Display(Name = "Regular hours, not 11:30 - 13:30")]
-			RegularHoursNoLunch
+			RegularHoursNoLunch,
+
+			[Display(Name = "Custom window")]
+			Custom
 		}
 
 		// How many contracts the busiest price of a bar needs to be a big fill
@@ -133,6 +136,29 @@ namespace ATAS.Indicators.Technical
 
 			[Display(Name = "Times the typical level in the book")]
 			TimesTypicalLevel
+		}
+
+		// How far the take profit and the stop loss sit from the entry
+		public enum BracketRule
+		{
+			[Display(Name = "Fixed ticks")]
+			FixedTicks,
+
+			[Display(Name = "Multiples of the ATR")]
+			AtrMultiple,
+
+			[Display(Name = "Stop beyond the signal bar")]
+			BeyondSignalBar
+		}
+
+		// Where a signal's trade is entered
+		public enum EntryRule
+		{
+			[Display(Name = "At the signal bar's close")]
+			AtClose,
+
+			[Display(Name = "Limit order on a pullback")]
+			LimitPullback
 		}
 
 		// How to order a bar's high and low when only O/H/L/C are known
@@ -200,7 +226,8 @@ namespace ATAS.Indicators.Technical
 			TakeProfit,
 			BreakEven,    // stopped at the break-even stop after the trigger was reached
 			StopLoss,
-			Expired
+			Expired,
+			Missed        // a limit entry that was never filled
 		}
 
 		private enum ZoneState
@@ -422,16 +449,15 @@ namespace ATAS.Indicators.Technical
 			public double StopLoss { get; }
 		}
 
-		// What the model knew at the moment a signal fired
+		// What the model knew at the moment a signal fired: the odds, and the counts of every
+		// group they were built from, broadest first
 		private readonly struct ProbabilityEstimate
 		{
-			public ProbabilityEstimate(OutcomeOdds odds, double expectedTicks, OutcomeCounter setup, OutcomeCounter trigger, OutcomeCounter direction)
+			public ProbabilityEstimate(OutcomeOdds odds, double expectedTicks, OutcomeCounter[] levels)
 			{
 				Odds = odds;
 				ExpectedTicks = expectedTicks;
-				Setup = new OutcomeTally(setup);
-				Trigger = new OutcomeTally(trigger);
-				Direction = new OutcomeTally(direction);
+				Levels = levels.Select(l => new OutcomeTally(l)).ToArray();
 			}
 
 			public OutcomeOdds Odds { get; }
@@ -439,74 +465,58 @@ namespace ATAS.Indicators.Technical
 			public double BreakEven => Odds.BreakEven;     // P(it ends at the break-even stop)
 			public double StopLoss => Odds.StopLoss;       // P(it ends at the full stop loss)
 			public double ExpectedTicks { get; }           // TP, BE and SL ticks weighted by those odds
-			public OutcomeTally Setup { get; }
-			public OutcomeTally Trigger { get; }
-			public OutcomeTally Direction { get; }
+			public OutcomeTally[] Levels { get; }
+			public OutcomeTally Setup => Levels[Levels.Length - 1];
+			public OutcomeTally Trigger => Levels[Math.Min(1, Levels.Length - 1)];
+			public OutcomeTally Direction => Levels[0];
 		}
 
-		// Walk-forward estimate of how a trade ends (TP / break-even / SL), smoothed down the
-		// hierarchy direction -> direction + trigger -> direction + trigger + confirmations.
+		// Walk-forward estimate of how a trade ends (TP / break-even / SL), smoothed down a path
+		// of ever narrower groups: direction, trigger, then each split switched on (time of day,
+		// volatility, trend, confirmations). Each group's counts are pulled toward the odds of
+		// the group above it.
 		private class ProbabilityModel
 		{
-			private const int Directions = 2;
-			private const int Triggers = 6;
-			private const int ConfirmationLevels = MaxConfirmations + 1;
-
-			private readonly OutcomeCounter[] _byDirection = new OutcomeCounter[Directions];
-			private readonly OutcomeCounter[,] _byTrigger = new OutcomeCounter[Directions, Triggers];
-			private readonly OutcomeCounter[,,] _bySetup = new OutcomeCounter[Directions, Triggers, ConfirmationLevels];
-
-			public ProbabilityModel()
-			{
-				Reset();
-			}
+			private readonly Dictionary<long, OutcomeCounter> _groups = new Dictionary<long, OutcomeCounter>();
 
 			public int Resolved { get; private set; }
 
 			public void Reset()
 			{
+				_groups.Clear();
 				Resolved = 0;
-
-				for (var d = 0; d < Directions; d++)
-				{
-					_byDirection[d] = new OutcomeCounter();
-
-					for (var t = 0; t < Triggers; t++)
-					{
-						_byTrigger[d, t] = new OutcomeCounter();
-
-						for (var c = 0; c < ConfirmationLevels; c++)
-							_bySetup[d, t, c] = new OutcomeCounter();
-					}
-				}
 			}
 
-			public void Record(bool isLong, TriggerType trigger, int confirmations, TradeOutcome outcome)
+			public void Record(long[] path, TradeOutcome outcome)
 			{
-				var d = isLong ? 0 : 1;
-				var t = (int)trigger;
+				foreach (var group in path)
+					Add(Counter(group), outcome);
 
-				Add(_byDirection[d], outcome);
-				Add(_byTrigger[d, t], outcome);
-				Add(_bySetup[d, t, confirmations], outcome);
 				Resolved++;
 			}
 
-			public ProbabilityEstimate Estimate(bool isLong, TriggerType trigger, int confirmations, OutcomeOdds prior, double priorWeight,
+			public ProbabilityEstimate Estimate(long[] path, OutcomeOdds prior, double priorWeight,
 				double takeProfitTicks, double breakEvenTicks, double stopLossTicks)
 			{
-				var d = isLong ? 0 : 1;
-				var t = (int)trigger;
-				var direction = _byDirection[d];
-				var triggerStats = _byTrigger[d, t];
-				var setup = _bySetup[d, t, confirmations];
+				var odds = prior;
+				var levels = new OutcomeCounter[path.Length];
 
-				var odds = Smooth(direction, prior, priorWeight);
-				odds = Smooth(triggerStats, odds, priorWeight);
-				odds = Smooth(setup, odds, priorWeight);
+				for (var i = 0; i < path.Length; i++)
+				{
+					levels[i] = Counter(path[i]);
+					odds = Smooth(levels[i], odds, priorWeight);
+				}
 
 				var expectedTicks = odds.TakeProfit * takeProfitTicks + odds.BreakEven * breakEvenTicks - odds.StopLoss * stopLossTicks;
-				return new ProbabilityEstimate(odds, expectedTicks, setup, triggerStats, direction);
+				return new ProbabilityEstimate(odds, expectedTicks, levels);
+			}
+
+			private OutcomeCounter Counter(long group)
+			{
+				if (!_groups.TryGetValue(group, out var counter))
+					_groups[group] = counter = new OutcomeCounter();
+
+				return counter;
 			}
 
 			private static void Add(OutcomeCounter counter, TradeOutcome outcome)
@@ -567,6 +577,18 @@ namespace ATAS.Indicators.Technical
 			public bool HasBreakEven;     // the break-even stop was on when the signal fired
 			public decimal TriggerPrice;  // reaching this price moves the stop...
 			public decimal BreakEvenPrice;// ...to this one
+			public int TargetTicks;       // the bracket, in ticks from the entry: take profit,
+			public int RiskTicks;         // stop loss,
+			public int TriggerTicks;      // break-even trigger (0 = no break-even)
+			public int LockedTicks;       // and the profit the break-even stop keeps
+			public bool LimitEntry;       // entered by a limit order on a pullback...
+			public bool Pending;          // ...that is still waiting for its fill
+			public decimal ThroughPrice;  // price has to trade here (a tick through the limit) to fill it
+			public int FillBar = -1;      // the bar it was entered on (the signal bar for an entry at the close)
+			public int ExpiryBar = -1;    // the last bar a limit order may fill on
+			public decimal SignalClose;
+			public int TimeBucket;        // time of day: first 30 minutes, morning, midday, afternoon, outside regular hours
+			public int VolatilityBucket;  // quiet, normal or busy compared with the longer average range
 			public bool BreakEvenActive;
 			public int BreakEvenBar = -1;
 			public TradeOutcome Outcome;
@@ -583,16 +605,18 @@ namespace ATAS.Indicators.Technical
 		// Where a trade stands after price has traded along a path
 		private readonly struct PathResult
 		{
-			public PathResult(TradeOutcome outcome, bool breakEvenActive, decimal exitPrice)
+			public PathResult(TradeOutcome outcome, bool breakEvenActive, decimal exitPrice, bool filled = true)
 			{
 				Outcome = outcome;
 				BreakEvenActive = breakEvenActive;
 				ExitPrice = exitPrice;
+				Filled = filled;
 			}
 
 			public TradeOutcome Outcome { get; }
 			public bool BreakEvenActive { get; }
 			public decimal ExitPrice { get; }
+			public bool Filled { get; }   // false: a limit order still waiting
 
 			// worst (0) to best (4) for the trade: SL, still open without break-even,
 			// break-even hit, still open with the stop in profit, TP
@@ -603,7 +627,7 @@ namespace ATAS.Indicators.Technical
 
 			public bool SameAs(PathResult other)
 			{
-				return Outcome == other.Outcome && BreakEvenActive == other.BreakEvenActive;
+				return Outcome == other.Outcome && BreakEvenActive == other.BreakEvenActive && Filled == other.Filled;
 			}
 		}
 
@@ -617,6 +641,7 @@ namespace ATAS.Indicators.Technical
 			public int ShortLosses;
 			public int Open;
 			public int Expired;
+			public int Missed;
 			public int Filtered;
 			public int ModelResolved;
 			public decimal LongNetTicks;
@@ -866,6 +891,13 @@ namespace ATAS.Indicators.Technical
 		private readonly List<SignalTrade> _trades = new List<SignalTrade>();
 		private readonly List<SignalTrade> _openTrades = new List<SignalTrade>();
 		private readonly List<decimal> _ema = new List<decimal>();
+
+		// running total of the bars' true ranges, for the average true range over any window
+		private readonly List<decimal> _cumulativeRange = new List<decimal>();
+
+		// swing highs / lows (bar, price) nothing has traded beyond yet, for Sweep confirmed swings only
+		private readonly List<(int Bar, decimal Price)> _openSwingHighs = new List<(int Bar, decimal Price)>();
+		private readonly List<(int Bar, decimal Price)> _openSwingLows = new List<(int Bar, decimal Price)>();
 		private readonly ProbabilityModel _model = new ProbabilityModel();
 
 		// where the statistics panel was drawn last (render thread only), for its hover
@@ -898,6 +930,7 @@ namespace ATAS.Indicators.Technical
 		private int _shortBreakEvens;
 		private int _shortLosses;
 		private int _expired;
+		private int _missed;
 		private int _filtered;
 		private decimal _longNetTicks;
 		private decimal _shortNetTicks;
@@ -970,8 +1003,11 @@ namespace ATAS.Indicators.Technical
 
 		private int _swingLookback = 10;
 		private bool _showSweeps = true;
+		private double _minSweepAtr;
+		private bool _sweepConfirmedSwings;
 
 		private int _minFvgTicks = 4;
+		private double _minFvgAtr;
 		private int _maxZoneAgeBars = 150;
 		private bool _requireCloseThroughZone = true;
 		private FvgFillRule _fvgFill = FvgFillRule.FarEdge;
@@ -984,6 +1020,8 @@ namespace ATAS.Indicators.Technical
 		private SignalHoursRule _signalHours = SignalHoursRule.RegularHours;
 		private TimeSpan _regularHoursStart = new TimeSpan(9, 30, 0);
 		private TimeSpan _regularHoursEnd = new TimeSpan(16, 0, 0);
+		private TimeSpan _customHoursStart = new TimeSpan(9, 30, 0);
+		private TimeSpan _customHoursEnd = new TimeSpan(10, 30, 0);
 		private int _openingRangeMinutes = 30;
 		private bool _levelPriorDay = true;
 		private bool _levelOvernight = true;
@@ -1037,15 +1075,32 @@ namespace ATAS.Indicators.Technical
 		private bool _oneTradeAtATime = true;
 		private int _minProbabilityPercent;
 		private int _minExpectedTicks;
+		private int _atrPeriod = 20;
 
+		private EntryRule _entry = EntryRule.AtClose;
+		private int _pullbackPercent = 25;
+		private int _limitValidBars = 3;
+		private BracketRule _bracket = BracketRule.FixedTicks;
 		private int _takeProfitTicks = 80;
 		private int _stopLossTicks = 80;
+		private double _takeProfitAtr = 3.0;
+		private double _stopLossAtr = 3.0;
+		private int _stopBufferTicks = 2;
+		private double _rewardRisk = 1.5;
+		private int _minStopTicks = 16;
+		private int _maxStopTicks = 200;
 		private int _breakEvenTriggerTicks = 40;
 		private int _breakEvenStopTicks = 20;
+		private int _breakEvenTriggerPercent = 50;
+		private int _breakEvenStopPercent = 25;
 		private int _maxBarsInTrade;
 		private bool _expireAtSessionEnd;
 		private SameBarHitRule _sameBarRule = SameBarHitRule.NearestExtremeFirst;
 		private int _probabilitySmoothing = 10;
+		private bool _oddsByTime;
+		private bool _oddsByVolatility;
+		private bool _oddsByTrend;
+		private bool _oddsByConfirmations = true;
 
 		#endregion
 
@@ -1067,6 +1122,23 @@ namespace ATAS.Indicators.Technical
 			set { _showSweeps = value; RedrawChart(); }
 		}
 
+		[Display(Name = "Min sweep depth (x ATR, 0 = off)", GroupName = "Liquidity Sweep", Order = 12,
+			Description = "How far beyond the swing high / low a sweep has to trade, in average true ranges of the bars before it. A shallower poke is no sweep; a key level it takes still ends as swept, but gives no signal.")]
+		[Range(0.0, 100.0)]
+		public double MinSweepAtr
+		{
+			get => _minSweepAtr;
+			set { _minSweepAtr = Math.Max(0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Sweep confirmed swings only", GroupName = "Liquidity Sweep", Order = 13,
+			Description = "A sweep has to take out a swing high / low of the lookback - higher / lower than the 3 bars on each side - that nothing has traded beyond since, and each swing gives one sweep. Off: any bar that wicks beyond the lookback's high / low.")]
+		public bool SweepConfirmedSwings
+		{
+			get => _sweepConfirmedSwings;
+			set { _sweepConfirmedSwings = value; RecalculateValues(); }
+		}
+
 		[Display(Name = "Min FVG Size (ticks)", GroupName = "Fair Value Gap", Order = 20)]
 		[Range(0, 10000)]
 		public int MinFvgTicks
@@ -1075,7 +1147,16 @@ namespace ATAS.Indicators.Technical
 			set { _minFvgTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Zone Max Age (bars)", GroupName = "Fair Value Gap", Order = 21,
+		[Display(Name = "Min FVG size (x ATR, 0 = off)", GroupName = "Fair Value Gap", Order = 21,
+			Description = "A gap also has to be this many average true ranges of the bars before it.")]
+		[Range(0.0, 100.0)]
+		public double MinFvgAtr
+		{
+			get => _minFvgAtr;
+			set { _minFvgAtr = Math.Max(0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Zone Max Age (bars)", GroupName = "Fair Value Gap", Order = 22,
 			Description = "A gap nothing has used or filled after this many bars is no longer watched.")]
 		[Range(5, 100000)]
 		public int MaxZoneAgeBars
@@ -1084,7 +1165,7 @@ namespace ATAS.Indicators.Technical
 			set { _maxZoneAgeBars = Math.Max(5, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Require reaction close beyond zone", GroupName = "Fair Value Gap", Order = 22,
+		[Display(Name = "Require reaction close beyond zone", GroupName = "Fair Value Gap", Order = 23,
 			Description = "A bullish reaction must close above the zone, a bearish one below it - not just form a pattern inside it.")]
 		public bool RequireCloseThroughZone
 		{
@@ -1092,7 +1173,7 @@ namespace ATAS.Indicators.Technical
 			set { _requireCloseThroughZone = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "FVG is filled when", GroupName = "Fair Value Gap", Order = 23,
+		[Display(Name = "FVG is filled when", GroupName = "Fair Value Gap", Order = 24,
 			Description = "A filled gap stops being watched, like a used one (a reaction on the same bar counts first).")]
 		public FvgFillRule FvgFill
 		{
@@ -1100,14 +1181,14 @@ namespace ATAS.Indicators.Technical
 			set { _fvgFill = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Draw FVG Zones", GroupName = "Fair Value Gap", Order = 24)]
+		[Display(Name = "Draw FVG Zones", GroupName = "Fair Value Gap", Order = 25)]
 		public bool DrawZones
 		{
 			get => _drawZones;
 			set { _drawZones = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Show used / filled zones", GroupName = "Fair Value Gap", Order = 25,
+		[Display(Name = "Show used / filled zones", GroupName = "Fair Value Gap", Order = 26,
 			Description = "Keep a faint box, ending where it was used or filled, for gaps that are no longer watched.")]
 		public bool ShowUsedZones
 		{
@@ -1115,21 +1196,21 @@ namespace ATAS.Indicators.Technical
 			set { _showUsedZones = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Show zone midline (50%)", GroupName = "Fair Value Gap", Order = 26)]
+		[Display(Name = "Show zone midline (50%)", GroupName = "Fair Value Gap", Order = 27)]
 		public bool ShowZoneMidline
 		{
 			get => _showZoneMidline;
 			set { _showZoneMidline = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Bullish zone color", GroupName = "Fair Value Gap", Order = 27)]
+		[Display(Name = "Bullish zone color", GroupName = "Fair Value Gap", Order = 28)]
 		public Color BullishZoneColor
 		{
 			get => _bullishZoneColor;
 			set { _bullishZoneColor = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Bearish zone color", GroupName = "Fair Value Gap", Order = 28)]
+		[Display(Name = "Bearish zone color", GroupName = "Fair Value Gap", Order = 29)]
 		public Color BearishZoneColor
 		{
 			get => _bearishZoneColor;
@@ -1144,7 +1225,23 @@ namespace ATAS.Indicators.Technical
 			set { _signalHours = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Regular hours start (New York)", GroupName = "Sessions & Key Levels", Order = 31,
+		[Display(Name = "Custom window start (New York)", GroupName = "Sessions & Key Levels", Order = 31,
+			Description = "With Signal hours set to Custom window, signals may fire from this New York time until the end time. A window that ends before it starts runs over midnight.")]
+		public TimeSpan CustomHoursStart
+		{
+			get => _customHoursStart;
+			set { _customHoursStart = WithinDay(value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Custom window end (New York)", GroupName = "Sessions & Key Levels", Order = 32,
+			Description = "End of the custom window (not included). The same time as the start: all day.")]
+		public TimeSpan CustomHoursEnd
+		{
+			get => _customHoursEnd;
+			set { _customHoursEnd = WithinDay(value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Regular hours start (New York)", GroupName = "Sessions & Key Levels", Order = 33,
 			Description = "Start of the regular session, for the signal hours, the prior-day and overnight levels and the opening range.")]
 		public TimeSpan RegularHoursStart
 		{
@@ -1152,14 +1249,14 @@ namespace ATAS.Indicators.Technical
 			set { _regularHoursStart = ClampToTradingDay(value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Regular hours end (New York)", GroupName = "Sessions & Key Levels", Order = 32)]
+		[Display(Name = "Regular hours end (New York)", GroupName = "Sessions & Key Levels", Order = 34)]
 		public TimeSpan RegularHoursEnd
 		{
 			get => _regularHoursEnd;
 			set { _regularHoursEnd = ClampToTradingDay(value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Opening range (minutes)", GroupName = "Sessions & Key Levels", Order = 33,
+		[Display(Name = "Opening range (minutes)", GroupName = "Sessions & Key Levels", Order = 35,
 			Description = "The first minutes of regular hours whose high and low become the opening range.")]
 		[Range(1, 600)]
 		public int OpeningRangeMinutes
@@ -1168,7 +1265,7 @@ namespace ATAS.Indicators.Technical
 			set { _openingRangeMinutes = Math.Max(1, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Prior day high / low", GroupName = "Sessions & Key Levels", Order = 34,
+		[Display(Name = "Prior day high / low", GroupName = "Sessions & Key Levels", Order = 36,
 			Description = "The high and low of the previous regular session, for the whole next trading day.")]
 		public bool LevelPriorDay
 		{
@@ -1176,7 +1273,7 @@ namespace ATAS.Indicators.Technical
 			set { _levelPriorDay = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Overnight high / low", GroupName = "Sessions & Key Levels", Order = 35,
+		[Display(Name = "Overnight high / low", GroupName = "Sessions & Key Levels", Order = 37,
 			Description = "The high and low from 18:00 New York time until regular hours open, for the rest of the day.")]
 		public bool LevelOvernight
 		{
@@ -1184,14 +1281,14 @@ namespace ATAS.Indicators.Technical
 			set { _levelOvernight = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Opening range high / low", GroupName = "Sessions & Key Levels", Order = 36)]
+		[Display(Name = "Opening range high / low", GroupName = "Sessions & Key Levels", Order = 38)]
 		public bool LevelOpeningRange
 		{
 			get => _levelOpeningRange;
 			set { _levelOpeningRange = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Equal highs / lows", GroupName = "Sessions & Key Levels", Order = 37,
+		[Display(Name = "Equal highs / lows", GroupName = "Sessions & Key Levels", Order = 39,
 			Description = "Two swing highs (lows) within Equal level match ticks of each other, with nothing above (below) them in between: stops pile up there.")]
 		public bool LevelEqual
 		{
@@ -1199,7 +1296,7 @@ namespace ATAS.Indicators.Technical
 			set { _levelEqual = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Equal level match (ticks)", GroupName = "Sessions & Key Levels", Order = 38)]
+		[Display(Name = "Equal level match (ticks)", GroupName = "Sessions & Key Levels", Order = 40)]
 		[Range(0, 1000)]
 		public int EqualToleranceTicks
 		{
@@ -1207,7 +1304,7 @@ namespace ATAS.Indicators.Technical
 			set { _equalToleranceTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Equal level lookback (bars)", GroupName = "Sessions & Key Levels", Order = 39,
+		[Display(Name = "Equal level lookback (bars)", GroupName = "Sessions & Key Levels", Order = 41,
 			Description = "How far apart the two swings may be, and how long the level counts after the second one.")]
 		[Range(10, 100000)]
 		public int EqualLookbackBars
@@ -1216,7 +1313,7 @@ namespace ATAS.Indicators.Technical
 			set { _equalLookbackBars = Math.Max(10, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Draw key levels", GroupName = "Sessions & Key Levels", Order = 40)]
+		[Display(Name = "Draw key levels", GroupName = "Sessions & Key Levels", Order = 42)]
 		public bool DrawKeyLevels
 		{
 			get => _drawKeyLevels;
@@ -1437,6 +1534,15 @@ namespace ATAS.Indicators.Technical
 			set { _minExpectedTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
+		[Display(Name = "Volatility (ATR) period (bars)", GroupName = "Signals", Order = 113,
+			Description = "Bars in the average true range that the volatility-based settings measure against: sweep depth, gap size, ATR brackets and the volatility of the odds.")]
+		[Range(1, 10000)]
+		public int AtrPeriod
+		{
+			get => _atrPeriod;
+			set { _atrPeriod = Math.Max(1, value); RecalculateValues(); }
+		}
+
 		[Display(Name = "Hammer / Shooting star", GroupName = "Candlestick Patterns", Order = 150,
 			Description = "After a decline: a small body at the top, a lower wick at least 'wick / body' times the body and little or no upper wick (a dragonfly doji when the body is almost nil). After a rally: the same upside down - shooting star, gravestone doji.")]
 		public bool PatternHammer
@@ -1568,7 +1674,41 @@ namespace ATAS.Indicators.Technical
 			set { _tweezerToleranceTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Take profit (ticks)", GroupName = "Take Profit / Stop Loss", Order = 200)]
+		[Display(Name = "Entry", GroupName = "Entry", Order = 190,
+			Description = "At the signal bar's close, or a limit order a share of the signal bar's range better: below the close for buys, above it for shorts.")]
+		public EntryRule Entry
+		{
+			get => _entry;
+			set { _entry = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Pullback (% of the signal bar)", GroupName = "Entry", Order = 191,
+			Description = "With a limit entry: how far back from the signal bar's close the order sits, as a share of the bar's range.")]
+		[Range(0, 100)]
+		public int PullbackPercent
+		{
+			get => _pullbackPercent;
+			set { _pullbackPercent = Math.Min(100, Math.Max(0, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Limit order valid (bars)", GroupName = "Entry", Order = 192,
+			Description = "With a limit entry: how many bars after the signal bar the order waits. It fills when price trades a tick through it; unfilled, it is cancelled and left out of the statistics.")]
+		[Range(1, 10000)]
+		public int LimitValidBars
+		{
+			get => _limitValidBars;
+			set { _limitValidBars = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Bracket size", GroupName = "Take Profit / Stop Loss", Order = 200,
+			Description = "Fixed ticks: Take profit / Stop loss ticks. Multiples of the ATR: both scale with the average true range of the bars before the signal. Stop beyond the signal bar: the stop sits Stop buffer ticks beyond the signal bar's low (buys) / high (shorts), the take profit a multiple of that.")]
+		public BracketRule Bracket
+		{
+			get => _bracket;
+			set { _bracket = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Take profit (ticks)", GroupName = "Take Profit / Stop Loss", Order = 201)]
 		[Range(1, 100000)]
 		public int TakeProfitTicks
 		{
@@ -1576,7 +1716,7 @@ namespace ATAS.Indicators.Technical
 			set { _takeProfitTicks = Math.Max(1, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Stop loss (ticks)", GroupName = "Take Profit / Stop Loss", Order = 201)]
+		[Display(Name = "Stop loss (ticks)", GroupName = "Take Profit / Stop Loss", Order = 202)]
 		[Range(1, 100000)]
 		public int StopLossTicks
 		{
@@ -1584,8 +1724,61 @@ namespace ATAS.Indicators.Technical
 			set { _stopLossTicks = Math.Max(1, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Break-even trigger (ticks, 0 = off)", GroupName = "Take Profit / Stop Loss", Order = 202,
-			Description = "Once a trade is this many ticks in profit, its stop moves to the break-even stop. Must be below the take profit.")]
+		[Display(Name = "Take profit (x ATR)", GroupName = "Take Profit / Stop Loss", Order = 203,
+			Description = "With the ATR bracket: the take profit, in average true ranges of the bars before the signal.")]
+		[Range(0.1, 1000.0)]
+		public double TakeProfitAtr
+		{
+			get => _takeProfitAtr;
+			set { _takeProfitAtr = Math.Max(0.1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Stop loss (x ATR)", GroupName = "Take Profit / Stop Loss", Order = 204,
+			Description = "With the ATR bracket: the stop loss, in average true ranges of the bars before the signal.")]
+		[Range(0.1, 1000.0)]
+		public double StopLossAtr
+		{
+			get => _stopLossAtr;
+			set { _stopLossAtr = Math.Max(0.1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Stop buffer (ticks)", GroupName = "Take Profit / Stop Loss", Order = 205,
+			Description = "With the stop beyond the signal bar: how far beyond the bar's low (buys) / high (shorts) the stop sits.")]
+		[Range(0, 10000)]
+		public int StopBufferTicks
+		{
+			get => _stopBufferTicks;
+			set { _stopBufferTicks = Math.Max(0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Take profit (x the stop)", GroupName = "Take Profit / Stop Loss", Order = 206,
+			Description = "With the stop beyond the signal bar: the take profit as a multiple of the stop's distance (the reward : risk).")]
+		[Range(0.1, 100.0)]
+		public double RewardRisk
+		{
+			get => _rewardRisk;
+			set { _rewardRisk = Math.Max(0.1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Min stop (ticks)", GroupName = "Take Profit / Stop Loss", Order = 207,
+			Description = "With the ATR or signal-bar bracket: the stop is at least this far from the entry, and at most Max stop. The take profit keeps its ratio to it.")]
+		[Range(1, 100000)]
+		public int MinStopTicks
+		{
+			get => _minStopTicks;
+			set { _minStopTicks = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Max stop (ticks)", GroupName = "Take Profit / Stop Loss", Order = 208)]
+		[Range(1, 100000)]
+		public int MaxStopTicks
+		{
+			get => _maxStopTicks;
+			set { _maxStopTicks = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Break-even trigger (ticks, 0 = off)", GroupName = "Take Profit / Stop Loss", Order = 209,
+			Description = "With fixed ticks: once a trade is this many ticks in profit, its stop moves to the break-even stop. Must be below the take profit.")]
 		[Range(0, 100000)]
 		public int BreakEvenTriggerTicks
 		{
@@ -1593,8 +1786,8 @@ namespace ATAS.Indicators.Technical
 			set { _breakEvenTriggerTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Break-even stop (ticks in profit)", GroupName = "Take Profit / Stop Loss", Order = 203,
-			Description = "Where the stop moves once the trigger is reached, in ticks of profit from the entry (0 = the entry price). Kept below the trigger.")]
+		[Display(Name = "Break-even stop (ticks in profit)", GroupName = "Take Profit / Stop Loss", Order = 210,
+			Description = "With fixed ticks: where the stop moves once the trigger is reached, in ticks of profit from the entry (0 = the entry price). Kept below the trigger.")]
 		[Range(0, 100000)]
 		public int BreakEvenStopTicks
 		{
@@ -1602,7 +1795,25 @@ namespace ATAS.Indicators.Technical
 			set { _breakEvenStopTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Max bars in trade (0 = no limit)", GroupName = "Take Profit / Stop Loss", Order = 204,
+		[Display(Name = "Break-even trigger (% of TP, 0 = off)", GroupName = "Take Profit / Stop Loss", Order = 211,
+			Description = "With the ATR or signal-bar bracket: the break-even trigger as a share of the take profit's distance.")]
+		[Range(0, 99)]
+		public int BreakEvenTriggerPercent
+		{
+			get => _breakEvenTriggerPercent;
+			set { _breakEvenTriggerPercent = Math.Min(99, Math.Max(0, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Break-even stop (% of TP)", GroupName = "Take Profit / Stop Loss", Order = 212,
+			Description = "With the ATR or signal-bar bracket: the profit the break-even stop keeps, as a share of the take profit's distance. Kept below the trigger.")]
+		[Range(0, 99)]
+		public int BreakEvenStopPercent
+		{
+			get => _breakEvenStopPercent;
+			set { _breakEvenStopPercent = Math.Min(99, Math.Max(0, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Max bars in trade (0 = no limit)", GroupName = "Take Profit / Stop Loss", Order = 213,
 			Description = "Trades that hit neither level within this many bars expire and are left out of the probabilities.")]
 		[Range(0, 100000)]
 		public int MaxBarsInTrade
@@ -1611,7 +1822,7 @@ namespace ATAS.Indicators.Technical
 			set { _maxBarsInTrade = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Close trades at session end", GroupName = "Take Profit / Stop Loss", Order = 205,
+		[Display(Name = "Close trades at session end", GroupName = "Take Profit / Stop Loss", Order = 214,
 			Description = "Expire open trades on the last bar of each session and take no new signals on it.")]
 		public bool ExpireAtSessionEnd
 		{
@@ -1619,7 +1830,7 @@ namespace ATAS.Indicators.Technical
 			set { _expireAtSessionEnd = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Order of high and low inside a bar", GroupName = "Take Profit / Stop Loss", Order = 206,
+		[Display(Name = "Order of high and low inside a bar", GroupName = "Take Profit / Stop Loss", Order = 215,
 			Description = "On historical bars only O/H/L/C are known, so when the order decides a trade (TP vs SL, or whether the break-even stop was hit after the trigger) this rule picks it. Live bars follow the trades as they happen.")]
 		public SameBarHitRule SameBarRule
 		{
@@ -1627,13 +1838,45 @@ namespace ATAS.Indicators.Technical
 			set { _sameBarRule = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Probability smoothing (virtual trades)", GroupName = "Take Profit / Stop Loss", Order = 207,
+		[Display(Name = "Probability smoothing (virtual trades)", GroupName = "Take Profit / Stop Loss", Order = 216,
 			Description = "How many trades' worth of weight the parent group gets. Higher = steadier probabilities that need more history to move.")]
 		[Range(1, 1000)]
 		public int ProbabilitySmoothing
 		{
 			get => _probabilitySmoothing;
 			set { _probabilitySmoothing = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Odds by time of day", GroupName = "Take Profit / Stop Loss", Order = 217,
+			Description = "Split each setup's odds by when the signal came: the first 30 minutes of regular hours, the morning, midday, the afternoon, or outside regular hours.")]
+		public bool OddsByTime
+		{
+			get => _oddsByTime;
+			set { _oddsByTime = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Odds by volatility", GroupName = "Take Profit / Stop Loss", Order = 218,
+			Description = "Split each setup's odds by how busy the market is: the ATR of the bars before the signal against ten times as many bars - quiet (under 0.8), normal, busy (over 1.25).")]
+		public bool OddsByVolatility
+		{
+			get => _oddsByVolatility;
+			set { _oddsByVolatility = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Odds by trend", GroupName = "Take Profit / Stop Loss", Order = 219,
+			Description = "Split each setup's odds by whether the signal goes with the trend EMA or against it.")]
+		public bool OddsByTrend
+		{
+			get => _oddsByTrend;
+			set { _oddsByTrend = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Odds by confirmations", GroupName = "Take Profit / Stop Loss", Order = 220,
+			Description = "Split each setup's odds by how many of the four confirmations it had.")]
+		public bool OddsByConfirmations
+		{
+			get => _oddsByConfirmations;
+			set { _oddsByConfirmations = value; RecalculateValues(); }
 		}
 
 		[Display(Name = "Show signal labels", GroupName = "Display", Order = 300)]
@@ -1809,6 +2052,9 @@ namespace ATAS.Indicators.Technical
 			_trades.Clear();
 			_openTrades.Clear();
 			_ema.Clear();
+			_cumulativeRange.Clear();
+			_openSwingHighs.Clear();
+			_openSwingLows.Clear();
 			_model.Reset();
 			_patternCacheBar = -1;
 
@@ -1828,6 +2074,7 @@ namespace ATAS.Indicators.Technical
 			_shortBreakEvens = 0;
 			_shortLosses = 0;
 			_expired = 0;
+			_missed = 0;
 			_filtered = 0;
 			_longNetTicks = 0;
 			_shortNetTicks = 0;
@@ -1851,6 +2098,7 @@ namespace ATAS.Indicators.Technical
 			AdvanceOpenTrades(bar, candle, ref alerts);
 			ExpireStaleTrades(bar, candle, ref alerts);
 			UpdateEma(bar, candle.Close);
+			UpdateTrueRange(bar, candle);
 
 			// bar + 1 exists (that's why this bar is closed), so we already know whether
 			// it opens a new session
@@ -1907,6 +2155,36 @@ namespace ATAS.Indicators.Technical
 			_ema[bar] = _ema[bar - 1] + alpha * (close - _ema[bar - 1]);
 		}
 
+		// running total of true ranges: each bar's range, stretched to the close before it
+		private void UpdateTrueRange(int bar, IndicatorCandle candle)
+		{
+			var range = candle.High - candle.Low;
+
+			if (bar > 0)
+			{
+				var previousClose = GetCandle(bar - 1).Close;
+				range = Math.Max(candle.High, previousClose) - Math.Min(candle.Low, previousClose);
+			}
+
+			_cumulativeRange.Add((bar > 0 ? _cumulativeRange[bar - 1] : 0) + range);
+		}
+
+		// average true range of the ATR period bars up to endBar (fewer at the start); 0 before the first
+		private decimal AverageRange(int endBar)
+		{
+			return AverageRange(endBar, AtrPeriod);
+		}
+
+		private decimal AverageRange(int endBar, int period)
+		{
+			if (endBar < 0)
+				return 0;
+
+			var count = Math.Min(period, endBar + 1);
+			var before = endBar - count >= 0 ? _cumulativeRange[endBar - count] : 0;
+			return (_cumulativeRange[endBar] - before) / count;
+		}
+
 		#endregion
 
 		#region Fair value gaps and sweeps
@@ -1918,8 +2196,9 @@ namespace ATAS.Indicators.Technical
 			var left = GetCandle(bar - 2);
 			var right = GetCandle(bar);
 
-			// at least one tick of empty space, even with Min FVG Size = 0
-			var minGap = Math.Max(MinFvgTicks, 1) * TickSize;
+			// at least one tick of empty space, even with Min FVG Size = 0, and at least Min FVG size
+			// (x ATR) of the bars before the gap
+			var minGap = Math.Max(Math.Max(MinFvgTicks, 1) * TickSize, (decimal)MinFvgAtr * AverageRange(bar - 3));
 
 			// Bullish FVG: left.High sits below right.Low
 			if (right.Low - left.High >= minGap)
@@ -2038,48 +2317,123 @@ namespace ATAS.Indicators.Technical
 			return rank < bestRank || (rank == bestRank && zone.ConfirmedBar > best.ConfirmedBar) ? zone : best;
 		}
 
-		// Liquidity sweep = current bar wicks beyond the prior N-bar high/low, then closes back
-		// inside it -> stop run / liquidity grab.
+		// Liquidity sweep = the bar wicks beyond the high / low of the lookback and closes back
+		// inside it -> stop run / liquidity grab. With Sweep confirmed swings only, the level is
+		// a swing of the lookback nothing has traded beyond yet. Either way the wick has to reach
+		// Min sweep depth (x ATR) beyond it.
 		private void CheckLiquiditySweep(int bar, IndicatorCandle candle, out bool sweptLows, out bool sweptHighs)
 		{
-			var highestHigh = decimal.MinValue;
-			var lowestLow = decimal.MaxValue;
-			var highBar = -1;
-			var lowBar = -1;
+			bool highTaken;
+			bool lowTaken;
+			decimal highLevel;
+			decimal lowLevel;
+			int highBar;
+			int lowBar;
 
-			for (var i = Math.Max(0, bar - SwingLookback); i < bar; i++)
+			if (SweepConfirmedSwings)
 			{
-				var c = GetCandle(i);
+				(highTaken, highLevel, highBar) = TakeOpenSwings(_openSwingHighs, bar, candle, true);
+				(lowTaken, lowLevel, lowBar) = TakeOpenSwings(_openSwingLows, bar, candle, false);
+				RememberSwings(bar);
+			}
+			else
+			{
+				highLevel = decimal.MinValue;
+				lowLevel = decimal.MaxValue;
+				highBar = -1;
+				lowBar = -1;
 
-				// the latest bar at the extreme, so the sweep line is as short as it can be
-				if (c.High >= highestHigh)
+				for (var i = Math.Max(0, bar - SwingLookback); i < bar; i++)
 				{
-					highestHigh = c.High;
-					highBar = i;
+					var c = GetCandle(i);
+
+					// the latest bar at the extreme, so the sweep line is as short as it can be
+					if (c.High >= highLevel)
+					{
+						highLevel = c.High;
+						highBar = i;
+					}
+
+					if (c.Low <= lowLevel)
+					{
+						lowLevel = c.Low;
+						lowBar = i;
+					}
 				}
 
-				if (c.Low <= lowestLow)
-				{
-					lowestLow = c.Low;
-					lowBar = i;
-				}
+				highTaken = candle.High > highLevel && candle.Close < highLevel;
+				lowTaken = candle.Low < lowLevel && candle.Close > lowLevel;
 			}
 
-			sweptHighs = candle.High > highestHigh && candle.Close < highestHigh;
-			sweptLows = candle.Low < lowestLow && candle.Close > lowestLow;
+			var minDepth = MinSweepDepth(bar);
+			sweptHighs = highTaken && candle.High - highLevel >= minDepth;
+			sweptLows = lowTaken && lowLevel - candle.Low >= minDepth;
 			var offset = ArrowOffsetTicks * TickSize;
 
 			if (sweptHighs)
 			{
 				_bearSweep[bar] = candle.High + offset;
-				_sweeps.Add(new LiquiditySweep { Bar = bar, SwingBar = highBar, Level = highestHigh });
+				_sweeps.Add(new LiquiditySweep { Bar = bar, SwingBar = highBar, Level = highLevel });
 			}
 
 			if (sweptLows)
 			{
 				_bullSweep[bar] = candle.Low - offset;
-				_sweeps.Add(new LiquiditySweep { Bar = bar, SwingBar = lowBar, Level = lowestLow, SweptLows = true });
+				_sweeps.Add(new LiquiditySweep { Bar = bar, SwingBar = lowBar, Level = lowLevel, SweptLows = true });
 			}
+		}
+
+		// how far beyond a level a sweep on `bar` has to reach, from the bars before it
+		private decimal MinSweepDepth(int bar)
+		{
+			return (decimal)MinSweepAtr * AverageRange(bar - 1);
+		}
+
+		// Swings older than the lookback are forgotten; the ones the bar traded beyond are taken.
+		// It swept the furthest one it closed back inside of (the latest on a tie).
+		private (bool Swept, decimal Level, int SwingBar) TakeOpenSwings(List<(int Bar, decimal Price)> swings, int bar, IndicatorCandle candle, bool highs)
+		{
+			swings.RemoveAll(sw => bar - sw.Bar > SwingLookback);
+			var swept = false;
+			var level = 0m;
+			var swingBar = -1;
+
+			for (var i = swings.Count - 1; i >= 0; i--)
+			{
+				var (swing, price) = swings[i];
+
+				if (highs ? candle.High <= price : candle.Low >= price)
+					continue;
+
+				var back = highs ? candle.Close < price : candle.Close > price;
+				var further = !swept || (highs ? price > level : price < level) || (price == level && swing > swingBar);
+
+				if (back && further)
+				{
+					swept = true;
+					level = price;
+					swingBar = swing;
+				}
+
+				swings.RemoveAt(i);
+			}
+
+			return (swept, level, swingBar);
+		}
+
+		// the swing SwingStrength bars back is confirmed now, untouched so far
+		private void RememberSwings(int bar)
+		{
+			var pivot = bar - SwingStrength;
+
+			if (pivot - SwingStrength < 0)
+				return;
+
+			if (IsSwing(pivot, true))
+				_openSwingHighs.Add((pivot, GetCandle(pivot).High));
+
+			if (IsSwing(pivot, false))
+				_openSwingLows.Add((pivot, GetCandle(pivot).Low));
 		}
 
 		#endregion
@@ -2112,6 +2466,13 @@ namespace ATAS.Indicators.Technical
 			return newYork.TimeOfDay >= TradingDayStart ? newYork.Date.AddDays(1) : newYork.Date;
 		}
 
+		// a time of day, from 00:00 to 23:59
+		private static TimeSpan WithinDay(TimeSpan time)
+		{
+			var minutes = (int)Math.Floor(time.TotalMinutes) % (24 * 60);
+			return TimeSpan.FromMinutes(minutes < 0 ? minutes + 24 * 60 : minutes);
+		}
+
 		// regular hours sit between midnight and 18:00 New York time
 		private static TimeSpan ClampToTradingDay(TimeSpan time)
 		{
@@ -2141,6 +2502,12 @@ namespace ATAS.Indicators.Technical
 
 				case SignalHoursRule.RegularHoursNoLunch:
 					return IsRegularHours(time) && !(time >= LunchStart && time < LunchEnd);
+
+				case SignalHoursRule.Custom:
+					return CustomHoursStart == CustomHoursEnd
+						|| (CustomHoursStart < CustomHoursEnd
+							? time >= CustomHoursStart && time < CustomHoursEnd
+							: time >= CustomHoursStart || time < CustomHoursEnd);
 
 				default:
 					return IsRegularHours(time);
@@ -2253,6 +2620,7 @@ namespace ATAS.Indicators.Technical
 		{
 			KeyLevel sweptLow = null;
 			KeyLevel sweptHigh = null;
+			var minDepth = MinSweepDepth(bar);
 
 			foreach (var level in _keyLevels.Where(l => l.FromBar <= bar).ToList())
 			{
@@ -2269,7 +2637,10 @@ namespace ATAS.Indicators.Technical
 				var back = level.IsHigh ? candle.Close < level.Price : candle.Close > level.Price;
 				EndLevel(level, back ? KeyLevelState.Swept : KeyLevelState.Broken, bar);
 
-				if (!back)
+				// swept, but only a deep enough sweep gives a signal
+				var depth = level.IsHigh ? candle.High - level.Price : level.Price - candle.Low;
+
+				if (!back || depth < minDepth)
 					continue;
 
 				if (level.IsHigh)
@@ -3289,7 +3660,16 @@ namespace ATAS.Indicators.Technical
 			var tickSize = TickSize;
 			var entry = candle.Close;
 			var direction = isLong ? 1 : -1;
-			var breakEven = BreakEvenEnabled;
+			var limit = Entry == EntryRule.LimitPullback;
+
+			// a limit order a share of the signal bar's range better than its close
+			if (limit)
+				entry -= direction * Math.Round((candle.High - candle.Low) * PullbackPercent / 100m / tickSize, MidpointRounding.AwayFromZero) * tickSize;
+
+			var (target, risk, triggerTicks, locked, breakEven) = BracketFor(bar, candle, isLong, entry);
+			var timeBucket = TimeBucket(candle.Time);
+			var volatilityBucket = VolatilityBucket(bar);
+			var path = ModelPath(isLong, trigger, timeBucket, volatilityBucket, withTrend, confirmations);
 
 			return new SignalTrade
 			{
@@ -3297,11 +3677,23 @@ namespace ATAS.Indicators.Technical
 				EntryTime = candle.Time,
 				IsLong = isLong,
 				EntryPrice = entry,
-				TakeProfitPrice = entry + direction * TakeProfitTicks * tickSize,
-				StopLossPrice = entry - direction * StopLossTicks * tickSize,
+				TakeProfitPrice = entry + direction * target * tickSize,
+				StopLossPrice = entry - direction * risk * tickSize,
 				HasBreakEven = breakEven,
-				TriggerPrice = entry + direction * BreakEvenTriggerTicks * tickSize,
-				BreakEvenPrice = entry + direction * EffectiveBreakEvenStopTicks * tickSize,
+				TriggerPrice = entry + direction * triggerTicks * tickSize,
+				BreakEvenPrice = entry + direction * locked * tickSize,
+				TargetTicks = target,
+				RiskTicks = risk,
+				TriggerTicks = triggerTicks,
+				LockedTicks = locked,
+				LimitEntry = limit,
+				Pending = limit,
+				ThroughPrice = entry - direction * tickSize,
+				FillBar = limit ? -1 : bar,
+				ExpiryBar = limit ? bar + LimitValidBars : -1,
+				SignalClose = candle.Close,
+				TimeBucket = timeBucket,
+				VolatilityBucket = volatilityBucket,
 				SignalHigh = candle.High,
 				SignalLow = candle.Low,
 				Trigger = trigger,
@@ -3316,9 +3708,97 @@ namespace ATAS.Indicators.Technical
 				FillVolume = fromFill ? fill.Volume : 0,
 				FillBidsFilled = fromFill && fill.BidsFilled,
 				SweptLevel = sweptLevel,
-				Estimate = _model.Estimate(isLong, trigger, confirmations, PriorOdds(), ProbabilitySmoothing,
-					TakeProfitTicks, breakEven ? EffectiveBreakEvenStopTicks : 0, StopLossTicks)
+				Estimate = _model.Estimate(path, PriorOdds(target, risk, triggerTicks, locked, breakEven), ProbabilitySmoothing,
+					target, breakEven ? locked : 0, risk)
 			};
+		}
+
+		// The groups a signal's odds come from, broadest first: its direction, its trigger, then
+		// each split switched on. Each group adds a base-16 digit to the one above it.
+		private long[] ModelPath(bool isLong, TriggerType trigger, int timeBucket, int volatilityBucket, bool withTrend, int confirmations)
+		{
+			var path = new List<long>(6);
+			long group = isLong ? 1 : 2;
+			path.Add(group);
+			group = group * 16 + (int)trigger + 1;
+			path.Add(group);
+
+			void Split(bool on, int value)
+			{
+				if (!on)
+					return;
+
+				group = group * 16 + value + 1;
+				path.Add(group);
+			}
+
+			Split(OddsByTime, timeBucket);
+			Split(OddsByVolatility, volatilityBucket);
+			Split(OddsByTrend, withTrend ? 1 : 0);
+			Split(OddsByConfirmations, confirmations);
+			return path.ToArray();
+		}
+
+		private long[] ModelPath(SignalTrade trade)
+		{
+			return ModelPath(trade.IsLong, trade.Trigger, trade.TimeBucket, trade.VolatilityBucket, trade.WithTrend, trade.Confirmations);
+		}
+
+		// first 30 minutes of regular hours (0), the morning (1), midday (2), the afternoon (3), outside regular hours (4)
+		private int TimeBucket(DateTime candleTime)
+		{
+			var time = NewYorkTime(candleTime).TimeOfDay;
+
+			if (!IsRegularHours(time))
+				return 4;
+
+			var since = time - RegularHoursStart;
+			return since < TimeSpan.FromMinutes(30) ? 0 : since < TimeSpan.FromHours(2) ? 1 : since < TimeSpan.FromHours(4.5) ? 2 : 3;
+		}
+
+		// quiet (0), normal (1) or busy (2): the ATR before the signal against ten times as many bars
+		private int VolatilityBucket(int bar)
+		{
+			var longer = AverageRange(bar - 1, AtrPeriod * 10);
+
+			if (longer <= 0)
+				return 1;
+
+			var ratio = AverageRange(bar - 1) / longer;
+			return ratio < 0.8m ? 0 : ratio > 1.25m ? 2 : 1;
+		}
+
+		// The bracket of a trade entered at `entry` off the signal bar: take profit, stop loss,
+		// break-even trigger and the profit the moved stop keeps, in ticks from the entry
+		private (int Target, int Risk, int Trigger, int Locked, bool BreakEven) BracketFor(int bar, IndicatorCandle candle, bool isLong, decimal entry)
+		{
+			if (Bracket == BracketRule.FixedTicks)
+				return (TakeProfitTicks, StopLossTicks, BreakEvenTriggerTicks, EffectiveBreakEvenStopTicks, BreakEvenEnabled);
+
+			var tick = TickSize;
+			decimal risk;
+			double ratio;
+
+			if (Bracket == BracketRule.AtrMultiple)
+			{
+				risk = (decimal)StopLossAtr * AverageRange(bar - 1) / tick;
+				ratio = TakeProfitAtr / StopLossAtr;
+			}
+			else
+			{
+				var stop = isLong ? candle.Low - StopBufferTicks * tick : candle.High + StopBufferTicks * tick;
+				risk = (isLong ? entry - stop : stop - entry) / tick;
+				ratio = RewardRisk;
+			}
+
+			// the stop within Min / Max stop, the take profit in proportion to it
+			var riskTicks = (int)Math.Round(risk, MidpointRounding.AwayFromZero);
+			riskTicks = Math.Max(MinStopTicks, Math.Min(Math.Max(MinStopTicks, MaxStopTicks), riskTicks));
+			var target = Math.Max(1, (int)Math.Round(riskTicks * (decimal)ratio, MidpointRounding.AwayFromZero));
+			var trigger = (int)Math.Round(target * BreakEvenTriggerPercent / 100m, MidpointRounding.AwayFromZero);
+			var locked = Math.Max(0, Math.Min((int)Math.Round(target * BreakEvenStopPercent / 100m, MidpointRounding.AwayFromZero), trigger - 1));
+			var breakEven = BreakEvenTriggerPercent > 0 && trigger > 0 && trigger < target;
+			return (target, riskTicks, breakEven ? trigger : 0, breakEven ? locked : 0, breakEven);
 		}
 
 		private void RegisterSignal(SignalTrade trade, IndicatorCandle candle, ref List<PendingAlert> alerts)
@@ -3349,7 +3829,7 @@ namespace ATAS.Indicators.Technical
 			if (_realtime && UseAlerts)
 			{
 				var setup = string.Join(", ", PatternNames(trade.CandlePatterns).Prepend(SetupName(trade)));
-				var message = $"{Side(trade)} @ {FormatPrice(trade.EntryPrice)} ({setup}): {OddsText(trade, " / ")}"
+				var message = $"{Side(trade)}{(trade.LimitEntry ? " limit" : string.Empty)} @ {FormatPrice(trade.EntryPrice)} ({setup}): {OddsText(trade, " / ")}"
 					+ $"  -  TP {FormatPrice(trade.TakeProfitPrice)}, SL {FormatPrice(trade.StopLossPrice)}";
 
 				QueueAlert(ref alerts, message, trade.IsLong ? BuyColor : ShortColor);
@@ -3400,6 +3880,15 @@ namespace ATAS.Indicators.Technical
 
 				var result = SettleStretch(trade, start, newHigh, newLow, candle.Close, SameBarRule, out var ambiguous);
 
+				if (trade.Pending && result.Filled)
+				{
+					trade.Pending = false;
+					trade.FillBar = bar;
+
+					if (_realtime && AlertOnTradeResult && trade.IsShown)
+						QueueAlert(ref alerts, $"{Side(trade)} limit filled @ {FormatPrice(trade.EntryPrice)}", trade.IsLong ? BuyColor : ShortColor);
+				}
+
 				if (result.BreakEvenActive && !trade.BreakEvenActive)
 				{
 					trade.BreakEvenActive = true;
@@ -3407,8 +3896,8 @@ namespace ATAS.Indicators.Technical
 
 					if (_realtime && AlertOnTradeResult && trade.IsShown && result.Outcome == TradeOutcome.Open)
 					{
-						var message = $"{Side(trade)} from {FormatPrice(trade.EntryPrice)}: +{BreakEvenTriggerTicks}t reached, "
-							+ $"stop moved to {FormatPrice(trade.BreakEvenPrice)} (+{EffectiveBreakEvenStopTicks}t)";
+						var message = $"{Side(trade)} from {FormatPrice(trade.EntryPrice)}: +{trade.TriggerTicks}t reached, "
+							+ $"stop moved to {FormatPrice(trade.BreakEvenPrice)} (+{trade.LockedTicks}t)";
 
 						QueueAlert(ref alerts, message, BreakEvenPen.Color.Convert());
 					}
@@ -3425,14 +3914,23 @@ namespace ATAS.Indicators.Technical
 
 		private void ExpireStaleTrades(int bar, IndicatorCandle candle, ref List<PendingAlert> alerts)
 		{
-			if (MaxBarsInTrade <= 0)
-				return;
-
 			for (var i = _openTrades.Count - 1; i >= 0; i--)
 			{
 				var trade = _openTrades[i];
 
-				if (bar - trade.EntryBar < MaxBarsInTrade)
+				// a limit order that waited its bars without a fill is cancelled
+				if (trade.Pending)
+				{
+					if (bar >= trade.ExpiryBar)
+					{
+						CloseTrade(trade, TradeOutcome.Missed, bar, trade.EntryPrice, ref alerts);
+						_openTrades.RemoveAt(i);
+					}
+
+					continue;
+				}
+
+				if (MaxBarsInTrade <= 0 || bar - trade.FillBar < MaxBarsInTrade)
 					continue;
 
 				CloseTrade(trade, TradeOutcome.Expired, bar, candle.Close, ref alerts);
@@ -3443,7 +3941,12 @@ namespace ATAS.Indicators.Technical
 		private void ExpireAllOpenTrades(int bar, IndicatorCandle candle, ref List<PendingAlert> alerts)
 		{
 			foreach (var trade in _openTrades)
-				CloseTrade(trade, TradeOutcome.Expired, bar, candle.Close, ref alerts);
+			{
+				if (trade.Pending)
+					CloseTrade(trade, TradeOutcome.Missed, bar, trade.EntryPrice, ref alerts);
+				else
+					CloseTrade(trade, TradeOutcome.Expired, bar, candle.Close, ref alerts);
+			}
 
 			_openTrades.Clear();
 		}
@@ -3453,13 +3956,23 @@ namespace ATAS.Indicators.Technical
 			trade.Outcome = outcome;
 			trade.ExitBar = bar;
 			trade.ExitPrice = exitPrice;
+			trade.Pending = false;
+
+			// a limit order that never filled is no trade: nothing made, nothing to learn
+			if (outcome == TradeOutcome.Missed)
+			{
+				if (trade.IsShown)
+					_missed++;
+
+				return;
+			}
 
 			var ticks = ResultTicks(trade);
 
 			// only a real ending (TP, break-even or SL) teaches the model - an expired trade reached none
 			if (outcome != TradeOutcome.Expired)
 			{
-				_model.Record(trade.IsLong, trade.Trigger, trade.Confirmations, outcome);
+				_model.Record(ModelPath(trade), outcome);
 
 				if (LabelExpectedTicks(trade) > 0)
 				{
@@ -3555,16 +4068,38 @@ namespace ATAS.Indicators.Technical
 			}
 		}
 
+		// A limit order waiting for its fill fills where the path first trades a tick through
+		// it, at its own price; from there the trade walks the rest of the path.
+		private static PathResult WalkPath(SignalTrade trade, IReadOnlyList<decimal> path)
+		{
+			if (!trade.Pending)
+				return WalkTrade(trade, path, trade.BreakEvenActive);
+
+			for (var i = 0; i < path.Count; i++)
+			{
+				if (trade.IsLong ? path[i] > trade.ThroughPrice : path[i] < trade.ThroughPrice)
+					continue;
+
+				var rest = new List<decimal>(path.Count - i + 1) { trade.EntryPrice };
+
+				for (var k = i; k < path.Count; k++)
+					rest.Add(path[k]);
+
+				return WalkTrade(trade, rest, false);
+			}
+
+			return new PathResult(TradeOutcome.Open, false, 0, false);
+		}
+
 		// Follows one trade along a price path. Moving in its favour can reach the break-even
 		// trigger (which moves the stop) and then the TP; moving against it can reach whichever
 		// stop is active. The first price is checked both ways, which also settles a gap
 		// through a level at the open.
-		private static PathResult WalkPath(SignalTrade trade, IReadOnlyList<decimal> path)
+		private static PathResult WalkTrade(SignalTrade trade, IReadOnlyList<decimal> path, bool active)
 		{
 			var direction = trade.IsLong ? 1 : -1;
 			var takeProfit = (trade.TakeProfitPrice - trade.EntryPrice) * direction;
 			var trigger = (trade.TriggerPrice - trade.EntryPrice) * direction;
-			var active = trade.BreakEvenActive;
 			var previous = 0m;
 
 			for (var i = 0; i < path.Count; i++)
@@ -3792,6 +4327,7 @@ namespace ATAS.Indicators.Technical
 				ShortLosses = _shortLosses,
 				Open = _openTrades.Count(t => t.IsShown),
 				Expired = _expired,
+				Missed = _missed,
 				Filtered = _filtered,
 				ModelResolved = _model.Resolved,
 				LongNetTicks = _longNetTicks,
@@ -3828,7 +4364,7 @@ namespace ATAS.Indicators.Technical
 
 			foreach (var trade in _trades)
 			{
-				if (trade.Outcome == TradeOutcome.Open || trade.Outcome == TradeOutcome.Expired)
+				if (trade.Outcome == TradeOutcome.Open || trade.Outcome == TradeOutcome.Expired || trade.Outcome == TradeOutcome.Missed)
 					continue;
 
 				board.Closed++;
@@ -4074,7 +4610,21 @@ namespace ATAS.Indicators.Technical
 				if (trade.EntryBar > lastBar || endBar < firstBar)
 					continue;
 
-				var x1 = ChartInfo.GetXByBar(trade.EntryBar, false);
+				if (trade.Pending || trade.Outcome == TradeOutcome.Missed)
+				{
+					var color = trade.IsLong ? BuyColor : ShortColor;
+					var xa = ChartInfo.GetXByBar(trade.EntryBar, false);
+					var xb = Math.Max(ChartInfo.GetXByBar(endBar, false), xa + 4);
+					var yLimit = ChartInfo.GetYByPrice(trade.EntryPrice, false);
+					context.DrawLine(new RenderPen(WithAlpha(color, trade.Pending ? 200 : 70)) { DashStyle = DashStyle.Dash }, xa, yLimit, xb, yLimit);
+
+					if (trade.Pending)
+						priceTags.Add(($"LMT {FormatPrice(trade.EntryPrice)}", xb + 4, yLimit, color));
+
+					continue;
+				}
+
+				var x1 = ChartInfo.GetXByBar(trade.FillBar, false);
 				var x2 = Math.Max(ChartInfo.GetXByBar(endBar, false), x1 + 4);
 				var yEntry = ChartInfo.GetYByPrice(trade.EntryPrice, false);
 				var yTp = ChartInfo.GetYByPrice(trade.TakeProfitPrice, false);
@@ -4232,7 +4782,7 @@ namespace ATAS.Indicators.Technical
 				var side = Side(trade);
 				var setup = SetupText(trade);
 				var odds = $"{OddsText(trade.HasBreakEven, trade.Estimate.Odds, "  ")}   EV {SignedTicks(LabelExpectedTicks(trade))}t";
-				var badge = OutcomeBadge(trade.Outcome);
+				var badge = trade.Pending ? "LIMIT" : OutcomeBadge(trade.Outcome);
 				var sideColor = trade.IsLong ? BuyColor : ShortColor;
 
 				var sideSize = context.MeasureString(side + "  ", font);
@@ -4283,7 +4833,9 @@ namespace ATAS.Indicators.Technical
 		{
 			var font = SmallFont;
 			var arrowOffset = ArrowOffsetTicks * TickSize;
-			var text = $"{OutcomeBadge(trade.Outcome)} {SignedTicks((int)Math.Round(ResultTicks(trade), MidpointRounding.AwayFromZero))}t";
+			var text = trade.Outcome == TradeOutcome.Missed
+				? "No fill"
+				: $"{OutcomeBadge(trade.Outcome)} {SignedTicks((int)Math.Round(ResultTicks(trade), MidpointRounding.AwayFromZero))}t";
 			var size = context.MeasureString(text, font);
 			var width = size.Width + 10;
 			var height = size.Height + 4;
@@ -4310,11 +4862,8 @@ namespace ATAS.Indicators.Technical
 		// returns where it was drawn
 		private Rectangle RenderStatsPanel(RenderContext context, PanelStats stats)
 		{
-			var breakEven = BreakEvenEnabled;
-			var bracket = $"TP {TakeProfitTicks}t · SL {StopLossTicks}t";
-
-			if (breakEven)
-				bracket += $" · BE +{BreakEvenTriggerTicks}t → +{EffectiveBreakEvenStopTicks}t";
+			var breakEven = BracketHasBreakEven;
+			var bracket = BracketText();
 
 			string[] Row(string name, int wins, int breakEvens, int losses, decimal net)
 			{
@@ -4334,7 +4883,8 @@ namespace ATAS.Indicators.Technical
 
 			var footer = new List<(string Text, Color Color)>
 			{
-				($"Open {stats.Open} · Expired {stats.Expired} · Hidden {stats.Filtered} · Model n={stats.ModelResolved}", DimTextColor),
+				($"Open {stats.Open} · Expired {stats.Expired}{(Entry == EntryRule.LimitPullback || stats.Missed > 0 ? $" · No fill {stats.Missed}" : string.Empty)}"
+					+ $" · Hidden {stats.Filtered} · Model n={stats.ModelResolved}", DimTextColor),
 
 				// were the labels right? what signals labelled with a positive / not positive
 				// expected result really made (every settled signal, hidden ones included)
@@ -4364,11 +4914,16 @@ namespace ATAS.Indicators.Technical
 
 			var open = stats.OpenTrade;
 
-			if (open != null)
+			if (open != null && open.Pending)
+			{
+				footer.Add(($"Limit {Side(open)} @ {FormatPrice(open.EntryPrice)}: waiting for a fill until bar {open.ExpiryBar}",
+					open.IsLong ? BuyColor : ShortColor));
+			}
+			else if (open != null)
 			{
 				// how far the open trade has moved, and the odds from here
 				var excursion = (stats.LastPrice - open.EntryPrice) / TickSize * (open.IsLong ? 1 : -1);
-				var stop = open.BreakEvenActive ? $", stop +{EffectiveBreakEvenStopTicks}t" : string.Empty;
+				var stop = open.BreakEvenActive ? $", stop +{open.LockedTicks}t" : string.Empty;
 				var odds = OddsText(open.HasBreakEven, LiveOdds(open, stats.LastPrice), " · ");
 
 				footer.Add(($"Live {Side(open)} {excursion.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t{stop}:  {odds}",
@@ -4446,7 +5001,7 @@ namespace ATAS.Indicators.Technical
 			const int pad = 8;
 			const int gap = 12;
 			var font = LabelFont.RenderObject;
-			var breakEven = BreakEvenEnabled;
+			var breakEven = BracketHasBreakEven;
 			var title = board.Closed == 0
 				? "Scoreboard: no closed signals yet"
 				: $"Scoreboard: {board.Closed} closed signal{(board.Closed == 1 ? string.Empty : "s")}, hidden ones included";
@@ -4562,19 +5117,32 @@ namespace ATAS.Indicators.Technical
 			var lines = new List<(string Text, Color Color)>
 			{
 				($"{Side(trade)} @ {FormatPrice(trade.EntryPrice)}   {time}", trade.IsLong ? BuyColor : ShortColor),
-				($"TP {FormatPrice(trade.TakeProfitPrice)} (+{TakeProfitTicks}t)   SL {FormatPrice(trade.StopLossPrice)} (-{StopLossTicks}t)", TextColor)
+				($"TP {FormatPrice(trade.TakeProfitPrice)} (+{trade.TargetTicks}t)   SL {FormatPrice(trade.StopLossPrice)} (-{trade.RiskTicks}t)", TextColor)
 			};
 
 			if (trade.HasBreakEven)
 			{
-				lines.Add(($"Break-even: at +{BreakEvenTriggerTicks}t the stop moves to {FormatPrice(trade.BreakEvenPrice)} (+{EffectiveBreakEvenStopTicks}t)",
+				lines.Add(($"Break-even: at +{trade.TriggerTicks}t the stop moves to {FormatPrice(trade.BreakEvenPrice)} (+{trade.LockedTicks}t)",
 					TextColor));
 			}
 
+			if (trade.LimitEntry)
+			{
+				var state = trade.Pending ? $"waiting until bar {trade.ExpiryBar}"
+					: trade.FillBar >= 0 ? $"filled on bar {trade.FillBar}"
+					: $"not filled by bar {trade.ExitBar}";
+				lines.Add(($"Limit entry {PullbackPercent}% of the signal bar back from its {FormatPrice(trade.SignalClose)} close: {state}", DimTextColor));
+			}
+
 			lines.Add((odds, TextColor));
-			lines.Add(($"This setup: {TallyText(estimate.Setup, trade.HasBreakEven)}", DimTextColor));
-			lines.Add(($"All {TriggerLabel(trade.Trigger)} {side}: {TallyText(estimate.Trigger, trade.HasBreakEven)}", DimTextColor));
-			lines.Add(($"All {side}: {TallyText(estimate.Direction, trade.HasBreakEven)}", DimTextColor));
+			// the groups the odds came from, narrowest first
+			var names = OddsGroupNames(trade, side);
+
+			for (var i = estimate.Levels.Length - 1; i >= 0; i--)
+			{
+				var name = i == estimate.Levels.Length - 1 && i >= 2 ? "This setup" : names[i];
+				lines.Add(($"{name}: {TallyText(estimate.Levels[i], trade.HasBreakEven)}", DimTextColor));
+			}
 			lines.Add(($"Confirmations {trade.Confirmations}/{MaxConfirmations}: trend {YesNo(trade.WithTrend)} · delta {YesNo(trade.DeltaConfirms)}"
 				+ $" · order flow {YesNo(trade.FillConfirms)} · pattern {YesNo(trade.CandlePatterns != CandlePattern.None)}", DimTextColor));
 
@@ -4602,10 +5170,35 @@ namespace ATAS.Indicators.Technical
 			}
 
 			if (trade.BreakEvenActive)
-				lines.Add(($"Stop moved to +{EffectiveBreakEvenStopTicks}t on bar {trade.BreakEvenBar}", BreakEvenPen.Color.Convert()));
+				lines.Add(($"Stop moved to +{trade.LockedTicks}t on bar {trade.BreakEvenBar}", BreakEvenPen.Color.Convert()));
 
 			lines.Add((ResultText(trade), OutcomeColor(trade.Outcome)));
 			return lines;
+		}
+
+		// "All buys", "All FVG buys", "FVG buys in the first 30 minutes", "... in busy markets", ...
+		private List<string> OddsGroupNames(SignalTrade trade, string side)
+		{
+			var trigger = TriggerLabel(trade.Trigger);
+			var names = new List<string> { $"All {side}", $"All {trigger} {side}" };
+			var name = $"{trigger} {side}";
+
+			void Split(bool on, string words)
+			{
+				if (!on)
+					return;
+
+				name += words;
+				names.Add(name);
+			}
+
+			var times = new[] { "in the first 30 minutes", "in the morning", "at midday", "in the afternoon", "outside regular hours" };
+			var markets = new[] { "quiet", "normal", "busy" };
+			Split(OddsByTime, $" {times[trade.TimeBucket]}");
+			Split(OddsByVolatility, $", {markets[trade.VolatilityBucket]} markets");
+			Split(OddsByTrend, trade.WithTrend ? ", with the trend" : ", against it");
+			Split(OddsByConfirmations, $", {trade.Confirmations} confirmation{(trade.Confirmations == 1 ? string.Empty : "s")}");
+			return names;
 		}
 
 		private List<(string Text, Color Color)> FillTooltip(FillEvent fill)
@@ -4802,21 +5395,40 @@ namespace ATAS.Indicators.Technical
 		// the break-even stop has to stay below its trigger
 		private int EffectiveBreakEvenStopTicks => Math.Min(BreakEvenStopTicks, Math.Max(0, BreakEvenTriggerTicks - 1));
 
+		// whether trades get a break-even stop with the bracket in use
+		private bool BracketHasBreakEven => Bracket == BracketRule.FixedTicks ? BreakEvenEnabled : BreakEvenTriggerPercent > 0;
+
+		// "TP 80t · SL 80t · BE +40t → +20t", "TP 3× ATR · SL 3× ATR · BE at 50% → 25% of TP"
+		private string BracketText()
+		{
+			string Times(double value) => value.ToString("0.##", CultureInfo.InvariantCulture);
+			var share = BreakEvenTriggerPercent > 0
+				? $" · BE at {BreakEvenTriggerPercent}% → {Math.Min(BreakEvenStopPercent, BreakEvenTriggerPercent - 1)}% of TP"
+				: string.Empty;
+
+			switch (Bracket)
+			{
+				case BracketRule.AtrMultiple:
+					return $"TP {Times(TakeProfitAtr)}× ATR · SL {Times(StopLossAtr)}× ATR{share}";
+
+				case BracketRule.BeyondSignalBar:
+					return $"SL beyond the signal bar +{StopBufferTicks}t · TP {Times(RewardRisk)}× the stop{share}";
+
+				default:
+					return $"TP {TakeProfitTicks}t · SL {StopLossTicks}t" + (BreakEvenEnabled ? $" · BE +{BreakEvenTriggerTicks}t → +{EffectiveBreakEvenStopTicks}t" : string.Empty);
+			}
+		}
+
 		// Odds of a driftless random walk - no edge at all - which every estimate starts from.
 		// Without break-even, P(TP) = SL / (TP + SL). With it, price first has to reach the
 		// trigger before the stop, P = SL / (trigger + SL), and from there the TP before the
 		// break-even stop, P = (trigger - stop) / (TP - stop). For 80 / 80 with the stop
 		// moving to +20 at +40 that is TP 2/9, BE 4/9, SL 1/3: an expected 0 ticks.
-		private OutcomeOdds PriorOdds()
+		private static OutcomeOdds PriorOdds(double tp, double sl, double trigger, double stop, bool breakEven)
 		{
-			double tp = TakeProfitTicks;
-			double sl = StopLossTicks;
-
-			if (!BreakEvenEnabled)
+			if (!breakEven)
 				return new OutcomeOdds(sl / (tp + sl), 0, tp / (tp + sl));
 
-			double trigger = BreakEvenTriggerTicks;
-			double stop = EffectiveBreakEvenStopTicks;
 			var reachTrigger = sl / (trigger + sl);
 			var takeProfitAfter = (trigger - stop) / (tp - stop);
 
@@ -4830,8 +5442,8 @@ namespace ATAS.Indicators.Technical
 		{
 			var excursion = (double)((price - trade.EntryPrice) / TickSize * (trade.IsLong ? 1 : -1));
 			var odds = trade.Estimate.Odds;
-			double tp = TakeProfitTicks;
-			double sl = StopLossTicks;
+			double tp = trade.TargetTicks;
+			double sl = trade.RiskTicks;
 
 			if (!trade.HasBreakEven)
 			{
@@ -4839,8 +5451,8 @@ namespace ATAS.Indicators.Technical
 				return new OutcomeOdds(p, 0, 1 - p);
 			}
 
-			double trigger = BreakEvenTriggerTicks;
-			double stop = EffectiveBreakEvenStopTicks;
+			double trigger = trade.TriggerTicks;
+			double stop = trade.LockedTicks;
 			var reached = odds.TakeProfit + odds.BreakEven;
 			var takeProfitAfter = reached > 0 ? odds.TakeProfit / reached : 0;
 
@@ -4882,8 +5494,12 @@ namespace ATAS.Indicators.Technical
 				case TradeOutcome.Expired:
 					return $"Expired on bar {trade.ExitBar} at {FormatPrice(trade.ExitPrice)} ({ticks}t)";
 
+				case TradeOutcome.Missed:
+					return $"No fill: price did not trade through the limit by bar {trade.ExitBar}";
+
 				default:
-					return trade.BreakEvenActive ? "Open - stop at break-even, waiting for TP or BE" : "Open - waiting for TP or SL";
+					return trade.Pending ? $"Waiting for the limit to fill, until bar {trade.ExpiryBar}"
+						: trade.BreakEvenActive ? "Open - stop at break-even, waiting for TP or BE" : "Open - waiting for TP or SL";
 			}
 		}
 
@@ -4901,6 +5517,7 @@ namespace ATAS.Indicators.Technical
 					return StopLossPen.Color.Convert();
 
 				case TradeOutcome.Expired:
+				case TradeOutcome.Missed:
 					return NeutralColor;
 
 				default:
@@ -4923,6 +5540,9 @@ namespace ATAS.Indicators.Technical
 
 				case TradeOutcome.Expired:
 					return "EXP";
+
+				case TradeOutcome.Missed:
+					return "NO FILL";
 
 				default:
 					return "OPEN";
@@ -5159,6 +5779,9 @@ namespace ATAS.Indicators.Technical
 
 				case SignalHoursRule.RegularHoursNoLunch:
 					return $"regular hours {Clock(RegularHoursStart)}–{Clock(RegularHoursEnd)}, not 11:30–13:30";
+
+				case SignalHoursRule.Custom:
+					return CustomHoursStart == CustomHoursEnd ? "custom window, all day" : $"custom {Clock(CustomHoursStart)}–{Clock(CustomHoursEnd)}";
 
 				default:
 					return $"regular hours {Clock(RegularHoursStart)}–{Clock(RegularHoursEnd)}";

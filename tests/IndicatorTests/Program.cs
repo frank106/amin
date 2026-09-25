@@ -58,6 +58,9 @@ internal static class Program
 		Run("Adaptive sizes: big fills among the biggest of recent bars", AdaptiveFills);
 		Run("Adaptive sizes: resting orders against the typical level", AdaptiveRestingOrders);
 		Run("Scoreboard: results per setup and pattern, and the odds check", ScoreboardCounts);
+		Run("Filters: ATR-sized sweeps and gaps, confirmed swings", SignalFilters);
+		Run("Brackets: ATR multiples, beyond the signal bar, bounds", Brackets);
+		Run("Limit entries: a pullback fill, no fill, a gap, the panel", LimitEntries);
 		Run("Fuzz: historical run vs oracle", () => FuzzHistorical(seed: 7, configure: null));
 		Run("Fuzz: expiry + session end + cooldown 0", () => FuzzHistorical(seed: 11, configure: i =>
 		{
@@ -147,6 +150,71 @@ internal static class Program
 			i.OneTradeAtATime = false;
 			i.LevelOvernight = false;
 		}));
+		Run("Fuzz: ATR-sized sweeps and gaps, a custom window", () => FuzzHistorical(seed: 89, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.Custom;
+			i.CustomHoursStart = new TimeSpan(10, 0, 0);
+			i.CustomHoursEnd = new TimeSpan(20, 0, 0);
+			i.MinSweepAtr = 0.3;
+			i.MinFvgAtr = 0.4;
+			i.AtrPeriod = 14;
+			i.OneTradeAtATime = false;
+		}, rich: false));
+		Run("Fuzz: sweeps of confirmed swings only, a window over midnight", () => FuzzHistorical(seed: 97, configure: i =>
+		{
+			Defaults(i);
+			i.SweepConfirmedSwings = true;
+			i.SwingLookback = 30;
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.Custom;
+			i.CustomHoursStart = new TimeSpan(20, 0, 0);
+			i.CustomHoursEnd = new TimeSpan(14, 0, 0);
+			i.MinSweepAtr = 0.1;
+		}, rich: false));
+		Run("Fuzz: ATR brackets with break-even shares", () => FuzzHistorical(seed: 101, configure: i =>
+		{
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.AtrMultiple;
+			i.TakeProfitAtr = 4;
+			i.StopLossAtr = 2.5;
+			i.MinStopTicks = 6;
+			i.MaxStopTicks = 60;
+			i.BreakEvenTriggerPercent = 40;
+			i.BreakEvenStopPercent = 15;
+		}));
+		Run("Fuzz: stops beyond the signal bar", () => FuzzHistorical(seed: 103, configure: i =>
+		{
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.BeyondSignalBar;
+			i.StopBufferTicks = 1;
+			i.RewardRisk = 2;
+			i.MinStopTicks = 4;
+			i.BreakEvenTriggerPercent = 0;
+		}));
+		Run("Fuzz: limit entries, expiry and session ends", () => FuzzHistorical(seed: 109, configure: i =>
+		{
+			i.Entry = FvgReactionLiquiditySweep.EntryRule.LimitPullback;
+			i.PullbackPercent = 30;
+			i.LimitValidBars = 4;
+			i.MaxBarsInTrade = 40;
+			i.ExpireAtSessionEnd = true;
+		}));
+		Run("Fuzz: live limit entries with stops beyond the signal bar", () => FuzzLiveMatchesHistory(i =>
+		{
+			i.Entry = FvgReactionLiquiditySweep.EntryRule.LimitPullback;
+			i.PullbackPercent = 20;
+			i.LimitValidBars = 3;
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.BeyondSignalBar;
+			i.MinStopTicks = 4;
+		}, seed: 107));
+		Run("Fuzz: odds by time of day, volatility and trend, filtered by EV", () => FuzzHistorical(seed: 113, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.AllHours;
+			i.OddsByTime = true;
+			i.OddsByVolatility = true;
+			i.OddsByTrend = true;
+			i.OddsByConfirmations = false;
+			i.MinExpectedTicks = 1;
+		}, rich: false));
 		Run("Fuzz: filters hide signals, the model still learns", FuzzFilters);
 		Run("Fuzz: live ticks and a live order book match history", () => FuzzLiveMatchesHistory());
 		Run("Fuzz: live matches history with key levels", () => FuzzLiveMatchesHistory(i =>
@@ -320,16 +388,26 @@ internal static class Program
 		var sweep = Enum.Parse(triggerType, "Sweep");
 		var prior = (2.0 / 9, 4.0 / 9, 1.0 / 3);
 
-		(double Tp, double Be, double Sl, double Ev) Estimate(bool isLong, object trigger, int confirmations)
+		// the groups of a signal, as the indicator builds them (direction, trigger, confirmations by default)
+		var modelPath = IndicatorType.GetMethod("ModelPath", Private, null,
+			new[] { typeof(bool), triggerType, typeof(int), typeof(int), typeof(bool), typeof(int) }, null);
+		long[] PathOf(FvgReactionLiquiditySweep ind, bool isLong, object trigger, int timeBucket, int confirmations) =>
+			(long[])modelPath.Invoke(ind, new[] { isLong, trigger, timeBucket, 1, false, confirmations });
+		var legacy = NewIndicator(null);
+
+		(double Tp, double Be, double Sl, double Ev) EstimateOn(object on, long[] path)
 		{
-			var e = estimate.Invoke(model, new[] { isLong, trigger, confirmations, Odds(prior.Item1, prior.Item2, prior.Item3), 10.0, 80.0, 20.0, 80.0 });
+			var e = estimate.Invoke(on, new object[] { path, Odds(prior.Item1, prior.Item2, prior.Item3), 10.0, 80.0, 20.0, 80.0 });
 			double P(string name) => (double)e.GetType().GetProperty(name).GetValue(e);
 			return (P("TakeProfit"), P("BreakEven"), P("StopLoss"), P("ExpectedTicks"));
 		}
 
+		(double Tp, double Be, double Sl, double Ev) Estimate(bool isLong, object trigger, int confirmations) =>
+			EstimateOn(model, PathOf(legacy, isLong, trigger, 0, confirmations));
+
 		void Record(bool isLong, object trigger, int confirmations, string outcome)
 		{
-			record.Invoke(model, new[] { isLong, trigger, confirmations, Enum.Parse(outcomeType, outcome) });
+			record.Invoke(model, new object[] { PathOf(legacy, isLong, trigger, 0, confirmations), Enum.Parse(outcomeType, outcome) });
 		}
 
 		var none = Estimate(true, fvg, 1);
@@ -370,14 +448,32 @@ internal static class Program
 		var losing = Estimate(true, sweep, 0);
 		Check(losing.Sl > 0.8 && losing.Ev < -40, "40 full stops -> mostly SL, clearly negative EV");
 		Check(Estimate(true, fvg, 1).Ev > losing.Ev, "winning setup stays above the losing one");
+
+		// by time of day: a TP in the first 30 minutes counts fully there, and elsewhere only
+		// through the broader groups
+		var timed = NewIndicator(i =>
+		{
+			i.OddsByTime = true;
+			i.OddsByConfirmations = false;
+		});
+		var byTime = Activator.CreateInstance(modelType);
+		record.Invoke(byTime, new object[] { PathOf(timed, true, fvg, 0, 1), Enum.Parse(outcomeType, "TakeProfit") });
+		var atOpen = EstimateOn(byTime, PathOf(timed, true, fvg, 0, 1));
+		var atNoon = EstimateOn(byTime, PathOf(timed, true, fvg, 2, 1));
+		Check(PathOf(timed, true, fvg, 0, 1).Length == 3 && atOpen.Tp > atNoon.Tp && atNoon.Tp > prior.Item1, "odds by time of day");
+		CheckClose(atOpen.Tp, Level(Level(Level(prior, 1, 0, 0), 1, 0, 0), 1, 0, 0).Item1, 1e-12, "three groups each counted the TP");
 	}
 
 	private static void PriorOddsAndPercentages()
 	{
+		// the coin-flip odds of the bracket a trade gets with these settings
 		(double Tp, double Be, double Sl) Prior(Action<FvgReactionLiquiditySweep> configure)
 		{
 			var ind = NewIndicator(configure);
-			var odds = IndicatorType.GetMethod("PriorOdds", Private).Invoke(ind, null);
+			var bracket = IndicatorType.GetMethod("BracketFor", Private).Invoke(ind, new object[] { 0, Bar(100, 101, 99, 100), true, 100m });
+			object Item(int k) => bracket.GetType().GetField($"Item{k}").GetValue(bracket);
+			var odds = IndicatorType.GetMethod("PriorOdds", PrivateStatic)
+				.Invoke(null, new object[] { (double)(int)Item(1), (double)(int)Item(2), (double)(int)Item(3), (double)(int)Item(4), Item(5) });
 			double P(string name) => (double)odds.GetType().GetProperty(name).GetValue(odds);
 			return (P("TakeProfit"), P("BreakEven"), P("StopLoss"));
 		}
@@ -1404,6 +1500,22 @@ internal static class Program
 
 		Check(At(regular, 8, 30, early) && At(regular, 17, 59, early) && !At(regular, 18, 0, early), "other hours; the session ends by 18:00");
 		Check(!At(firstTwo, 10, 30, early) && At(firstTwo, 10, 29, early), "the first two hours follow the start");
+
+		var custom = FvgReactionLiquiditySweep.SignalHoursRule.Custom;
+		Action<FvgReactionLiquiditySweep> Window(int fromHour, int fromMinute, int toHour, int toMinute) => i =>
+		{
+			i.CustomHoursStart = new TimeSpan(fromHour, fromMinute, 0);
+			i.CustomHoursEnd = new TimeSpan(toHour, toMinute, 0);
+		};
+
+		var tenToEleven = Window(10, 0, 11, 0);
+		Check(!At(custom, 9, 59, tenToEleven) && At(custom, 10, 0, tenToEleven) && At(custom, 10, 59, tenToEleven) && !At(custom, 11, 0, tenToEleven),
+			"custom window 10:00 - 11:00");
+		var overMidnight = Window(20, 0, 2, 0);
+		Check(!At(custom, 19, 59, overMidnight) && At(custom, 20, 0, overMidnight) && At(custom, 1, 59, overMidnight) && !At(custom, 2, 0, overMidnight),
+			"a window over midnight");
+		Check(At(custom, 3, 0, Window(9, 30, 9, 30)) && At(custom, 17, 0, Window(9, 30, 9, 30)), "the same start and end: all day");
+		Check(At(custom, 9, 30) && At(custom, 10, 29) && !At(custom, 10, 30), "the default custom window is the first hour, 09:30 - 10:30");
 	}
 
 	// a bar opening at a New York time in January 2026 (UTC-5)
@@ -1531,6 +1643,27 @@ internal static class Program
 		context = new RenderContext();
 		ind.HarnessRender(context);
 		Check(context.Strings.Contains("Swept the prior day high 102.00 on bar 31"), "signal tooltip names the swept level");
+
+		// with the odds split by time of day and volatility, the tooltip names each group
+		var split = RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.RegularHours, i =>
+		{
+			i.OddsByTime = true;
+			i.OddsByVolatility = true;
+			i.OddsByConfirmations = false;
+		}));
+		split.FirstVisibleBarNumber = 0;
+		split.LastVisibleBarNumber = split.Candles.Count - 1;
+		var splitChart = (FakeChart)split.ChartInfo;
+		splitChart.TopPrice = 110;
+		context = new RenderContext();
+		split.HarnessRender(context);
+		var card = context.Operations.First(o => o.Kind == "text" && o.Text == "Sweep PDH · Shooting star");
+		splitChart.MouseLocationInfo.LastPosition = new Point(card.From.X + 2, card.From.Y + 2);
+		context = new RenderContext();
+		split.HarnessRender(context);
+		Check(context.Strings.Any(t => t.StartsWith("This setup: ")) && context.Strings.Contains("Key sweep shorts at midday: no history yet")
+			&& context.Strings.Any(t => t.StartsWith("All Key sweep shorts: ")) && context.Strings.Any(t => t.StartsWith("All shorts: ")),
+			$"the odds groups by name: {string.Join(" | ", context.Strings.Where(t => t.Contains("shorts")))}");
 		Check(context.Strings.Any(t => t.StartsWith("Signals: regular hours 09:30–16:00 · last bar 12:30 New York")), "the panel shows the hours and the New York clock");
 	}
 
@@ -1732,6 +1865,219 @@ internal static class Program
 		Check(context.Strings.Any(t => t.StartsWith("Resting ≥213 (5× typical): ")), "an even book: 5x 42.5, rounded up");
 	}
 
+	private static void SignalFilters()
+	{
+		// flat bars have a true range of one point, so the ATR before the pattern is 1.0
+		List<IndicatorCandle> Flat(int count) => Enumerable.Range(0, count).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		bool BearSweep(FvgReactionLiquiditySweep ind, int bar) => Series(ind, "_bearSweep")[bar] != 0;
+
+		// a sweep has to reach Min sweep depth (x ATR) beyond the high: 1 tick is 0.25 ATR, 3 ticks 0.75
+		List<IndicatorCandle> Poke(decimal high)
+		{
+			var bars = Flat(15);
+			bars.Add(Bar(100, high, 99.75m, 100));
+			bars.Add(Bar(100, 100.25m, 99.75m, 100));
+			return bars;
+		}
+
+		Check(BearSweep(RunHistorical(Poke(100.75m)), 15), "without a minimum depth a 1-tick poke is a sweep");
+		Check(!BearSweep(RunHistorical(Poke(100.75m), i => i.MinSweepAtr = 0.5), 15), "half an ATR: a 1-tick poke is not");
+		var deep = RunHistorical(Poke(101.25m), i => i.MinSweepAtr = 0.5);
+		Check(BearSweep(deep, 15) && Trades(deep).Any(t => t.EntryBar == 15 && !t.IsLong && t.Trigger == "Sweep"), "3 ticks beyond: a sweep and a SHORT");
+
+		// a gap has to be Min FVG size (x ATR): 1.5 points after flat bars
+		var gapBars = Flat(16);
+		gapBars.Add(Bar(100.25m, 103, 100.25m, 102.75m));
+		gapBars.Add(Bar(102.5m, 103, 102, 102.75m));
+		gapBars.Add(Bar(102.75m, 103, 102.5m, 102.75m));
+		int Gaps(Action<FvgReactionLiquiditySweep> configure) => Zones(RunHistorical(gapBars, configure)).Count;
+		Check(Gaps(i => i.MinFvgTicks = 1) == 1 && Gaps(i => { i.MinFvgTicks = 1; i.MinFvgAtr = 1.5; }) == 1
+			&& Gaps(i => { i.MinFvgTicks = 1; i.MinFvgAtr = 1.6; }) == 0, "a 1.5-point gap is 1.5 ATR");
+
+		// Sweep confirmed swings only: the swing high of bar 12 is swept by bar 16, then taken; bar 18
+		// pokes over bar 16, which is no swing - a sweep of the lookback's high, not of a swing
+		var swings = Flat(12);
+		swings.Add(Bar(100, 101, 99.5m, 100));
+		swings.AddRange(Flat(3));
+		swings.Add(Bar(100, 101.25m, 99.75m, 100.25m));
+		swings.Add(Bar(100.25m, 100.5m, 99.75m, 100));
+		swings.Add(Bar(100, 101.5m, 99.75m, 100.25m));
+		swings.AddRange(Flat(2));
+		var rolling = RunHistorical(swings);
+		var confirmed = RunHistorical(swings, i => i.SweepConfirmedSwings = true);
+		Check(BearSweep(rolling, 16) && BearSweep(rolling, 18), "rolling: both pokes are sweeps");
+		Check(BearSweep(confirmed, 16) && !BearSweep(confirmed, 18), "confirmed swings: only the sweep of the swing high");
+
+		// a swing that a bar closed above is broken, so a later poke over it is no sweep
+		var broken = Flat(12);
+		broken.Add(Bar(100, 101, 99.5m, 100));
+		broken.AddRange(Flat(3));
+		broken.Add(Bar(100, 101.25m, 99.75m, 101.1m));
+		broken.Add(Bar(101, 101.1m, 100, 100.25m));
+		broken.Add(Bar(100.25m, 101.2m, 99.75m, 100.25m));
+		broken.AddRange(Flat(2));
+		var afterBreak = RunHistorical(broken, i => i.SweepConfirmedSwings = true);
+		Check(!BearSweep(afterBreak, 16) && !BearSweep(afterBreak, 18), "a broken swing is gone");
+
+		// key levels: a shallow sweep still ends the level as swept, but gives no signal
+		Action<FvgReactionLiquiditySweep> Levels(double depth) => i =>
+		{
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.RegularHours;
+			i.LevelPriorDay = true;
+			i.LevelOvernight = true;
+			i.LevelOpeningRange = true;
+			i.SwingLookback = 2;
+			i.OneTradeAtATime = false;
+			i.MinSweepAtr = depth;
+		};
+
+		string Keys(FvgReactionLiquiditySweep ind) => string.Join(" ", Trades(ind).Where(t => t.Trigger == "KeySweep").Select(t => t.EntryBar));
+		var all = RunHistorical(KeyLevelDays(), Levels(0));
+		var none = RunHistorical(KeyLevelDays(), Levels(2));
+		var some = RunHistorical(KeyLevelDays(), Levels(1));
+		Check(Keys(all) == "6 10 31" && Keys(none) == string.Empty && Keys(some) == "6 10",
+			$"key sweeps by depth: {Keys(all)} / {Keys(none)} / {Keys(some)}");
+		Check(KeyLevelKeys(none).SequenceEqual(KeyLevelKeys(all)), "the levels end the same way whatever the depth");
+	}
+
+	private static void Brackets()
+	{
+		// flat bars (ATR 1 point = 4 ticks), a sweep of their highs - SHORT at 100 - then a drop to 96
+		List<IndicatorCandle> Market()
+		{
+			var bars = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+			bars.Add(Bar(100, 101.25m, 99.75m, 100));
+			bars.Add(Bar(100, 100.25m, 96, 96.5m));
+			bars.Add(Bar(96.5m, 96.75m, 96.25m, 96.5m));
+			return bars;
+		}
+
+		TradeView Short(Action<FvgReactionLiquiditySweep> configure) => Trades(RunHistorical(Market(), configure)).Single(t => t.EntryBar == 15 && !t.IsLong);
+		string Of(TradeView t) => $"{t.TargetTicks}/{t.RiskTicks}/{t.TriggerTicks}/{t.LockedTicks}/{t.HasBreakEven}";
+		Action<FvgReactionLiquiditySweep> Atr(double tp, double sl, Action<FvgReactionLiquiditySweep> more = null) => i =>
+		{
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.AtrMultiple;
+			i.TakeProfitAtr = tp;
+			i.StopLossAtr = sl;
+			more?.Invoke(i);
+		};
+
+		var atr = Short(Atr(3, 3, i => i.MinStopTicks = 4));
+		Check(Of(atr) == "12/12/6/3/True" && atr.TakeProfitPrice == 97 && atr.StopLossPrice == 103 && atr.TriggerPrice == 98.5m && atr.BreakEvenPrice == 99.25m,
+			$"3 ATR each way, break-even at half and a quarter of the TP: {Of(atr)}");
+		Check(atr.Outcome == "TakeProfit" && atr.ExitPrice == 97, "it takes profit at 97");
+		CheckClose(atr.TakeProfit, 2.0 / 9, 1e-12, "a 1:1 bracket with break-even at 50% / 25% has the default's coin-flip odds");
+		Check(Of(Short(Atr(3, 3))) == "16/16/8/4/True", "the default Min stop of 16 ticks");
+		Check(Of(Short(Atr(3, 3, i => { i.MinStopTicks = 4; i.MaxStopTicks = 10; }))) == "10/10/5/3/True", "Max stop 10, the TP in proportion");
+		Check(Of(Short(Atr(4.5, 3, i => i.MinStopTicks = 4))) == "18/12/9/5/True", "a TP 1.5 times the stop");
+		Check(Of(Short(Atr(3, 3, i => { i.MinStopTicks = 4; i.BreakEvenTriggerPercent = 0; }))) == "12/12/0/0/False", "no break-even at 0%");
+
+		// stop 2 ticks over the signal bar's 101.25 high: 7 ticks; TP 1.5 times that, rounded up
+		var beyond = Short(i =>
+		{
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.BeyondSignalBar;
+			i.MinStopTicks = 1;
+		});
+		Check(Of(beyond) == "11/7/6/3/True" && beyond.StopLossPrice == 101.75m && beyond.TakeProfitPrice == 97.25m, $"beyond the signal bar: {Of(beyond)}");
+
+		// the panel names the bracket, the tooltip shows the trade's own ticks
+		var ind = RunHistorical(Market(), Atr(3, 3, i => i.MinStopTicks = 4));
+		ind.FirstVisibleBarNumber = 0;
+		ind.LastVisibleBarNumber = ind.Candles.Count - 1;
+		var chart = (FakeChart)ind.ChartInfo;
+		var context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Any(t => t.Contains("TP 3× ATR · SL 3× ATR · BE at 50% → 25% of TP")), "the panel names the ATR bracket");
+
+		var chip = context.Operations.First(o => o.Kind == "text" && o.Text == "TP +12t");
+		chart.MouseLocationInfo.LastPosition = new Point(chip.From.X + 2, chip.From.Y + 2);
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Contains("TP 97.00 (+12t)   SL 103.00 (-12t)") && context.Strings.Contains("Break-even: at +6t the stop moves to 99.25 (+3t)"),
+			"the tooltip shows the trade's own bracket");
+	}
+
+	private static void LimitEntries()
+	{
+		// a sweep of the flat highs at bar 15 (range 1.5): the short's limit sits 25% of that,
+		// rounded to 2 ticks, above the 100 close - 100.50 - and fills once price trades 100.75
+		List<IndicatorCandle> Market(params IndicatorCandle[] after)
+		{
+			var bars = Enumerable.Range(0, 15).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+			bars.Add(Bar(100, 101.25m, 99.75m, 100));
+			bars.AddRange(after);
+			return bars;
+		}
+
+		Action<FvgReactionLiquiditySweep> Limit(Action<FvgReactionLiquiditySweep> more = null) => i =>
+		{
+			i.Entry = FvgReactionLiquiditySweep.EntryRule.LimitPullback;
+			i.TakeProfitTicks = 8;
+			i.StopLossTicks = 8;
+			i.BreakEvenTriggerTicks = 0;
+			more?.Invoke(i);
+		};
+
+		TradeView Short(FvgReactionLiquiditySweep ind) => Trades(ind).Single(t => t.EntryBar == 15 && !t.IsLong);
+
+		var filled = Short(RunHistorical(Market(Bar(100, 100.75m, 99.75m, 100.25m), Bar(100.25m, 100.25m, 96, 96.5m), Bar(96.5m, 96.75m, 96.25m, 96.5m)), Limit()));
+		Check(filled.LimitEntry && filled.EntryPrice == 100.5m && filled.TakeProfitPrice == 98.5m && filled.StopLossPrice == 102.5m && filled.FillBar == 16
+			&& filled.Outcome == "TakeProfit" && filled.ExitBar == 17 && filled.ExitPrice == 98.5m,
+			$"filled at 100.50 on the pullback, TP two points lower: {filled.Outcome} fill {filled.FillBar} exit {filled.ExitBar}");
+
+		// a touch of the limit is no fill; after 3 bars the order is cancelled
+		var touchedInd = RunHistorical(Market(Bar(100, 100.5m, 99.75m, 100), Bar(100, 100.25m, 99.5m, 99.75m), Bar(99.75m, 100, 99.25m, 99.5m),
+			Bar(99.5m, 99.75m, 99, 99.25m)), Limit());
+		var touched = Short(touchedInd);
+		Check(touched.Outcome == "Missed" && touched.ExitBar == 18 && touched.FillBar == -1 && touched.ExitPrice == touched.EntryPrice,
+			$"touched but not traded through: no fill, cancelled on bar 18 ({touched.Outcome} {touched.ExitBar})");
+		Check((int)IndicatorType.GetField("_missed", Private).GetValue(touchedInd) == 1 && ModelResolved(touchedInd) == 0,
+			"an order that never filled is counted apart and teaches the model nothing");
+		Check(Short(RunHistorical(Market(Bar(100, 100.5m, 99.75m, 100), Bar(100, 100.25m, 99.5m, 99.75m)), Limit(i => i.LimitValidBars = 1))).ExitBar == 16,
+			"valid for one bar: cancelled after bar 16");
+
+		// a gap through the limit fills at the limit's own price
+		var gap = Short(RunHistorical(Market(Bar(101, 101.25m, 100.75m, 101), Bar(101, 101.25m, 100.75m, 101)), Limit()));
+		Check(gap.FillBar == 16 && gap.EntryPrice == 100.5m && gap.Outcome == "Open", "a gap open through the limit fills at 100.50");
+
+		// a stop beyond the signal bar is measured from the limit: 101.25 + 2 ticks - 100.50 = 5 ticks
+		var beyond = Short(RunHistorical(Market(Bar(100, 100.25m, 99.75m, 100)), Limit(i =>
+		{
+			i.Bracket = FvgReactionLiquiditySweep.BracketRule.BeyondSignalBar;
+			i.MinStopTicks = 1;
+		})));
+		Check(beyond.RiskTicks == 5 && beyond.StopLossPrice == 101.75m, "the signal-bar stop from the limit price");
+
+		// waiting: the limit's line and tag, a LIMIT badge, the panel line
+		var waiting = RunHistorical(Market(Bar(100, 100.25m, 99.75m, 100)), Limit());
+		waiting.FirstVisibleBarNumber = 0;
+		waiting.LastVisibleBarNumber = waiting.Candles.Count - 1;
+		var context = new RenderContext();
+		waiting.HarnessRender(context);
+		Check(context.Strings.Contains("LMT 100.50") && context.Strings.Contains("LIMIT")
+			&& context.Strings.Contains("Limit SHORT @ 100.50: waiting for a fill until bar 18")
+			&& context.Strings.Any(t => t.StartsWith("Open 1 · Expired 0 · No fill 0 · Hidden")), "a waiting limit order on the chart and in the panel");
+
+		// cancelled: a faint line where the order waited, no tag, a No fill chip whose tooltip says what happened
+		Check(!(bool)Get(TradesRaw(touchedInd).Single(), "Pending"), "a cancelled order no longer waits");
+		touchedInd.FirstVisibleBarNumber = 0;
+		touchedInd.LastVisibleBarNumber = touchedInd.Candles.Count - 1;
+		context = new RenderContext();
+		touchedInd.HarnessRender(context);
+		var chip = context.Operations.FirstOrDefault(o => o.Kind == "text" && o.Text == "No fill");
+		Check(chip != null && !context.Strings.Any(t => t.StartsWith("LMT ")), "an unfilled order leaves a No fill chip and no tag");
+
+		if (chip != null)
+		{
+			((FakeChart)touchedInd.ChartInfo).MouseLocationInfo.LastPosition = new Point(chip.From.X + 2, chip.From.Y + 2);
+			context = new RenderContext();
+			touchedInd.HarnessRender(context);
+			Check(context.Strings.Contains("Limit entry 25% of the signal bar back from its 100.00 close: not filled by bar 18")
+				&& context.Strings.Contains("No fill: price did not trade through the limit by bar 18"),
+				$"the tooltip of an unfilled order: {string.Join(" | ", context.Strings.Where(t => t.Contains("imit") || t.Contains("fill")))}");
+		}
+	}
+
 	private static void ScoreboardCounts()
 	{
 		// some trades run out of bars: expired ones are left out
@@ -1847,6 +2193,24 @@ internal static class Program
 		VerifyInvariants(ind, trades, market.Candles.Count);
 		VerifySignalsAgainstOracle(ind, market, trades, rich);
 
+		// the new filters still leave sweeps and gap reactions to compare
+		if (ind.SweepConfirmedSwings || ind.MinSweepAtr > 0)
+			Check(trades.Count(t => t.Trigger == "Sweep") > 10, "the filtered fuzz market still sweeps");
+
+		if (ind.MinFvgAtr > 0)
+			Check(trades.Count(t => t.Trigger == "Fvg" || t.Trigger == "SweepThenFvg") > 10, "the filtered fuzz market still reacts off gaps");
+
+		// the odds splits see more than one group each
+		if (ind.OddsByTime)
+			Check(trades.Select(t => t.TimeBucket).Distinct().Count() == 5, "signals at every time of day");
+
+		if (ind.OddsByVolatility)
+			Check(trades.Select(t => t.VolatilityBucket).Distinct().Count() == 3, "signals in quiet, normal and busy markets");
+
+		if (ind.MinExpectedTicks > 0)
+			Check(trades.Any(t => t.IsShown) && trades.Any(t => !t.IsShown && Math.Round(t.ExpectedTicks, MidpointRounding.AwayFromZero) < ind.MinExpectedTicks),
+				"the EV filter shows some signals and hides others");
+
 		var patterns = VerifyPatternsOnEveryBar(ind, market.Candles);
 
 		// with the default shapes the market has every pattern somewhere
@@ -1943,14 +2307,17 @@ internal static class Program
 
 		// alerts: every shown signal and result that happened after the history load, nothing else
 		var expectedSignals = liveTrades.Count(t => t.IsShown && t.EntryBar >= historyBars - 1);
-		var expectedResults = liveTrades.Count(t => t.IsShown && t.Outcome != "Open" && t.ExitBar >= historyBars);
+		var expectedResults = liveTrades.Count(t => t.IsShown && t.Outcome != "Open" && t.Outcome != "Missed" && t.ExitBar >= historyBars);
+		var expectedFills = liveTrades.Count(t => t.IsShown && t.LimitEntry && t.FillBar >= historyBars);
 		var expectedMoves = liveTrades.Count(t => t.IsShown && t.BreakEvenActive && t.BreakEvenBar >= historyBars);
-		var signalAlerts = live.Alerts.Count(a => a.StartsWith("BUY @") || a.StartsWith("SHORT @"));
+		var signalAlerts = live.Alerts.Count(a => a.StartsWith("BUY @") || a.StartsWith("SHORT @") || a.StartsWith("BUY limit @") || a.StartsWith("SHORT limit @"));
+		var fillAlerts = live.Alerts.Count(a => a.Contains(" limit filled @ "));
 		var moveAlerts = live.Alerts.Count(a => a.Contains("stop moved to"));
 		var resultAlerts = live.Alerts.Count(a => a.Contains(" from ") && !a.Contains("stop moved to"));
 		Check(signalAlerts == expectedSignals, $"signal alerts {signalAlerts}, expected {expectedSignals}");
 		Check(resultAlerts == expectedResults, $"result alerts {resultAlerts}, expected {expectedResults}");
 		Check(moveAlerts == expectedMoves, $"stop-moved alerts {moveAlerts}, expected {expectedMoves}");
+		Check(fillAlerts == expectedFills, $"limit-fill alerts {fillAlerts}, expected {expectedFills}");
 		Check(expectedSignals > 0 && expectedResults > 0 && expectedMoves > 0, "live part should contain signals, results and stop moves");
 	}
 
@@ -2376,6 +2743,10 @@ internal static class Program
 				case FvgReactionLiquiditySweep.SignalHoursRule.RegularHoursNoLunch:
 					return Regular(time) && (time < new TimeSpan(11, 30, 0) || time >= new TimeSpan(13, 30, 0));
 
+				case FvgReactionLiquiditySweep.SignalHoursRule.Custom:
+					var (start, end) = (_ind.CustomHoursStart, _ind.CustomHoursEnd);
+					return start == end || (start < end ? time >= start && time < end : time >= start || time < end);
+
 				default:
 					return Regular(time);
 			}
@@ -2465,6 +2836,7 @@ internal static class Program
 
 			OracleLevel low = null;
 			OracleLevel high = null;
+			var minDepth = (decimal)_ind.MinSweepAtr * OracleAtr(_candles, b - 1, _ind.AtrPeriod);
 
 			foreach (var level in Levels.Where(l => l.State == "Fresh" && l.From <= b).ToList())
 			{
@@ -2483,9 +2855,12 @@ internal static class Program
 				level.State = back ? "Swept" : "Broken";
 				level.End = b;
 
-				if (back && level.High)
+				// swept either way, but only a deep enough sweep gives a signal
+				var deep = (level.High ? c.High - level.Price : level.Price - c.Low) >= minDepth;
+
+				if (back && deep && level.High)
 					high = Better(high, level);
-				else if (back)
+				else if (back && deep)
 					low = Better(low, level);
 			}
 
@@ -2653,8 +3028,9 @@ internal static class Program
 		var lastHighSweep = -1;
 		var lastLong = -1;
 		var lastShort = -1;
-		var minGap = Math.Max(ind.MinFvgTicks, 1) * Tick;
 		var none = new List<string>();
+		var openHighs = new List<(int Bar, decimal Price)>();
+		var openLows = new List<(int Bar, decimal Price)>();
 		var sessions = new OracleSessions(ind, candles);
 		var peaks = new List<decimal>();
 		var keyMarkers = new Dictionary<int, (bool Low, bool High)>();
@@ -2739,6 +3115,7 @@ internal static class Program
 				continue;
 
 			var left = candles[b - 2];
+			var minGap = Math.Max(Math.Max(ind.MinFvgTicks, 1) * Tick, (decimal)ind.MinFvgAtr * OracleAtr(candles, b - 3, ind.AtrPeriod));
 
 			if (c.Low - left.High >= minGap)
 				zones.Add(new OracleZone { Start = b - 1, Confirmed = b, Top = c.Low, Bottom = left.High, Bull = true });
@@ -2746,11 +3123,46 @@ internal static class Program
 			if (left.Low - c.High >= minGap)
 				zones.Add(new OracleZone { Start = b - 1, Confirmed = b, Top = left.Low, Bottom = c.High, Bull = false });
 
-			var window = candles.Skip(b - ind.SwingLookback).Take(ind.SwingLookback).ToList();
-			var highest = window.Max(x => x.High);
-			var lowest = window.Min(x => x.Low);
-			var sweptHighs = c.High > highest && c.Close < highest;
-			var sweptLows = c.Low < lowest && c.Close > lowest;
+			// the level a sweep takes, and how far beyond it the wick has to reach
+			decimal? highLevel;
+			decimal? lowLevel;
+			var depth = (decimal)ind.MinSweepAtr * OracleAtr(candles, b - 1, ind.AtrPeriod);
+
+			if (ind.SweepConfirmedSwings)
+			{
+				// untouched swings of the lookback: the furthest one closed back inside of is swept
+				openHighs.RemoveAll(sw => b - sw.Bar > ind.SwingLookback);
+				openLows.RemoveAll(sw => b - sw.Bar > ind.SwingLookback);
+				highLevel = openHighs.Where(sw => c.High > sw.Price && c.Close < sw.Price).Select(sw => (decimal?)sw.Price).DefaultIfEmpty(null).Max();
+				lowLevel = openLows.Where(sw => c.Low < sw.Price && c.Close > sw.Price).Select(sw => (decimal?)sw.Price).DefaultIfEmpty(null).Min();
+				openHighs.RemoveAll(sw => c.High > sw.Price);
+				openLows.RemoveAll(sw => c.Low < sw.Price);
+
+				var pivot = b - 3;
+
+				if (pivot >= 3)
+				{
+					var top = candles[pivot].High;
+					var bottom = candles[pivot].Low;
+
+					if (Enumerable.Range(pivot - 3, 3).All(i => candles[i].High < top) && Enumerable.Range(pivot + 1, 3).All(i => candles[i].High <= top))
+						openHighs.Add((pivot, top));
+
+					if (Enumerable.Range(pivot - 3, 3).All(i => candles[i].Low > bottom) && Enumerable.Range(pivot + 1, 3).All(i => candles[i].Low >= bottom))
+						openLows.Add((pivot, bottom));
+				}
+			}
+			else
+			{
+				var window = candles.Skip(b - ind.SwingLookback).Take(ind.SwingLookback).ToList();
+				var highest = window.Max(x => x.High);
+				var lowest = window.Min(x => x.Low);
+				highLevel = c.High > highest && c.Close < highest ? highest : null;
+				lowLevel = c.Low < lowest && c.Close > lowest ? lowest : null;
+			}
+
+			var sweptHighs = highLevel != null && c.High - highLevel.Value >= depth;
+			var sweptLows = lowLevel != null && lowLevel.Value - c.Low >= depth;
 
 			// a gap reacts to a pattern that includes a candle that traded into it; price comes
 			// down into a bullish gap and up into a bearish one
@@ -2888,8 +3300,12 @@ internal static class Program
 					continue;
 
 				var confirmations = (withTrend ? 1 : 0) + (delta ? 1 : 0) + (fillOk ? 1 : 0) + (patterns.Count > 0 ? 1 : 0);
-				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{withTrend}|{delta}|{fillOk}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}"
-					+ $"|{(swept == null ? "" : $"{swept.Kind}@{swept.Price}@{swept.End}")}");
+				var entry = ind.Entry == FvgReactionLiquiditySweep.EntryRule.LimitPullback
+					? c.Close - (isLong ? 1 : -1) * Math.Round((c.High - c.Low) * ind.PullbackPercent / 100m / Tick, MidpointRounding.AwayFromZero) * Tick
+					: c.Close;
+				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{entry}|{withTrend}|{delta}|{fillOk}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}"
+					+ $"|{(swept == null ? "" : $"{swept.Kind}@{swept.Price}@{swept.End}")}|{OracleBracket(ind, candles, b, isLong, entry)}"
+					+ $"|{OracleTimeBucket(ind, c.Time)}|{OracleVolatility(ind, candles, b)}");
 
 				if (isLong)
 					lastLong = b;
@@ -2901,7 +3317,7 @@ internal static class Program
 		var actual = trades
 			.OrderBy(t => t.EntryBar).ThenBy(t => !t.IsLong)
 			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.WithTrend}|{t.DeltaConfirms}|{t.FillConfirms}|{string.Join(",", t.CandlePatterns)}"
-				+ $"|{t.SweptLevel}")
+				+ $"|{t.SweptLevel}|{t.TargetTicks}/{t.RiskTicks}/{t.TriggerTicks}/{t.LockedTicks}/{t.HasBreakEven}|{t.TimeBucket}|{t.VolatilityBucket}")
 			.ToList();
 
 		var firstDiff = Enumerable.Range(0, Math.Min(actual.Count, expected.Count)).FirstOrDefault(i => actual[i] != expected[i]);
@@ -2914,7 +3330,7 @@ internal static class Program
 
 		var keyLevelsOn = ind.LevelPriorDay || ind.LevelOvernight || ind.LevelOpeningRange || ind.LevelEqual;
 
-		if (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.AnyTrigger)
+		if (rich && ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.AnyTrigger)
 		{
 			var triggers = keyLevelsOn ? new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg", "KeySweep", "KeySweepThenFvg" } : new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg" };
 			var missingTriggers = triggers.Where(k => !trades.Any(t => t.Trigger == k)).ToList();
@@ -2985,6 +3401,82 @@ internal static class Program
 		}
 
 		Check(wrong == 0, $"{wrong} trigger series values differ from the oracle");
+	}
+
+	// first 30 minutes of regular hours, morning, midday, afternoon, outside regular hours
+	private static int OracleTimeBucket(FvgReactionLiquiditySweep ind, DateTime time)
+	{
+		var t = OracleSessions.NewYorkTime(time).TimeOfDay;
+
+		if (t < ind.RegularHoursStart || t >= ind.RegularHoursEnd)
+			return 4;
+
+		var minutes = (t - ind.RegularHoursStart).TotalMinutes;
+		return minutes < 30 ? 0 : minutes < 120 ? 1 : minutes < 270 ? 2 : 3;
+	}
+
+	// quiet, normal or busy: the ATR before the bar against ten times as many bars
+	private static int OracleVolatility(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, int b)
+	{
+		var longer = OracleAtr(candles, b - 1, ind.AtrPeriod * 10);
+
+		if (longer <= 0)
+			return 1;
+
+		var ratio = OracleAtr(candles, b - 1, ind.AtrPeriod) / longer;
+		return ratio < 0.8m ? 0 : ratio > 1.25m ? 2 : 1;
+	}
+
+	// the bracket a signal on bar b entered at `entry` should get: TP / SL / trigger / locked ticks, break-even
+	private static string OracleBracket(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, int b, bool isLong, decimal entry)
+	{
+		if (ind.Bracket == FvgReactionLiquiditySweep.BracketRule.FixedTicks)
+		{
+			var on = ind.BreakEvenTriggerTicks > 0 && ind.BreakEvenTriggerTicks < ind.TakeProfitTicks;
+			var stop = Math.Min(ind.BreakEvenStopTicks, Math.Max(0, ind.BreakEvenTriggerTicks - 1));
+			return $"{ind.TakeProfitTicks}/{ind.StopLossTicks}/{ind.BreakEvenTriggerTicks}/{stop}/{on}";
+		}
+
+		decimal raw;
+		double ratio;
+
+		if (ind.Bracket == FvgReactionLiquiditySweep.BracketRule.AtrMultiple)
+		{
+			raw = (decimal)ind.StopLossAtr * OracleAtr(candles, b - 1, ind.AtrPeriod) / Tick;
+			ratio = ind.TakeProfitAtr / ind.StopLossAtr;
+		}
+		else
+		{
+			var extreme = isLong ? candles[b].Low - ind.StopBufferTicks * Tick : candles[b].High + ind.StopBufferTicks * Tick;
+			raw = Math.Abs(entry - extreme) / Tick * (isLong == entry > extreme ? 1 : -1);
+			ratio = ind.RewardRisk;
+		}
+
+		int Round(decimal x) => (int)Math.Round(x, MidpointRounding.AwayFromZero);
+		var risk = Math.Max(ind.MinStopTicks, Math.Min(Math.Max(ind.MinStopTicks, ind.MaxStopTicks), Round(raw)));
+		var target = Math.Max(1, Round(risk * (decimal)ratio));
+		var trigger = Round(target * ind.BreakEvenTriggerPercent / 100m);
+		var breakEven = ind.BreakEvenTriggerPercent > 0 && trigger > 0 && trigger < target;
+		var locked = Math.Max(0, Math.Min(Round(target * ind.BreakEvenStopPercent / 100m), trigger - 1));
+		return breakEven ? $"{target}/{risk}/{trigger}/{locked}/True" : $"{target}/{risk}/0/0/False";
+	}
+
+	// average true range of the `period` bars up to endBar (fewer at the start), summed from scratch
+	private static decimal OracleAtr(List<IndicatorCandle> candles, int endBar, int period)
+	{
+		if (endBar < 0)
+			return 0;
+
+		var from = Math.Max(0, endBar - period + 1);
+		var sum = 0m;
+
+		for (var i = from; i <= endBar; i++)
+		{
+			var c = candles[i];
+			sum += i == 0 ? c.High - c.Low : Math.Max(c.High, candles[i - 1].Close) - Math.Min(c.Low, candles[i - 1].Close);
+		}
+
+		return sum / (endBar - from + 1);
 	}
 
 	// a big fill of resting bids (buys) or offers (shorts) near that end of the signal bar or the bar before
@@ -3190,15 +3682,15 @@ internal static class Program
 		{
 			var expected = Oracle(ind, market, t, last, liveFromBar);
 			var ok = expected.Outcome == t.Outcome && expected.ExitBar == t.ExitBar && expected.BreakEvenBar == t.BreakEvenBar
-				&& (t.Outcome == "Open" || expected.Exit == t.ExitPrice);
+				&& (t.Outcome == "Open" || expected.Exit == t.ExitPrice) && expected.FillBar == t.FillBar;
 
 			if (ok)
 				continue;
 
 			if (mismatches++ < 5)
 			{
-				Failures.Add($"trade @{t.EntryBar} {(t.IsLong ? "L" : "S")}: indicator {t.Outcome}/{t.ExitBar}/BE {t.BreakEvenBar}/{t.ExitPrice}, "
-					+ $"oracle {expected.Outcome}/{expected.ExitBar}/BE {expected.BreakEvenBar}/{expected.Exit}");
+				Failures.Add($"trade @{t.EntryBar} {(t.IsLong ? "L" : "S")}: indicator {t.Outcome}/{t.ExitBar}/BE {t.BreakEvenBar}/{t.ExitPrice}/fill {t.FillBar}, "
+					+ $"oracle {expected.Outcome}/{expected.ExitBar}/BE {expected.BreakEvenBar}/{expected.Exit}/fill {expected.FillBar}");
 			}
 		}
 
@@ -3206,18 +3698,27 @@ internal static class Program
 		Check(!ind.ExpireAtSessionEnd || trades.All(t => !market.SessionStarts.Contains(t.EntryBar + 1)), "trade opened on a session's last bar");
 	}
 
-	// independent re-implementation of how a trade should settle, break-even included
-	private static (string Outcome, int ExitBar, int BreakEvenBar, decimal Exit) Oracle(FvgReactionLiquiditySweep ind, Market market, TradeView t,
-		int lastBar, int liveFromBar)
+	// independent re-implementation of how a trade should settle: a limit order's fill, then the
+	// trade, break-even included
+	private static (string Outcome, int ExitBar, int BreakEvenBar, decimal Exit, int FillBar) Oracle(FvgReactionLiquiditySweep ind, Market market,
+		TradeView t, int lastBar, int liveFromBar)
 	{
 		var active = false;
 		var movedAt = -1;
+		var waiting = t.LimitEntry;
+		var filledAt = waiting ? -1 : t.EntryBar;
 
 		for (var b = t.EntryBar + 1; b <= lastBar; b++)
 		{
 			var step = b >= liveFromBar
-				? OracleWalk(t, market.Paths[b], active)
-				: OracleBar(t, market.Candles[b], active, ind.SameBarRule);
+				? OracleWalk(t, market.Paths[b], active, waiting)
+				: OracleBar(t, market.Candles[b], active, waiting, ind.SameBarRule);
+
+			if (waiting && step.Filled)
+			{
+				waiting = false;
+				filledAt = b;
+			}
 
 			if (step.Active && !active)
 				movedAt = b;
@@ -3225,29 +3726,38 @@ internal static class Program
 			active = step.Active;
 
 			if (step.Outcome != "Open")
-				return (step.Outcome, b, movedAt, step.Exit);
+				return (step.Outcome, b, movedAt, step.Exit, filledAt);
 
 			if (b == lastBar)
 				break; // still forming - no end-of-bar expiry yet
 
-			if (ind.MaxBarsInTrade > 0 && b - t.EntryBar >= ind.MaxBarsInTrade)
-				return ("Expired", b, movedAt, market.Candles[b].Close);
+			// an unfilled limit order is cancelled after its bars, or when the session ends
+			if (waiting)
+			{
+				if (b >= t.EntryBar + ind.LimitValidBars || (ind.ExpireAtSessionEnd && market.SessionStarts.Contains(b + 1)))
+					return ("Missed", b, movedAt, t.EntryPrice, -1);
+
+				continue;
+			}
+
+			if (ind.MaxBarsInTrade > 0 && b - filledAt >= ind.MaxBarsInTrade)
+				return ("Expired", b, movedAt, market.Candles[b].Close, filledAt);
 
 			if (ind.ExpireAtSessionEnd && market.SessionStarts.Contains(b + 1))
-				return ("Expired", b, movedAt, market.Candles[b].Close);
+				return ("Expired", b, movedAt, market.Candles[b].Close, filledAt);
 		}
 
-		return ("Open", -1, movedAt, 0);
+		return ("Open", -1, movedAt, 0, filledAt);
 	}
 
 	// one historical bar: open, both extremes in the order the rule picks, close
-	private static (string Outcome, bool Active, decimal Exit) OracleBar(TradeView t, IndicatorCandle c, bool active,
+	private static (string Outcome, bool Active, decimal Exit, bool Filled) OracleBar(TradeView t, IndicatorCandle c, bool active, bool waiting,
 		FvgReactionLiquiditySweep.SameBarHitRule rule)
 	{
-		var lowFirst = OracleWalk(t, new List<decimal> { c.Open, c.Low, c.High, c.Close }, active);
-		var highFirst = OracleWalk(t, new List<decimal> { c.Open, c.High, c.Low, c.Close }, active);
+		var lowFirst = OracleWalk(t, new List<decimal> { c.Open, c.Low, c.High, c.Close }, active, waiting);
+		var highFirst = OracleWalk(t, new List<decimal> { c.Open, c.High, c.Low, c.Close }, active, waiting);
 
-		if (lowFirst.Outcome == highFirst.Outcome && lowFirst.Active == highFirst.Active)
+		if (lowFirst.Outcome == highFirst.Outcome && lowFirst.Active == highFirst.Active && lowFirst.Filled == highFirst.Filled)
 			return lowFirst;
 
 		if (rule == FvgReactionLiquiditySweep.SameBarHitRule.CandleDirection)
@@ -3256,68 +3766,97 @@ internal static class Program
 		if (rule == FvgReactionLiquiditySweep.SameBarHitRule.NearestExtremeFirst && c.High - c.Open != c.Open - c.Low)
 			return c.High - c.Open < c.Open - c.Low ? highFirst : lowFirst;
 
-		int Score((string Outcome, bool Active, decimal Exit) r) =>
+		int Score((string Outcome, bool Active, decimal Exit, bool Filled) r) =>
 			r.Outcome == "StopLoss" ? 0 : r.Outcome == "BreakEven" ? 2 : r.Outcome == "TakeProfit" ? 4 : r.Active ? 3 : 1;
 
 		return Score(lowFirst) <= Score(highFirst) ? lowFirst : highFirst;
 	}
 
-	// price by price: TP, then the break-even trigger, then whichever stop applies
-	private static (string Outcome, bool Active, decimal Exit) OracleWalk(TradeView t, List<decimal> prices, bool active)
+	// price by price: a waiting limit order fills where price first trades a tick through it, at
+	// its price; then TP, the break-even trigger and whichever stop applies
+	private static (string Outcome, bool Active, decimal Exit, bool Filled) OracleWalk(TradeView t, List<decimal> prices, bool active, bool waiting)
 	{
+		if (waiting)
+		{
+			var through = t.IsLong ? t.EntryPrice - Tick : t.EntryPrice + Tick;
+			var at = prices.FindIndex(p => t.IsLong ? p <= through : p >= through);
+
+			if (at < 0)
+				return ("Open", false, 0, false);
+
+			var after = OracleWalk(t, new[] { t.EntryPrice }.Concat(prices.Skip(at)).ToList(), false, false);
+			return (after.Outcome, after.Active, after.Exit, true);
+		}
+
 		foreach (var price in prices)
 		{
 			var inFavour = t.IsLong ? price - t.EntryPrice : t.EntryPrice - price;
 			var reachedTrigger = t.HasBreakEven && inFavour >= Math.Abs(t.TriggerPrice - t.EntryPrice);
 
 			if (inFavour >= Math.Abs(t.TakeProfitPrice - t.EntryPrice))
-				return ("TakeProfit", active || reachedTrigger, t.TakeProfitPrice);
+				return ("TakeProfit", active || reachedTrigger, t.TakeProfitPrice, true);
 
 			active |= reachedTrigger;
 
 			var stop = active ? t.BreakEvenPrice : t.StopLossPrice;
 
 			if (t.IsLong ? price <= stop : price >= stop)
-				return (active ? "BreakEven" : "StopLoss", active, stop);
+				return (active ? "BreakEven" : "StopLoss", active, stop, true);
 		}
 
-		return ("Open", active, 0);
+		return ("Open", active, 0, true);
 	}
 
 	private static void VerifyInvariants(FvgReactionLiquiditySweep ind, List<TradeView> trades, int barCount)
 	{
 		// 1) walk-forward: each estimate uses exactly the trades settled by its signal bar
 		var lookAhead = 0;
-		var prior = PriorOf(ind);
-		double beTicks = ind.BreakEvenTriggerTicks > 0 && ind.BreakEvenTriggerTicks < ind.TakeProfitTicks
-			? Math.Min(ind.BreakEvenStopTicks, ind.BreakEvenTriggerTicks - 1)
-			: 0;
 
 		foreach (var t in trades)
 		{
+			var prior = PriorOf(t);
+			double beTicks = t.HasBreakEven ? t.LockedTicks : 0;
+
 			var settled = trades.Where(o => o.IsLong == t.IsLong && o.ExitBar >= 0 && o.ExitBar <= t.EntryBar
 				&& (o.Outcome == "TakeProfit" || o.Outcome == "BreakEven" || o.Outcome == "StopLoss")).ToList();
-			var sameTrigger = settled.Where(o => o.Trigger == t.Trigger).ToList();
-			var sameSetup = sameTrigger.Where(o => o.Confirmations == t.Confirmations).ToList();
+			// the groups the odds should come from, broadest first
+			var groups = new List<List<TradeView>> { settled };
+			var group = settled.Where(o => o.Trigger == t.Trigger).ToList();
+			groups.Add(group);
 
-			bool Matches(List<TradeView> group, (int Wins, int BreakEvens, int Count) tally) =>
-				tally.Count == group.Count && tally.Wins == group.Count(o => o.Outcome == "TakeProfit")
-				&& tally.BreakEvens == group.Count(o => o.Outcome == "BreakEven");
+			void Split(bool on, Func<TradeView, bool> same)
+			{
+				if (!on)
+					return;
 
-			var ok = Matches(settled, t.Direction) && Matches(sameTrigger, t.TriggerTally) && Matches(sameSetup, t.Setup);
+				group = group.Where(same).ToList();
+				groups.Add(group);
+			}
+
+			Split(ind.OddsByTime, o => o.TimeBucket == t.TimeBucket);
+			Split(ind.OddsByVolatility, o => o.VolatilityBucket == t.VolatilityBucket);
+			Split(ind.OddsByTrend, o => o.WithTrend == t.WithTrend);
+			Split(ind.OddsByConfirmations, o => o.Confirmations == t.Confirmations);
+
+			bool Matches(List<TradeView> members, (int Wins, int BreakEvens, int Count) tally) =>
+				tally.Count == members.Count && tally.Wins == members.Count(o => o.Outcome == "TakeProfit")
+				&& tally.BreakEvens == members.Count(o => o.Outcome == "BreakEven");
+
+			var ok = groups.Count == t.Levels.Count && groups.Zip(t.Levels, Matches).All(x => x)
+				&& t.Direction == t.Levels[0] && t.Setup == t.Levels[t.Levels.Count - 1];
 
 			double k = ind.ProbabilitySmoothing;
 			var p = prior;
 
-			foreach (var tally in new[] { t.Direction, t.TriggerTally, t.Setup })
+			foreach (var tally in t.Levels)
 			{
 				double n = tally.Count + k;
 				p = ((tally.Wins + k * p.Tp) / n, (tally.BreakEvens + k * p.Be) / n, (tally.Count - tally.Wins - tally.BreakEvens + k * p.Sl) / n);
 			}
 
-			var ev = p.Tp * ind.TakeProfitTicks + p.Be * beTicks - p.Sl * ind.StopLossTicks;
+			var ev = p.Tp * t.TargetTicks + p.Be * beTicks - p.Sl * t.RiskTicks;
 			ok &= Math.Abs(p.Tp - t.TakeProfit) < 1e-12 && Math.Abs(p.Be - t.BreakEven) < 1e-12 && Math.Abs(ev - t.ExpectedTicks) < 1e-9;
-			ok &= t.TakeProfit > 0 && t.StopLoss > 0 && (beTicks > 0 || t.HasBreakEven || t.BreakEven == 0);
+			ok &= t.TakeProfit > 0 && t.StopLoss > 0 && (t.HasBreakEven || t.BreakEven == 0);
 
 			if (!ok && lookAhead++ < 3)
 				Failures.Add($"estimate of trade @{t.EntryBar} does not match the trades settled before it");
@@ -3372,6 +3911,9 @@ internal static class Program
 		Check(PanelInt("_shortWins") == shownTrades.Count(t => !t.IsLong && t.Outcome == "TakeProfit"), "short wins");
 		Check(PanelInt("_shortLosses") == shownTrades.Count(t => !t.IsLong && t.Outcome == "StopLoss"), "short losses");
 		Check(PanelInt("_expired") == shownTrades.Count(t => t.Outcome == "Expired"), "expired");
+		Check(PanelInt("_missed") == shownTrades.Count(t => t.Outcome == "Missed"), "limit orders not filled");
+		Check(trades.All(t => t.LimitEntry ? t.ExpiryBar == t.EntryBar + ind.LimitValidBars && (t.Outcome == "Missed") == (t.FillBar < 0 && t.Outcome != "Open")
+			: t.FillBar == t.EntryBar), "fill and expiry bars");
 		Check(PanelInt("_filtered") == trades.Count(t => !t.IsShown), "filtered");
 		var settledAll = trades.Where(t => t.Outcome == "TakeProfit" || t.Outcome == "BreakEven" || t.Outcome == "StopLoss").ToList();
 		Check(ModelResolved(ind) == settledAll.Count, "model sample size");
@@ -3390,9 +3932,15 @@ internal static class Program
 		var expectedNet = shownTrades.Where(t => t.Outcome != "Open")
 			.Sum(t => (t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1));
 		Check(net == expectedNet, $"net ticks {net} vs {expectedNet}");
-		Check(trades.Where(t => t.Outcome == "TakeProfit").All(t => Realised(t) == ind.TakeProfitTicks), "a TP is worth exactly +TP ticks");
-		Check(trades.Where(t => t.Outcome == "BreakEven").All(t => Realised(t) == (decimal)beTicks), "a break-even exit is worth exactly the offset");
-		Check(trades.Where(t => t.Outcome == "StopLoss").All(t => Realised(t) == -ind.StopLossTicks), "an SL is worth exactly -SL ticks");
+		Check(trades.Where(t => t.Outcome == "TakeProfit").All(t => Realised(t) == t.TargetTicks), "a TP is worth exactly its +TP ticks");
+		Check(trades.Where(t => t.Outcome == "BreakEven").All(t => Realised(t) == t.LockedTicks), "a break-even exit is worth exactly the offset");
+		Check(trades.Where(t => t.Outcome == "StopLoss").All(t => Realised(t) == -t.RiskTicks), "an SL is worth exactly its -SL ticks");
+
+		// the prices sit exactly the trade's distances from the entry
+		bool On(decimal price, decimal entry, int ticks, bool isLong) => price == entry + (isLong ? 1 : -1) * ticks * Tick;
+		Check(trades.All(t => On(t.TakeProfitPrice, t.EntryPrice, t.TargetTicks, t.IsLong) && On(t.StopLossPrice, t.EntryPrice, -t.RiskTicks, t.IsLong)
+			&& (!t.HasBreakEven || (On(t.TriggerPrice, t.EntryPrice, t.TriggerTicks, t.IsLong) && On(t.BreakEvenPrice, t.EntryPrice, t.LockedTicks, t.IsLong)
+				&& t.LockedTicks < t.TriggerTicks && t.TriggerTicks < t.TargetTicks))), "the levels sit the bracket's distances from the entry");
 	}
 
 	// A made-up order book around the streamed price: eight levels each side at random sizes,
@@ -3819,6 +4367,16 @@ internal static class Program
 		public int BreakEvenBar;
 		public decimal TriggerPrice;
 		public decimal BreakEvenPrice;
+		public int TargetTicks;
+		public int RiskTicks;
+		public int TriggerTicks;
+		public int LockedTicks;
+		public bool LimitEntry;
+		public int FillBar;
+		public int ExpiryBar;
+		public int TimeBucket;
+		public int VolatilityBucket;
+		public List<(int Wins, int BreakEvens, int Count)> Levels;
 		public bool WithTrend;
 		public bool DeltaConfirms;
 		public bool FillConfirms;
@@ -4053,6 +4611,18 @@ internal static class Program
 				BreakEvenBar = (int)Get(t, "BreakEvenBar"),
 				TriggerPrice = (decimal)Get(t, "TriggerPrice"),
 				BreakEvenPrice = (decimal)Get(t, "BreakEvenPrice"),
+				TargetTicks = (int)Get(t, "TargetTicks"),
+				RiskTicks = (int)Get(t, "RiskTicks"),
+				TriggerTicks = (int)Get(t, "TriggerTicks"),
+				LockedTicks = (int)Get(t, "LockedTicks"),
+				LimitEntry = (bool)Get(t, "LimitEntry"),
+				FillBar = (int)Get(t, "FillBar"),
+				ExpiryBar = (int)Get(t, "ExpiryBar"),
+				TimeBucket = (int)Get(t, "TimeBucket"),
+				VolatilityBucket = (int)Get(t, "VolatilityBucket"),
+				Levels = ((Array)estimate.GetType().GetProperty("Levels").GetValue(estimate)).Cast<object>()
+					.Select(l => ((int)l.GetType().GetProperty("Wins").GetValue(l), (int)l.GetType().GetProperty("BreakEvens").GetValue(l),
+						(int)l.GetType().GetProperty("Count").GetValue(l))).ToList(),
 				WithTrend = (bool)Get(t, "WithTrend"),
 				DeltaConfirms = (bool)Get(t, "DeltaConfirms"),
 				FillConfirms = (bool)Get(t, "FillConfirms"),
@@ -4209,6 +4779,11 @@ internal static class Program
 		return names;
 	}
 
+	private static List<object> TradesRaw(FvgReactionLiquiditySweep ind)
+	{
+		return ((IList)IndicatorType.GetField("_trades", Private).GetValue(ind)).Cast<object>().ToList();
+	}
+
 	private static string SignalKey(TradeView t)
 	{
 		return $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}";
@@ -4220,16 +4795,16 @@ internal static class Program
 	}
 
 	// driftless random-walk odds, derived independently of the indicator
-	private static (double Tp, double Be, double Sl) PriorOf(FvgReactionLiquiditySweep ind)
+	private static (double Tp, double Be, double Sl) PriorOf(TradeView t)
 	{
-		double tp = ind.TakeProfitTicks;
-		double sl = ind.StopLossTicks;
+		double tp = t.TargetTicks;
+		double sl = t.RiskTicks;
 
-		if (ind.BreakEvenTriggerTicks <= 0 || ind.BreakEvenTriggerTicks >= ind.TakeProfitTicks)
+		if (!t.HasBreakEven)
 			return (sl / (tp + sl), 0, tp / (tp + sl));
 
-		double trigger = ind.BreakEvenTriggerTicks;
-		double stop = Math.Min(ind.BreakEvenStopTicks, ind.BreakEvenTriggerTicks - 1);
+		double trigger = t.TriggerTicks;
+		double stop = t.LockedTicks;
 		var reach = sl / (trigger + sl);
 		var after = (trigger - stop) / (tp - stop);
 		return (reach * after, reach * (1 - after), 1 - reach);
@@ -4264,6 +4839,10 @@ internal static class Program
 		Set(trade, "TriggerPrice", 100m + direction * 10);
 		Set(trade, "BreakEvenPrice", 100m + direction * 5);
 		Set(trade, "BreakEvenActive", active);
+		Set(trade, "TargetTicks", 80);
+		Set(trade, "RiskTicks", 80);
+		Set(trade, "TriggerTicks", 40);
+		Set(trade, "LockedTicks", 20);
 		return trade;
 	}
 
@@ -4279,9 +4858,14 @@ internal static class Program
 
 	private static void SetEstimate(object trade, double tp, double be, double sl)
 	{
-		var counter = Activator.CreateInstance(IndicatorType.GetNestedType("OutcomeCounter", BindingFlags.NonPublic));
+		var counterType = IndicatorType.GetNestedType("OutcomeCounter", BindingFlags.NonPublic);
+		var levels = Array.CreateInstance(counterType, 3);
+
+		for (var i = 0; i < 3; i++)
+			levels.SetValue(Activator.CreateInstance(counterType), i);
+
 		var estimateType = IndicatorType.GetNestedType("ProbabilityEstimate", BindingFlags.NonPublic);
-		Set(trade, "Estimate", Activator.CreateInstance(estimateType, Odds(tp, be, sl), 0.0, counter, counter, counter));
+		Set(trade, "Estimate", Activator.CreateInstance(estimateType, Odds(tp, be, sl), 0.0, levels));
 	}
 
 	// a whole historical bar, as the indicator sees it the first time

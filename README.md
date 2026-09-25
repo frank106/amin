@@ -16,7 +16,9 @@ A custom indicator for the [ATAS](https://atas.net) platform that:
 7. turns reactions and liquidity sweeps into **BUY / SHORT signals with the odds of each way the
    trade can end**: the take profit (80 ticks), the break-even stop (the stop moves to +20 ticks
    once the trade is 40 ticks in profit) or the stop loss (80 ticks). By default they only fire
-   during regular hours, 09:30–16:00 New York time;
+   during regular hours, 09:30–16:00 New York time. The bracket can instead follow the market (a
+   multiple of the ATR, or the stop just beyond the signal bar), and the entry can be a limit order
+   on a pullback;
 8. keeps a **scoreboard** of how each setup and each candlestick pattern has done on your chart,
    and checks whether the odds it showed held up.
 
@@ -50,7 +52,9 @@ Gaps that are no longer watched can also be kept as faint boxes (*Show used / fi
 
 A gap is the classic three-candle imbalance: a **bullish** gap when the third candle's low is
 above the first candle's high, a **bearish** one when the third candle's high is below the first
-candle's low, by at least *Min FVG Size* ticks (4).
+candle's low, by at least *Min FVG Size* ticks (4). *Min FVG size (× ATR)* can also ask for a
+share of the average true range of the bars before the gap, so small gaps in a busy market don't
+count (off by default).
 
 A gap is watched from the candle after the one that completes it, until one of these happens,
 and then it is never used again:
@@ -207,6 +211,18 @@ What Level 2 can and can't do inside an indicator:
 A sweep is a bar that wicks beyond the high / low of the last *Swing Lookback* bars (10) and closes
 back inside: a stop run. A dotted line joins the swing it took to the sweep bar.
 
+Two filters keep only the clearer stop runs. Both are off by default:
+
+* **Min sweep depth** (× ATR): the wick has to reach this many average true ranges beyond the
+  high / low. A poke of a tick or two takes few stops. The ATR is the average range of the
+  *Volatility (ATR) period* bars (20) before the sweep bar, so the depth follows the market. A
+  key level taken by a shallower wick still ends as swept, but gives no signal.
+* **Sweep confirmed swings only**: the bar has to take out a swing high / low of the lookback
+  (higher / lower than the 3 bars on each side) that nothing has traded beyond since. When it
+  takes several, the line goes to the furthest one. A swing counts once: after a bar has traded
+  beyond it, it is gone. Without this filter, any bar that wicks beyond the lookback's high / low
+  counts, even when that was the last bar's.
+
 ## Key levels
 
 Some highs and lows are watched by everyone, so stops pile up just beyond them. The indicator
@@ -265,11 +281,35 @@ Each signal counts up to four confirmations, and any of them can be made mandato
 * **candlestick pattern**: FVG and fill reactions always have one; a sweep counts it when the
   sweep bar completes a pattern pointing its way.
 
-Entry is the signal bar's close; TP and SL are *Take profit* / *Stop loss* ticks away. With the
-default 80 / 80 on NQ that is 20 points each way ($400 per NQ contract, $40 per MNQ). Once the
-trade is *Break-even trigger* ticks in profit (40), its stop moves to *Break-even stop* ticks in
-profit (+20), so from then on it ends at +80 or +20. Set the trigger to 0 to trade the plain
-80 / 80 bracket.
+### Entry, take profit and stop loss
+
+By default the entry is the signal bar's close, and TP and SL are *Take profit* / *Stop loss*
+ticks away. With the default 80 / 80 on NQ that is 20 points each way ($400 per NQ contract, $40
+per MNQ). Once the trade is *Break-even trigger* ticks in profit (40), its stop moves to
+*Break-even stop* ticks in profit (+20), so from then on it ends at +80 or +20. Set the trigger
+to 0 to trade the plain 80 / 80 bracket.
+
+*Bracket size* can make the bracket follow the market instead:
+
+* **Multiples of the ATR**: the stop is *Stop loss (× ATR)* (3) average true ranges of the
+  *Volatility (ATR) period* bars (20) before the signal, and the take profit *Take profit (× ATR)*
+  (3). A busy market gets a wider bracket, a quiet one a tighter one.
+* **Stop beyond the signal bar**: the stop sits *Stop buffer* ticks (2) beyond the signal bar's low
+  (buys) or high (shorts), where the setup is proven wrong, and the take profit is *Take profit
+  (× the stop)* (1.5) times as far.
+
+Either way the stop is kept between *Min stop* (16) and *Max stop* (200) ticks, and the take
+profit keeps its ratio to it. The break-even step is then a share of the take profit: the stop
+moves once the trade is *Break-even trigger (% of TP)* (50%) of the way there, to *Break-even stop
+(% of TP)* (25%) in profit. Each card, chip and tooltip shows the trade's own distances.
+
+*Entry* can also be a **limit order on a pullback**: *Pullback* (25%) of the signal bar's range
+back from its close (below it for a buy, above it for a short). The order waits *Limit order
+valid* bars (3). It fills once price trades a tick through it, at the limit price, and the
+bracket then counts from there. A dashed line with an `LMT` price tag marks it while it waits.
+An order that doesn't fill is cancelled: its chip says *No fill*, the panel counts it, and it is
+left out of the results and the odds. A waiting order counts as the open trade for *One trade at
+a time*.
 
 ### Signal hours
 
@@ -281,7 +321,9 @@ other choices:
 
 * **All hours**: signals around the clock, as before;
 * **First two hours of regular hours**: 09:30–11:30, usually the busiest stretch;
-* **Regular hours, not 11:30 – 13:30**: skips the lunch lull.
+* **Regular hours, not 11:30 – 13:30**: skips the lunch lull;
+* **Custom window**: from *Custom window start* to *Custom window end*, e.g. 09:30–10:30. A
+  window that ends before it starts runs over midnight; the same start and end means all day.
 
 The panel shows which one is on, with the New York time of the last bar to check it against.
 
@@ -292,16 +334,26 @@ or at the SL. When a new signal fires, its odds are the shares of **earlier, alr
 signals of the same kind that ended each way. So the numbers on an old signal are exactly what
 the indicator would have shown live (no look-ahead).
 
-"The same kind" is layered: same direction → same trigger → same number of confirmations. A
-narrow group with only a few past trades is blended with its broader parent group
-(`p = (count + k·p_parent) / (trades + k)` for each ending, *k* = *Probability smoothing*). The
-starting point is the odds of a coin-flip market. For 80 / 80 with the stop moving to +20 at +40
-that is **TP 22%, BE 45%, SL 33%**, worth 0 ticks on average (without break-even: 50 / 50). A
-fresh chart shows those numbers everywhere, and they only move as real outcomes accumulate. Load
-more history for more reliable estimates.
+"The same kind" is layered: same direction → same trigger → then each split that is switched on,
+nested in the one before:
 
-**EV** (expected value) combines the three: `TP% × 80 + BE% × 20 − SL% × 80` ticks. A positive EV
-means that kind of signal has paid on this chart so far.
+* *Odds by time of day* (off): the first 30 minutes of regular hours, the rest of the morning
+  (to 11:30 with the default hours), midday (to 14:00), the afternoon, or outside regular hours;
+* *Odds by volatility* (off): quiet, normal or busy, from the ATR of the bars before the signal
+  against one ten times as long (under 0.8×, over 1.25×);
+* *Odds by trend* (off): with the trend EMA or against it;
+* *Odds by confirmations* (on): the number of confirmations.
+
+A narrow group with only a few past trades is blended with its broader parent group
+(`p = (count + k·p_parent) / (trades + k)` for each ending, *k* = *Probability smoothing*), so
+each split you add needs more history before it says anything. The tooltip lists every group
+with its counts. The starting point is the odds of a coin-flip market for the trade's own
+bracket. For 80 / 80 with the stop moving to +20 at +40 that is **TP 22%, BE 45%, SL 33%**, worth 0
+ticks on average (without break-even: 50 / 50). A fresh chart shows those numbers everywhere, and
+they only move as real outcomes accumulate. Load more history for more reliable estimates.
+
+**EV** (expected value) combines the three: `TP% × 80 + BE% × 20 − SL% × 80` ticks, with each
+trade's own distances. A positive EV means that kind of signal has paid on this chart so far.
 
 ### Reading the chart
 
@@ -328,7 +380,8 @@ Hidden signals are still followed, so the statistics keep learning from them.
 The panel shows:
 
 * TP / BE / SL counts and net ticks for longs, shorts and total (signals shown on the chart);
-* open, expired and hidden signals, and how many settled trades the model has learned from;
+* open, expired and hidden signals, limit orders that didn't fill (with a limit entry), and how
+  many settled trades the model has learned from;
 * the signal hours, and the New York time of the last bar;
 * **track record**: the average ticks actually made by signals labelled with a positive EV and
   by the rest, so you can see whether the labels have been reliable on this chart;
@@ -337,6 +390,7 @@ The panel shows:
 * for an open trade, **live odds** from the current price, e.g.
   `Live BUY +44t, stop +20t:  TP 38% · BE 62% · SL 0%`. Each leg (reaching +40 before the stop,
   then TP before the break-even stop) is a random walk with the drift implied by the entry odds.
+  While a limit order waits, the line shows its price and the bar it waits until.
 
 ### Scoreboard
 
@@ -388,21 +442,77 @@ before you judge it.
   or turn on *Require candlestick pattern* to filter the sweeps.
 * **Prune with the scoreboard** once its rows hold a few dozen signals each: switch off the
   patterns and setups that keep losing ticks on your chart.
+* **Test a change before you trust it**: replay your own history through the backtest runner,
+  pick settings on one stretch and judge them on a later one. Check its worst-case row too, since
+  a result that exists only with the assumed order inside bars isn't there (see below).
+
+## Backtest: two years of 1-minute NQ
+
+The runner in `tests/Backtest` replays bars through the indicator (see
+[tests/README.md](tests/README.md)). It was run on two years of 1-minute bars of Dukascopy's
+Nasdaq-100 CFD (bid prices, 22 September 2024 – 24 September 2026, 519 trading days) as a stand-in
+for NQ. It is the same index, but not the futures contract, and it has no footprint, so there are
+no *Fill* signals and no delta or order-flow confirmations. Costs are 1 tick of commission and 1
+tick of slippage per market order: 3 ticks a trade entered at the close.
+
+**The defaults** (regular hours, 80 / 80, break-even +40 → +20):
+
+| | Trades | TP / BE / SL | Gross a trade | Net a trade |
+|---|---|---|---|---|
+| Settled as the indicator does | 23,679 | 28.8% / 37.9% / 33.2% | +4.1 ticks | +1.1 ticks |
+| Worst-case order inside each bar | 24,453 | 16.6% / 48.6% / 34.7% | −4.8 ticks | −7.8 ticks |
+
+The truth lies between the two rows, and for this bracket near the first: on simulated tick paths
+(below) the first overstates it by 1–2 ticks a trade and the worst case understates it by about
+9. That leaves the defaults around break-even after costs. The "win rate" (TP or break-even,
+67%) says little: random entries with this bracket end at TP or break-even about as often.
+
+**The new settings, tested honestly.** Settings were chosen on the first year only (to 22
+September 2025) and judged once on the second:
+
+* The first-year search tried about 400 combinations of entries, brackets, filters and odds
+  splits. The best was signals only in the first two hours of regular hours, with a 40 / 40
+  bracket and break-even at +20 → +10. It made +3.0 ticks a trade after costs in year 1, and
+  **+3.4 in year 2, with 13 of 13 months up**.
+* It most likely isn't real. On simulated tick paths with no edge at all, bars settle that
+  bracket 4–5 ticks a trade better than the path inside them: more than all of its profit. That
+  happens in both years, so the second year can't catch it. With the worst-case order it lost
+  4.4 and 7.9 ticks a trade. Only tick data can settle it.
+* Measured in ways the bar order can't bias, nothing held up:
+  * the plain move 5 to 60 minutes after a signal: no reliable edge in year 1, in any hour window
+    or with any filter;
+  * brackets without break-even: 80 / 80 lost 4.8 and 2.4 ticks a trade after costs;
+  * ATR-sized brackets (3 ATRs each way, with break-even): +1.7 and +1.2 ticks a trade, within
+    noise.
+* Neither the limit entries nor hiding signals with low expected ticks turned the first year
+  positive, with or without the new odds splits.
+
+So the defaults are unchanged. The new settings are there to try ideas on your own market and
+data. Judge them with the runner's worst-case row next to the result, or on tick data.
 
 ## Honest limits
 
 * The probability is a frequency from the history loaded on the chart, not a guarantee. Markets
   change; small samples stay close to the coin-flip odds by design.
-* Fills are idealised: entry at the close, exact TP / SL, no slippage or commission.
-* On historical bars the order of the high and low inside one bar is unknown, and it matters
-  whenever a bar holds both the TP and the SL, or reaches +40 and also trades back to +20.
+* Fills are idealised: entry at the close (or exactly at the limit price), exact TP / SL, no
+  slippage or commission. The backtest runner takes costs off.
+* On historical bars the path inside a bar is unknown. It matters whenever a bar holds both the
+  TP and the SL, or reaches +40 and also trades back to +20.
   * By default the indicator assumes price went from the open to the **nearer extreme first**,
-    the assumption TradingView's strategy tester makes.
+    then to the other one and the close. TradingView's strategy tester makes the same assumption.
+  * That is **optimistic whenever the break-even step fits inside a typical bar**. Price that
+    reaches the trigger inside a bar often comes back to the moved stop before the close, and
+    no order of a bar's high and low shows that. On simulated tick paths with NQ's 1-minute
+    volatility (`tests/PathCheck`), bars overstated the default 80 / 80 (break-even +40 → +20) by
+    about 1–2 ticks a trade, and a 40 / 40 bracket with break-even at +20 → +10 by 4–5 ticks.
+    Brackets without break-even, and ATR-sized ones, came out within about half a tick.
   * *Worst case* assumes the order that hurts the trade. With break-even on, that means any bar
-    that reaches +40 from an open below +20 counts as stopped at break-even, which is very
-    pessimistic on 1-minute charts.
-  * Live bars follow the trades as they happen, so reloading the chart can occasionally settle
-    such a trade differently.
+    that reaches +40 from an open below +20 counts as stopped at break-even: about 9 ticks a trade
+    too pessimistic for the default bracket, 1–2 for the 40 / 40 one. The truth usually lies
+    between the two, and the backtest runner shows both.
+  * Live bars follow the trades as they happen, so they don't have this problem. Reloading the
+    chart can settle such a trade differently, and the odds on the labels come from history
+    settled this way, so with a tight break-even step they lean optimistic too.
 * Candlestick patterns are rules of thumb with fixed thresholds (wicks at most a tenth of the
   range, bodies against a 14-bar average...). They describe what the candles did, not what they
   will do.
@@ -478,14 +588,18 @@ show while the chart is open.
 |---|---|---|---|
 | Liquidity Sweep | Swing Lookback (bars) | 10 | bars whose high / low a sweep must run |
 | | Show sweeps | on | the dotted sweep lines |
+| | Min sweep depth (x ATR, 0 = off) | 0 | how far beyond the high / low a sweep has to trade, in ATRs of the bars before it |
+| | Sweep confirmed swings only | off | only swing highs / lows (3 bars each side) nothing has traded beyond since; each counts once |
 | Fair Value Gap | Min FVG Size (ticks) | 4 | |
+| | Min FVG size (x ATR, 0 = off) | 0 | a gap must also be this many ATRs of the bars before it |
 | | Zone Max Age (bars) | 150 | a gap nothing used or filled within this many bars stops being watched |
 | | Require reaction close beyond zone | on | a bullish reaction must close above the gap, a bearish one below it |
 | | FVG is filled when | Price reaches its far edge | or: a candle closes beyond it; price reaches its middle (50%) |
 | | Draw FVG Zones, Show zone midline (50%) | on | |
 | | Show used / filled zones | off | a faint box for each gap that is no longer watched |
 | | Bullish zone color, Bearish zone color | translucent teal / red | |
-| Sessions & Key Levels | Signal hours (New York) | Regular hours | or all hours; the first two hours of regular hours; regular hours but not 11:30 – 13:30 |
+| Sessions & Key Levels | Signal hours (New York) | Regular hours | or all hours; the first two hours of regular hours; regular hours but not 11:30 – 13:30; a custom window |
+| | Custom window start / end (New York) | 09:30 / 10:30 | with a custom window; one that ends before it starts runs over midnight, the same time for both means all day |
 | | Regular hours start / end (New York) | 09:30 / 16:00 | for the signal hours, the prior day, the overnight range and the opening range |
 | | Opening range (minutes) | 30 | |
 | | Prior day high / low, Overnight high / low, Opening range high / low, Equal highs / lows | on | which key levels to watch |
@@ -514,17 +628,29 @@ show while the chart is open.
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
 | | Min expected ticks to show (0 = off) | 0 | hide signals with a lower EV; they are still learned from |
+| | Volatility (ATR) period (bars) | 20 | the ATR behind the sweep depth, the gap size, ATR brackets and the volatility split of the odds |
 | Candlestick Patterns | Hammer / Shooting star, Inverted hammer / Hanging man, Engulfing, Piercing line / Dark cloud cover, Harami, Tweezer bottom / top, Morning star / Evening star, Three white soldiers / black crows, Marubozu, Three inside up / down, Three outside up / down, Outside reversal, Three-line strike | on | one switch per pattern pair; the doji stars go with the stars, the dragonfly / gravestone dojis with the hammers |
 | | Hammer wick / body (min) | 2 | for hammers, shooting stars, inverted hammers and hanging men |
 | | Average body (bars) | 14 | the yardstick for long and small bodies |
 | | Tweezer match (ticks) | 1 | how far apart a tweezer's two lows (highs) may be |
-| Take Profit / Stop Loss | Take profit (ticks) / Stop loss (ticks) | 80 / 80 | |
-| | Break-even trigger (ticks, 0 = off) | 40 | profit at which the stop moves |
-| | Break-even stop (ticks in profit) | 20 | where it moves to (0 = the entry price); kept below the trigger |
-| | Max bars in trade (0 = no limit) | 0 | expired trades are left out of the probabilities |
+| Entry | Entry | At the signal bar's close | or a limit order on a pullback |
+| | Pullback (% of the signal bar) | 25 | with a limit entry: how far back from the close the order sits |
+| | Limit order valid (bars) | 3 | bars after the signal bar the order waits; unfilled, it is cancelled and left out of the results |
+| Take Profit / Stop Loss | Bracket size | Fixed ticks | or multiples of the ATR; or the stop beyond the signal bar |
+| | Take profit (ticks) / Stop loss (ticks) | 80 / 80 | with fixed ticks |
+| | Take profit (x ATR) / Stop loss (x ATR) | 3 / 3 | with the ATR bracket |
+| | Stop buffer (ticks) | 2 | with the stop beyond the signal bar: how far beyond its low (buys) / high (shorts) |
+| | Take profit (x the stop) | 1.5 | with the stop beyond the signal bar: the reward : risk |
+| | Min stop / Max stop (ticks) | 16 / 200 | with the ATR or signal-bar bracket; the take profit keeps its ratio |
+| | Break-even trigger (ticks, 0 = off) | 40 | with fixed ticks: profit at which the stop moves |
+| | Break-even stop (ticks in profit) | 20 | with fixed ticks: where it moves to (0 = the entry price); kept below the trigger |
+| | Break-even trigger / stop (% of TP) | 50 / 25 | the same with the ATR or signal-bar bracket, as shares of the take profit (trigger 0 = off) |
+| | Max bars in trade (0 = no limit) | 0 | counted from the fill; expired trades are left out of the probabilities |
 | | Close trades at session end | off | also takes no new signal on a session's last bar |
 | | Order of high and low inside a bar | Open to the nearer extreme first | or worst case for the trade, or candle direction (O-L-H-C / O-H-L-C) |
 | | Probability smoothing (virtual trades) | 10 | higher = steadier numbers that need more history to move |
+| | Odds by time of day / by volatility / by trend | off | split each setup's odds by when the signal came, how busy the market was, or whether it went with the trend EMA |
+| | Odds by confirmations | on | split each setup's odds by its number of confirmations |
 | Display | Show signal labels, Compact labels for closed trades, Show TP / SL levels, Show statistics panel | on | closed trades keep a small result chip and a faint box |
 | | Keep the scoreboard open | off | shows the scoreboard without hovering the panel |
 | | Show reaction labels | off | name the pattern next to each reaction marker (hovering one always does) |
@@ -538,7 +664,20 @@ draws its own markers for them. The sweep series also mark sweeps of key levels.
 
 ## Changes in this version
 
-New since the rewrite:
+New in this version, all off by default, so the signals and their odds stay as they were:
+
+* **signal filters**: a custom window for the signal hours, a minimum sweep depth and gap size in
+  ATRs, and sweeps of confirmed swing highs / lows only;
+* **brackets that follow the market**: multiples of the ATR, or the stop just beyond the signal
+  bar with a reward : risk, each with its break-even step as a share of the take profit;
+* **limit entries** on a pullback into the signal bar;
+* **odds split** by time of day, volatility and trend, as well as by confirmations;
+* the **backtest runner** takes commission and slippage off, reports two stretches apart
+  (`--split`), and replays the history with the worst-case order inside each bar next to the
+  result. See [Backtest](#backtest-two-years-of-1-minute-nq) for what two years of NQ said about
+  all of this.
+
+New since the rewrite, in the previous version:
 
 * **key levels**: the prior day's, the overnight and the opening range's highs / lows and equal
   highs / lows, swept or broken, with two new triggers, *Key sweep* and *Key sweep+FVG*;
@@ -585,4 +724,5 @@ The fixes made to the original file are all still in:
 `tests/` builds the indicator against stand-ins for the ATAS API and checks it on scripted and
 randomised markets, including a simulated order book — see [tests/README.md](tests/README.md).
 `tests/Backtest` replays a CSV of bars through the same code, for a backtest over any stretch of
-history outside ATAS. They are not part of the indicator build.
+history outside ATAS, and `tests/PathCheck` measures how far a backtest on 1-minute bars is off
+for given settings. They are not part of the indicator build.

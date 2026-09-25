@@ -10,7 +10,12 @@
 //   --from, --to <date>     only bars from / before this date (UTC)
 //   --tick <size>           tick size (default 0.25, NQ); prices are rounded to it
 //   --tick-value <dollars>  per tick and contract (default 5, NQ; MNQ is 0.5)
-//   --cost <ticks>          round-trip costs per trade for the net after costs (default 2)
+//   --commission <ticks>    commission per round trip (default 1: about $5 on NQ)
+//   --slippage <ticks>      slippage per market order: an entry at the close and every exit (default 1);
+//                           a limit entry has none, so it costs commission + 1 slippage, a market one + 2
+//   --split <date>          also report the signals before and from this date apart (year 1 / year 2)
+//   --summary               print one line of JSON (all / before / from the split, and the same with the
+//                           worst-case high / low order under "worst") instead of the report
 //   --price-scale <x>       multiply every price, for files with scaled integer prices
 //   --symbol <name>         keep only the rows of this symbol, when the file has a symbol column;
 //                           otherwise each day keeps its most traded symbol
@@ -55,7 +60,10 @@ internal static class Program
 		public DateTime To = DateTime.MaxValue;
 		public decimal Tick = 0.25m;
 		public decimal TickValue = 5m;
-		public decimal Cost = 2m;
+		public decimal Commission = 1m;
+		public decimal Slippage = 1m;
+		public DateTime? Split;
+		public bool Summary;
 		public decimal PriceScale = 1m;
 		public string Symbol;
 		public string Preset = "defaults";
@@ -79,16 +87,26 @@ internal static class Program
 		public decimal Entry, TakeProfit, StopLoss, Exit, Ticks;
 		public int LabelTp;
 		public double TpOdds, BeOdds, SlOdds, ExpectedTicks;
+		public bool LimitEntry;
+		public int FillBar;
+		public int StepTicks;           // from the break-even trigger back to the moved stop (0 = no break-even)
+		public decimal Net;             // ticks after commission and slippage
 		public bool Closed => Outcome == "TakeProfit" || Outcome == "BreakEven" || Outcome == "StopLoss";
 		public bool Ended => Closed || Outcome == "Expired";
 	}
 
-	// trades that ended: at TP, break-even, SL, or expired (closed at market)
+	// trades that ended: at TP, break-even, SL, or expired (closed at market); gross ticks and
+	// the net after costs
 	private sealed class Tally
 	{
 		public int Tp, Be, Sl, Ex;
-		public decimal Ticks, Won, Lost;
+		public decimal Ticks, Net, Won, Lost;
+		public double NetSquares;
 		public int Count => Tp + Be + Sl + Ex;
+		public decimal NetPerTrade => Count > 0 ? Net / Count : 0;
+
+		// how many standard errors the average net is above 0
+		public double TStat => Count < 2 ? 0 : (double)NetPerTrade / Math.Sqrt(Math.Max(1e-12, (NetSquares - (double)(Net * Net) / Count) / (Count - 1)) / Count);
 
 		public void Add(Trade t)
 		{
@@ -102,11 +120,13 @@ internal static class Program
 				Ex++;
 
 			Ticks += t.Ticks;
+			Net += t.Net;
+			NetSquares += (double)(t.Net * t.Net);
 
-			if (t.Ticks > 0)
-				Won += t.Ticks;
+			if (t.Net > 0)
+				Won += t.Net;
 			else
-				Lost -= t.Ticks;
+				Lost -= t.Net;
 		}
 	}
 
@@ -144,6 +164,34 @@ internal static class Program
 			return 1;
 		}
 
+		Replay(ind, candles);
+		var trades = ReadTrades(ind, candles, o: options);
+
+		// the same history again, with the high / low order inside a bar that is worst for every
+		// trade: on OHLC bars the truth usually lies between the two
+		List<Trade> worst = null;
+
+		if (ind.SameBarRule != FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst)
+		{
+			var pessimist = new FvgReactionLiquiditySweep { InstrumentInfo = new InstrumentInfo { TickSize = options.Tick } };
+			ApplySettings(pessimist, options);
+			pessimist.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
+			Replay(pessimist, candles);
+			worst = ReadTrades(pessimist, candles, o: options);
+		}
+
+		var report = Report(ind, candles, trades, worst, options, changed, notes, DateTime.UtcNow - started);
+		Console.Write(report);
+
+		if (options.TradesFile != null)
+			WriteTrades(options.TradesFile, trades, candles);
+
+		return 0;
+	}
+
+	// feeds every bar to the indicator, as a chart loading this history would
+	private static void Replay(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles)
+	{
 		ind.Candles.AddRange(candles);
 
 		// the first bar of each CME trading day (18:00 New York) starts a session
@@ -157,15 +205,6 @@ internal static class Program
 
 		for (var i = 0; i < candles.Count; i++)
 			ind.HarnessCalculate(i);
-
-		var trades = ReadTrades(ind, candles);
-		var report = Report(ind, candles, trades, options, changed, notes, DateTime.UtcNow - started);
-		Console.Write(report);
-
-		if (options.TradesFile != null)
-			WriteTrades(options.TradesFile, trades, candles);
-
-		return 0;
 	}
 
 	#region Input
@@ -211,8 +250,20 @@ internal static class Program
 					o.TickValue = decimal.Parse(Next(ref i), Inv);
 					break;
 
-				case "--cost":
-					o.Cost = decimal.Parse(Next(ref i), Inv);
+				case "--commission":
+					o.Commission = decimal.Parse(Next(ref i), Inv);
+					break;
+
+				case "--slippage":
+					o.Slippage = decimal.Parse(Next(ref i), Inv);
+					break;
+
+				case "--split":
+					o.Split = DateTime.Parse(Next(ref i), Inv, DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal);
+					break;
+
+				case "--summary":
+					o.Summary = true;
 					break;
 
 				case "--price-scale":
@@ -607,7 +658,7 @@ internal static class Program
 		return obj.GetType().GetField(field).GetValue(obj);
 	}
 
-	private static List<Trade> ReadTrades(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles)
+	private static List<Trade> ReadTrades(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, Options o)
 	{
 		var list = (IList)IndicatorType.GetField("_trades", Private).GetValue(ind);
 		var triggerLabel = IndicatorType.GetMethod("TriggerLabel", PrivateStatic);
@@ -656,14 +707,22 @@ internal static class Program
 				TpOdds = Odds("TakeProfit"),
 				BeOdds = Odds("BreakEven"),
 				SlOdds = Odds("StopLoss"),
-				ExpectedTicks = Odds("ExpectedTicks")
+				ExpectedTicks = Odds("ExpectedTicks"),
+				LimitEntry = (bool)Get(t, "LimitEntry"),
+				FillBar = (int)Get(t, "FillBar"),
+				StepTicks = (bool)Get(t, "HasBreakEven") ? (int)Get(t, "TriggerTicks") - (int)Get(t, "LockedTicks") : 0
 			});
 		}
+
+		// commission, and a tick of slippage on every market order: the entry at the close (not a
+		// limit entry) and the exit
+		foreach (var t in trades.Where(t => t.Ended))
+			t.Net = t.Ticks - o.Commission - o.Slippage * (t.LimitEntry ? 1 : 2);
 
 		return trades;
 	}
 
-	private static string Report(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<Trade> trades, Options o,
+	private static string Report(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<Trade> trades, List<Trade> worst, Options o,
 		List<string> changed, List<string> notes, TimeSpan elapsed)
 	{
 		var sb = new StringBuilder();
@@ -672,50 +731,6 @@ internal static class Program
 		var shown = trades.Where(t => t.IsShown).ToList();
 		var closed = shown.Where(t => t.Closed).OrderBy(t => t.ExitBar).ThenBy(t => t.EntryBar).ToList();
 		var ended = shown.Where(t => t.Ended).OrderBy(t => t.ExitBar).ThenBy(t => t.EntryBar).ToList();
-		var first = NewYorkTime(candles[0].Time);
-		var last = NewYorkTime(candles[candles.Count - 1].Time);
-		var days = candles.Select(c => TradingDay(c.Time)).Distinct().Count();
-
-		Line($"FVG Reaction + Liquidity Sweep, backtest on {string.Join(", ", o.Files.Select(Path.GetFileName))}");
-		Line($"{candles.Count.ToString("N0", Inv)} bars over {days} trading days, {first:yyyy-MM-dd HH:mm} to {last:yyyy-MM-dd HH:mm} New York; tick {o.Tick}, ${o.TickValue} per tick");
-		Line($"Settings: {(o.Preset == "1min" ? "1-minute preset" : "indicator defaults")}{(changed.Count > 0 ? " with " + string.Join(", ", changed) : string.Empty)}");
-		Line($"Signal hours {ind.SignalHours}, TP {ind.TakeProfitTicks}t / SL {ind.StopLossTicks}t, break-even at +{ind.BreakEvenTriggerTicks}t to +{ind.BreakEvenStopTicks}t, "
-			+ $"one trade at a time {(ind.OneTradeAtATime ? "on" : "off")}, high / low order {ind.SameBarRule}");
-
-		foreach (var note in notes)
-			Line($"Note: {note}");
-
-		Line();
-		var open = shown.Count(t => t.Outcome == "Open");
-		var expired = shown.Count(t => t.Outcome == "Expired");
-		Line($"Signals on the chart: {shown.Count} ({closed.Count} at TP / BE / SL, {expired} expired, {open} still open at the end); "
-			+ $"{trades.Count - shown.Count} more were hidden (a trade was already open, or filtered) and only counted for the odds");
-		Line();
-
-		string Percent(int part, int whole) => whole == 0 ? "-" : (100.0 * part / whole).ToString("0.0", Inv) + "%";
-		string Signed(decimal value, string format = "0") => value.ToString("+" + format + ";-" + format + ";0", Inv);
-		string Factor(Tally t) => t.Lost == 0 ? (t.Won > 0 ? "inf" : "-") : (t.Won / t.Lost).ToString("0.00", Inv);
-
-		// a table of tallies
-		void Table(string title, IEnumerable<(string Name, Tally Tally)> groups)
-		{
-			var rows = groups.Where(g => g.Tally.Count > 0).ToList();
-
-			if (rows.Count == 0)
-				return;
-
-			var width = Math.Max(title.Length, rows.Max(r => r.Name.Length));
-			var withExpired = rows.Any(r => r.Tally.Ex > 0);
-			Line($"{title.PadRight(width)}  {"trades",6}  {"TP",5}  {"BE",5}  {"SL",5}  {(withExpired ? $"{"exp",5}  " : string.Empty)}{"TP rate",7}  {"TP+BE",6}  {"net ticks",9}  {"per trade",9}  {"PF",5}");
-
-			foreach (var (name, t) in rows)
-			{
-				Line($"{name.PadRight(width)}  {t.Count,6}  {t.Tp,5}  {t.Be,5}  {t.Sl,5}  {(withExpired ? $"{t.Ex,5}  " : string.Empty)}{Percent(t.Tp, t.Count),7}  {Percent(t.Tp + t.Be, t.Count),6}  "
-					+ $"{Signed(t.Ticks),9}  {Signed(t.Ticks / t.Count, "0.0"),9}  {Factor(t),5}");
-			}
-
-			Line();
-		}
 
 		Tally Sum(IEnumerable<Trade> group)
 		{
@@ -728,37 +743,160 @@ internal static class Program
 		}
 
 		var all = Sum(ended);
-		Table("Signals that ended", new[] { ("All", all), ("Buys", Sum(ended.Where(t => t.IsLong))), ("Shorts", Sum(ended.Where(t => !t.IsLong))) });
 
-		// the equity curve of the trades on the chart, one contract each
+		// the chart's panel counts the same trades, before costs
+		int Field(string name) => (int)IndicatorType.GetField(name, Private).GetValue(ind);
+		decimal Ticks(string name) => (decimal)IndicatorType.GetField(name, Private).GetValue(ind);
+		var panelTp = Field("_longWins") + Field("_shortWins");
+		var panelBe = Field("_longBreakEvens") + Field("_shortBreakEvens");
+		var panelSl = Field("_longLosses") + Field("_shortLosses");
+		var panelNet = Ticks("_longNetTicks") + Ticks("_shortNetTicks");
+		var panelExpired = Field("_expired");
+		var agrees = panelTp == all.Tp && panelBe == all.Be && panelSl == all.Sl && panelExpired == all.Ex && panelNet == all.Ticks;
+
+		// the worst-case replay's trades on the chart that ended
+		var worstEnded = worst?.Where(t => t.IsShown && t.Ended).ToList();
+
+		if (o.Summary)
+			return Summary(ended, worstEnded, o, agrees) + Environment.NewLine;
+
+		var first = NewYorkTime(candles[0].Time);
+		var last = NewYorkTime(candles[candles.Count - 1].Time);
+		var days = candles.Select(c => TradingDay(c.Time)).Distinct().Count();
+
+		Line($"FVG Reaction + Liquidity Sweep, backtest on {string.Join(", ", o.Files.Select(Path.GetFileName))}");
+		Line($"{candles.Count.ToString("N0", Inv)} bars over {days} trading days, {first:yyyy-MM-dd HH:mm} to {last:yyyy-MM-dd HH:mm} New York; tick {o.Tick}, ${o.TickValue} per tick");
+		Line($"Settings: {(o.Preset == "1min" ? "1-minute preset" : "indicator defaults")}{(changed.Count > 0 ? " with " + string.Join(", ", changed) : string.Empty)}");
+		Line($"Signal hours {ind.SignalHours}, entry {ind.Entry}, bracket {(string)IndicatorType.GetMethod("BracketText", Private).Invoke(ind, null)}, "
+			+ $"one trade at a time {(ind.OneTradeAtATime ? "on" : "off")}, high / low order {ind.SameBarRule}");
+		Line($"Costs: {o.Commission} tick{(o.Commission == 1 ? string.Empty : "s")} commission a round trip, {o.Slippage} of slippage on each market order "
+			+ $"({o.Commission + 2 * o.Slippage} a trade entered at the close, {o.Commission + o.Slippage} with a limit entry)");
+
+		foreach (var note in notes)
+			Line($"Note: {note}");
+
+		Line();
+		var open = shown.Count(t => t.Outcome == "Open");
+		var expired = shown.Count(t => t.Outcome == "Expired");
+		var missed = shown.Count(t => t.Outcome == "Missed");
+		Line($"Signals on the chart: {shown.Count} ({closed.Count} at TP / BE / SL, {expired} expired, {missed} limit orders not filled, {open} still open at the end); "
+			+ $"{trades.Count - shown.Count} more were hidden (a trade was already open, or filtered) and only counted for the odds");
+		Line();
+
+		string Percent(int part, int whole) => whole == 0 ? "-" : (100.0 * part / whole).ToString("0.0", Inv) + "%";
+		string Signed(decimal value, string format = "0") => value.ToString("+" + format + ";-" + format + ";0", Inv);
+		string Factor(Tally t) => t.Lost == 0 ? (t.Won > 0 ? "inf" : "-") : (t.Won / t.Lost).ToString("0.00", Inv);
+
+		// a table of tallies: rates, gross and net ticks per trade, the net total and profit factor
+		void Table(string title, IEnumerable<(string Name, Tally Tally)> groups)
+		{
+			var rows = groups.Where(g => g.Tally.Count > 0).ToList();
+
+			if (rows.Count == 0)
+				return;
+
+			var width = Math.Max(title.Length, rows.Max(r => r.Name.Length));
+			var withExpired = rows.Any(r => r.Tally.Ex > 0);
+			Line($"{title.PadRight(width)}  {"trades",6}  {"TP",5}  {"BE",5}  {"SL",5}  {(withExpired ? $"{"exp",5}  " : string.Empty)}{"TP rate",7}  {"TP+BE",6}  "
+				+ $"{"gross/tr",8}  {"net/tr",7}  {"net ticks",9}  {"PF net",6}");
+
+			foreach (var (name, t) in rows)
+			{
+				Line($"{name.PadRight(width)}  {t.Count,6}  {t.Tp,5}  {t.Be,5}  {t.Sl,5}  {(withExpired ? $"{t.Ex,5}  " : string.Empty)}{Percent(t.Tp, t.Count),7}  "
+					+ $"{Percent(t.Tp + t.Be, t.Count),6}  {Signed(t.Ticks / t.Count, "0.0"),8}  {Signed(t.NetPerTrade, "0.0"),7}  {Signed(t.Net),9}  {Factor(t),6}");
+			}
+
+			Line();
+		}
+
+		var summaryRows = new List<(string, Tally)> { ("All", all), ("Buys", Sum(ended.Where(t => t.IsLong))), ("Shorts", Sum(ended.Where(t => !t.IsLong))) };
+
+		if (o.Split.HasValue)
+		{
+			var split = o.Split.Value;
+			summaryRows.Add(($"Before {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime < split))));
+			summaryRows.Add(($"From {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime >= split))));
+		}
+
+		Table("Signals that ended", summaryRows);
+
+		// the equity curve after costs of the trades on the chart, one contract each
 		decimal equity = 0, peak = 0, drawdown = 0;
 		var streak = 0;
 		var worstStreak = 0;
 
 		foreach (var t in ended)
 		{
-			equity += t.Ticks;
+			equity += t.Net;
 			peak = Math.Max(peak, equity);
 			drawdown = Math.Max(drawdown, peak - equity);
 			streak = t.Outcome == "StopLoss" ? streak + 1 : 0;
 			worstStreak = Math.Max(worstStreak, streak);
 		}
 
-		var costs = o.Cost * all.Count;
-		Line($"Net {Signed(all.Ticks)} ticks = {Money(all.Ticks * o.TickValue)} per contract ({Money(all.Ticks * o.TickValue / 10)} per micro); "
-			+ $"after {o.Cost} ticks of costs per trade: {Signed(all.Ticks - costs)} ticks = {Money((all.Ticks - costs) * o.TickValue)}");
-		Line($"Largest drawdown {drawdown.ToString("0", Inv)} ticks ({Money(-drawdown * o.TickValue)}); longest run of stop losses: {worstStreak}; "
-			+ $"{closed.Count(t => t.Ambiguous)} trades settled by the high / low order assumption");
+		var months = ended.GroupBy(t => NewYorkTime(t.SignalTime).ToString("yyyy-MM", Inv)).ToList();
+		Line($"Before costs {Signed(all.Ticks)} ticks = {Money(all.Ticks * o.TickValue)} per contract; after costs {Signed(all.Net)} ticks = {Money(all.Net * o.TickValue)} "
+			+ $"({Money(all.Net * o.TickValue / 10)} per micro), {Signed(all.NetPerTrade, "0.0")} a trade, {all.TStat.ToString("0.0", Inv)} standard errors from zero");
+		Line($"After costs: largest drawdown {drawdown.ToString("0", Inv)} ticks ({Money(-drawdown * o.TickValue)}), {months.Count(m => m.Sum(t => t.Net) > 0)} of {months.Count} months up; "
+			+ $"longest run of stop losses {worstStreak}");
 		Line();
 
+		// how much the result leans on the assumed order of each bar's high and low
+		var assumed = closed.Count(t => t.Ambiguous);
+
+		if (worstEnded != null)
+		{
+			var orderRows = new List<(string, Tally)> { ($"As assumed ({ind.SameBarRule})", all), ("Worst case (stop first)", Sum(worstEnded)) };
+
+			if (o.Split.HasValue)
+			{
+				var split = o.Split.Value;
+				orderRows.Add(($"As assumed, before {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime < split))));
+				orderRows.Add(($"Worst case, before {split:yyyy-MM-dd}", Sum(worstEnded.Where(t => t.SignalTime < split))));
+				orderRows.Add(($"As assumed, from {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime >= split))));
+				orderRows.Add(($"Worst case, from {split:yyyy-MM-dd}", Sum(worstEnded.Where(t => t.SignalTime >= split))));
+			}
+
+			Table("High / low order inside a bar", orderRows);
+			Line($"Bars don't show the path inside them. On {assumed} of {closed.Count} trades ({Percent(assumed, closed.Count)}) the order of the exit bar's "
+				+ "high and low decided the result, and more depend on the path unflagged: after a break-even trigger inside a bar, price often "
+				+ "comes back to the moved stop before the close, which no order of high and low shows. The truth usually lies between the two rows: "
+				+ "nearer the first when the break-even step is wide next to a typical bar, nearer the worst case when it is narrow.");
+
+			// how wide the break-even step is next to the bars the trades lived through
+			var ranges = closed.Where(t => t.ExitBar > t.EntryBar)
+				.SelectMany(t => Enumerable.Range(t.EntryBar + 1, t.ExitBar - t.EntryBar))
+				.Select(i => (candles[i].High - candles[i].Low) / o.Tick)
+				.OrderBy(x => x)
+				.ToList();
+			var steps = closed.Where(t => t.StepTicks > 0).Select(t => t.StepTicks).OrderBy(x => x).ToList();
+
+			if (ranges.Count > 0 && steps.Count > 0)
+			{
+				Line($"Here the median bar during a trade spans {ranges[ranges.Count / 2].ToString("0", Inv)} ticks, the break-even step "
+					+ $"(trigger back to the moved stop) {steps[steps.Count / 2]}. tests/PathCheck measures what bars get wrong for a bracket "
+					+ "on simulated tick paths; tick data settles it.");
+			}
+
+			Line();
+		}
+		else
+		{
+			Line($"On {assumed} of {closed.Count} trades ({Percent(assumed, closed.Count)}) the order of the exit bar's high and low decided the result; "
+				+ "every such bar was taken in the order worst for the trade.");
+			Line();
+		}
+
 		Table("By year", ended.GroupBy(t => NewYorkTime(t.SignalTime).Year).OrderBy(g => g.Key).Select(g => (g.Key.ToString(Inv), Sum(g))));
-		Table("By month", ended.GroupBy(t => NewYorkTime(t.SignalTime).ToString("yyyy-MM", Inv)).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => (g.Key, Sum(g))));
+		Table("By month", months.OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => (g.Key, Sum(g))));
 		Table("By setup", ended.GroupBy(t => t.Setup).OrderByDescending(g => g.Count()).Select(g => (g.Key, Sum(g))));
 		Table("Key sweeps by level", ended.Where(t => t.Level != null).GroupBy(t => t.Level).OrderByDescending(g => g.Count()).Select(g => (g.Key, Sum(g))));
 		Table("By New York hour", ended.GroupBy(t => NewYorkTime(t.SignalTime).Hour).OrderBy(g => g.Key).Select(g => ($"{g.Key:00}:00", Sum(g))));
 		Table("By weekday", ended.GroupBy(t => NewYorkTime(t.SignalTime).DayOfWeek).OrderBy(g => ((int)g.Key + 6) % 7).Select(g => (g.Key.ToString(), Sum(g))));
 		Table("By pattern", ended.SelectMany(t => (t.Patterns.Length == 0 ? "No pattern" : t.Patterns).Split(" + "), (t, p) => (t, p))
 			.GroupBy(x => x.p).OrderByDescending(g => g.Count()).Take(12).Select(g => (g.Key, Sum(g.Select(x => x.t)))));
+		Table("By expected ticks on the label", ended.GroupBy(t => t.ExpectedTicks < 0 ? "below 0" : t.ExpectedTicks < 5 ? "0 to 5" : t.ExpectedTicks < 10 ? "5 to 10" : "10 and more")
+			.OrderBy(g => g.Min(t => t.ExpectedTicks)).Select(g => (g.Key, Sum(g))));
 
 		// were the odds on the labels right?
 		var buckets = new[] { (0, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 101) };
@@ -779,20 +917,61 @@ internal static class Program
 		if (hidden.Count > 0)
 			Table("Every signal that ended, hidden ones too", new[] { ("All", Sum(trades.Where(t => t.Ended))), ("Hidden only", Sum(hidden)) });
 
-		// the panel's own totals must agree with the trade list
-		int Field(string name) => (int)IndicatorType.GetField(name, Private).GetValue(ind);
-		decimal Ticks(string name) => (decimal)IndicatorType.GetField(name, Private).GetValue(ind);
-		var panelTp = Field("_longWins") + Field("_shortWins");
-		var panelBe = Field("_longBreakEvens") + Field("_shortBreakEvens");
-		var panelSl = Field("_longLosses") + Field("_shortLosses");
-		var panelNet = Ticks("_longNetTicks") + Ticks("_shortNetTicks");
-		var panelExpired = Field("_expired");
-		var agrees = panelTp == all.Tp && panelBe == all.Be && panelSl == all.Sl && panelExpired == all.Ex && panelNet == all.Ticks;
 		Line(agrees
-			? $"The chart's panel shows the same totals ({panelTp} TP, {panelBe} BE, {panelSl} SL, {panelExpired} expired, {Signed(panelNet)}t)."
+			? $"The chart's panel shows the same totals ({panelTp} TP, {panelBe} BE, {panelSl} SL, {panelExpired} expired, {Signed(panelNet)}t before costs)."
 			: $"WARNING: the panel's totals ({panelTp} TP, {panelBe} BE, {panelSl} SL, {panelExpired} expired, {Signed(panelNet)}t) differ from the trade list.");
 		Line($"Ran in {elapsed.TotalSeconds.ToString("0", Inv)} s.");
 		return sb.ToString();
+	}
+
+	// one line of JSON: every signal that ended, and before / from the split when there is one
+	private static string Summary(List<Trade> ended, List<Trade> worstEnded, Options o, bool agrees)
+	{
+		string Part(IEnumerable<Trade> group)
+		{
+			var list = group.ToList();
+			var t = new Tally();
+
+			foreach (var trade in list)
+				t.Add(trade);
+
+			decimal equity = 0, peak = 0, drawdown = 0;
+
+			foreach (var trade in list)
+			{
+				equity += trade.Net;
+				peak = Math.Max(peak, equity);
+				drawdown = Math.Max(drawdown, peak - equity);
+			}
+
+			var months = list.GroupBy(x => NewYorkTime(x.SignalTime).ToString("yyyy-MM", Inv)).ToList();
+			var days = list.Select(x => NewYorkTime(x.SignalTime).Date).Distinct().Count();
+			string N(double x) => double.IsNaN(x) || double.IsInfinity(x) ? "0" : x.ToString("0.###", Inv);
+			return $"{{\"trades\":{t.Count},\"days\":{days},\"tp\":{t.Tp},\"be\":{t.Be},\"sl\":{t.Sl},\"exp\":{t.Ex},\"gross\":{N((double)t.Ticks)},\"net\":{N((double)t.Net)},"
+				+ $"\"netPerTrade\":{N((double)t.NetPerTrade)},\"t\":{N(t.TStat)},\"pf\":{N(t.Lost == 0 ? 0 : (double)(t.Won / t.Lost))},\"drawdown\":{N((double)drawdown)},"
+				+ $"\"monthsUp\":{months.Count(m => m.Sum(x => x.Net) > 0)},\"months\":{months.Count},\"assumed\":{list.Count(x => x.Ambiguous)}}}";
+		}
+
+		string Parts(List<Trade> list)
+		{
+			var parts = new List<string> { $"\"all\":{Part(list)}" };
+
+			if (o.Split.HasValue)
+			{
+				parts.Add($"\"before\":{Part(list.Where(t => t.SignalTime < o.Split.Value))}");
+				parts.Add($"\"from\":{Part(list.Where(t => t.SignalTime >= o.Split.Value))}");
+			}
+
+			return string.Join(",", parts);
+		}
+
+		var json = Parts(ended);
+
+		// the same parts with the worst-case order inside each bar
+		if (worstEnded != null)
+			json += $",\"worst\":{{{Parts(worstEnded)}}}";
+
+		return "{" + json + $",\"panelAgrees\":{(agrees ? "true" : "false")}}}";
 	}
 
 	private static string Money(decimal dollars)
@@ -803,17 +982,19 @@ internal static class Program
 	private static void WriteTrades(string path, List<Trade> trades, List<IndicatorCandle> candles)
 	{
 		using var writer = new StreamWriter(path);
-		writer.WriteLine("signal_bar_ny,side,setup,setup_name,patterns,entry,take_profit,stop_loss,exit_bar_ny,exit,outcome,ticks,shown,high_low_assumed,label_tp,p_tp,p_be,p_sl,ev_ticks");
+		writer.WriteLine("signal_bar_ny,side,setup,setup_name,patterns,entry,limit_entry,fill_bar_ny,take_profit,stop_loss,exit_bar_ny,exit,outcome,ticks,net_ticks,shown,high_low_assumed,label_tp,p_tp,p_be,p_sl,ev_ticks");
 
 		string Csv(string text) => text.Contains(',') ? $"\"{text}\"" : text;
 
 		foreach (var t in trades.OrderBy(t => t.EntryBar))
 		{
 			var exitTime = t.ExitBar >= 0 ? NewYorkTime(candles[t.ExitBar].Time).ToString("yyyy-MM-dd HH:mm", Inv) : string.Empty;
+			var fillTime = t.FillBar >= 0 ? NewYorkTime(candles[t.FillBar].Time).ToString("yyyy-MM-dd HH:mm", Inv) : string.Empty;
 			writer.WriteLine(string.Join(",",
 				NewYorkTime(t.SignalTime).ToString("yyyy-MM-dd HH:mm", Inv), t.IsLong ? "BUY" : "SHORT", Csv(t.Setup), Csv(t.SetupName), Csv(t.Patterns),
-				t.Entry.ToString(Inv), t.TakeProfit.ToString(Inv), t.StopLoss.ToString(Inv), exitTime, t.ExitBar >= 0 ? t.Exit.ToString(Inv) : string.Empty,
-				t.Outcome, t.ExitBar >= 0 ? t.Ticks.ToString("0", Inv) : string.Empty, t.IsShown ? "1" : "0", t.Ambiguous ? "1" : "0", t.LabelTp.ToString(Inv),
+				t.Entry.ToString(Inv), t.LimitEntry ? "1" : "0", fillTime, t.TakeProfit.ToString(Inv), t.StopLoss.ToString(Inv), exitTime,
+				t.ExitBar >= 0 ? t.Exit.ToString(Inv) : string.Empty, t.Outcome, t.Ended ? t.Ticks.ToString("0", Inv) : string.Empty,
+				t.Ended ? t.Net.ToString("0.##", Inv) : string.Empty, t.IsShown ? "1" : "0", t.Ambiguous ? "1" : "0", t.LabelTp.ToString(Inv),
 				t.TpOdds.ToString("0.000", Inv), t.BeOdds.ToString("0.000", Inv), t.SlOdds.ToString("0.000", Inv), t.ExpectedTicks.ToString("0.0", Inv)));
 		}
 	}
