@@ -131,6 +131,12 @@ dotnet run -c Release --project tests/Backtest -- nq-1min.csv --tz America/New_Y
 * **Costs**: `--commission` ticks a round trip (1) and `--slippage` ticks on each market order
   (1): the entry at the close and every exit. A trade entered at the close costs 3 ticks, one with
   a limit entry 2.
+* **Ticks**: `--ticks file.csv` (time and price, `.gz` too, repeatable) replays each bar that has
+  ticks tick by tick, as ATAS feeds a live chart, so trades follow the real path inside those bars
+  instead of an assumed one. Those bars are rebuilt from their ticks. The report then puts the
+  result on the ticks next to the same history on the bars alone (as assumed, and worst case), and
+  says how much of the trades' time the ticks covered. Give ticks for the whole stretch you test
+  (`--from` / `--to`): where there are none, trades are settled on the bars as before.
 * **Output**:
   * TP / BE / SL / expired, ticks per trade before and after costs, net ticks and dollars, and
     how many standard errors the average is from zero;
@@ -151,7 +157,9 @@ dotnet run -c Release --project tests/Backtest -- nq-1min.csv --tz America/New_Y
   * two years of 1-minute bars run in about 12 seconds, the worst-case replay included;
   * the six common file layouts read into identical bars;
   * on driftless noise a plain 80 / 80 bracket ends 50.0% TP with a net of 0, so there is no
-    look-ahead.
+    look-ahead;
+  * fed PathCheck's simulated market as bars and ticks, the tick replay settles all 2,952 signals
+    of 40 days exactly as PathCheck's path does.
 * **The high / low order**: with the break-even stop on, the path inside a bar matters. On
   simulated tick paths (60 steps a minute) with NQ's 1-minute ranges, settling on the bars with the
   default rule (open to the nearer extreme first) overstated the default 80 / 80 bracket
@@ -179,5 +187,8 @@ than on the path, and the ticks a trade each rule adds. `--volatility` scales th
 default, gives bars of about 50 ticks in regular hours, like NQ in 2024–2026), `--steps` the
 steps a minute, `--days` and `--seed` the sample, and `--set` takes any setting. The figures
 under *The high / low order* above come from it (seeds 1 and 7, 60 to 250 days, volatility 1.4
-and 1.7).
+and 1.7). Real prices come back inside a minute more often than a random walk does: on the ticks
+of 71 days of the Nasdaq-100 CFD (the runner's `--ticks`), the bars overstated the default bracket
+by 2.6 ticks a trade and the 40 / 40 one by 4–5, more than simulated. Treat its figures as a
+floor.
 

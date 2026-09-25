@@ -443,52 +443,73 @@ before you judge it.
 * **Prune with the scoreboard** once its rows hold a few dozen signals each: switch off the
   patterns and setups that keep losing ticks on your chart.
 * **Test a change before you trust it**: replay your own history through the backtest runner,
-  pick settings on one stretch and judge them on a later one. Check its worst-case row too, since
-  a result that exists only with the assumed order inside bars isn't there (see below).
+  pick settings on one stretch and judge them on a later one. With a break-even step, settle it
+  on ticks (`--ticks`) or at least check the worst-case row: a result that exists only with the
+  assumed order inside bars isn't there (see below).
 
 ## Backtest: two years of 1-minute NQ
 
 The runner in `tests/Backtest` replays bars through the indicator (see
 [tests/README.md](tests/README.md)). It was run on two years of 1-minute bars of Dukascopy's
 Nasdaq-100 CFD (bid prices, 22 September 2024 – 24 September 2026, 519 trading days) as a stand-in
-for NQ. It is the same index, but not the futures contract, and it has no footprint, so there are
-no *Fill* signals and no delta or order-flow confirmations. Costs are 1 tick of commission and 1
-tick of slippage per market order: 3 ticks a trade entered at the close.
+for NQ, and on the real ticks inside those bars for a random sample of 71 days, 36 in the first
+year and 35 in the second (09:00–17:00 New York). It is the same index, but not the futures
+contract, and it has no footprint, so there are no *Fill* signals and no delta or order-flow
+confirmations. Costs are 1 tick of commission and 1 tick of slippage per market order: 3 ticks a
+trade entered at the close.
 
-**The defaults** (regular hours, 80 / 80, break-even +40 → +20):
+**The defaults** (regular hours, 80 / 80, break-even +40 → +20), net a trade after costs:
 
-| | Trades | TP / BE / SL | Gross a trade | Net a trade |
-|---|---|---|---|---|
-| Settled as the indicator does | 23,679 | 28.8% / 37.9% / 33.2% | +4.1 ticks | +1.1 ticks |
-| Worst-case order inside each bar | 24,453 | 16.6% / 48.6% / 34.7% | −4.8 ticks | −7.8 ticks |
+| Settled | Year 1 | Year 2 |
+|---|---|---|
+| on the bars, as the indicator settles history | 0.0 ticks | +2.0 ticks |
+| on the real ticks (the bars less what the ticks showed they add) | −2.1 ticks | −1.1 ticks |
+| on the bars, worst-case order inside each bar | −8.7 ticks | −7.0 ticks |
 
-The truth lies between the two rows, and for this bracket near the first: on simulated tick paths
-(below) the first overstates it by 1–2 ticks a trade and the worst case understates it by about
-9. That leaves the defaults around break-even after costs. The "win rate" (TP or break-even,
-67%) says little: random entries with this bracket end at TP or break-even about as often.
+Signal by signal, the bars made the default bracket 2.6 ticks a trade better than the ticks did
+(2.1 in year 1, 3.2 in year 2). Settled on real ticks, the defaults lose about 1–2 ticks a trade
+after costs. The "win rate" (TP or break-even, 67%) says little: random entries with this bracket
+end at TP or break-even about as often.
+
+**Where the bars go wrong.** Almost all of the difference comes from one kind of bar: the one that
+reaches the break-even trigger while its range also covers the moved stop. How often the ticks
+came back to the stop inside that same bar, with the default bracket:
+
+| The bar | Stop hit in the same bar | On the bars |
+|---|---|---|
+| closes below the moved stop | 99% | always |
+| closes between the stop and the trigger | 35% | never |
+| closes beyond the trigger | 14% | never |
+| also reaches the take profit | 18%, before the TP | never |
+
+No fixed order of a bar's high and low gets this right. Each case is a mix, the rule counts the
+likelier outcome, and so every miss goes the same way. Without break-even the bars settle 99.9%
+of the trades as the ticks do. With the ATR-sized bracket, whose break-even step is about a bar
+wide, they are about a tick a trade optimistic.
 
 **The new settings, tested honestly.** Settings were chosen on the first year only (to 22
 September 2025) and judged once on the second:
 
-* The first-year search tried about 400 combinations of entries, brackets, filters and odds
-  splits. The best was signals only in the first two hours of regular hours, with a 40 / 40
-  bracket and break-even at +20 → +10. It made +3.0 ticks a trade after costs in year 1, and
-  **+3.4 in year 2, with 13 of 13 months up**.
-* It most likely isn't real. On simulated tick paths with no edge at all, bars settle that
-  bracket 4–5 ticks a trade better than the path inside them: more than all of its profit. That
-  happens in both years, so the second year can't catch it. With the worst-case order it lost
-  4.4 and 7.9 ticks a trade. Only tick data can settle it.
-* Measured in ways the bar order can't bias, nothing held up:
-  * the plain move 5 to 60 minutes after a signal: no reliable edge in year 1, in any hour window
-    or with any filter;
-  * brackets without break-even: 80 / 80 lost 4.8 and 2.4 ticks a trade after costs;
-  * ATR-sized brackets (3 ATRs each way, with break-even): +1.7 and +1.2 ticks a trade, within
-    noise.
-* Neither the limit entries nor hiding signals with low expected ticks turned the first year
-  positive, with or without the new odds splits.
+* On the bars, the best of about 400 combinations was signals only in the first two hours of
+  regular hours, with a 40 / 40 bracket and break-even at +20 → +10. It made +3.0 ticks a trade
+  after costs in year 1, and **+3.4 in year 2, with 13 of 13 months up**.
+* On real ticks it loses: the bars overstate that bracket by 5–6 ticks a trade, more than all of
+  its profit, so it comes out at −1.6 and −2.4. The second year couldn't catch this, because the
+  error is in the bars and shows up in both years.
+* Settled on real ticks, every bracket with a fixed break-even step lost in both years (eight of
+  them, −0.5 to −2.7 ticks a trade), and so did the brackets without one (80 / 80: −4.8 and
+  −2.2). The ATR-sized bracket (3 ATRs each way, with break-even) came out at +1.3 and −0.3: no
+  edge, but the least bad, and better than the defaults in both years (by 3.4 and 0.8 ticks a
+  trade).
+* The plain move 5 to 60 minutes after a signal, which no bar order can bias, showed no reliable
+  edge in year 1, in any hour window or with any filter. Neither the limit entries nor hiding
+  signals with low expected ticks, with or without the new odds splits, turned the first year
+  positive, even on the bars.
 
-So the defaults are unchanged. The new settings are there to try ideas on your own market and
-data. Judge them with the runner's worst-case row next to the result, or on tick data.
+So the defaults are unchanged: nothing tested is profitable after costs on real ticks. If you
+want the chart's odds to reflect what really happened, *Bracket size: Multiples of the ATR* is
+the bracket that history on bars settles almost exactly. Judge any change on ticks (`--ticks`),
+live, or at least next to the runner's worst-case row.
 
 ## Honest limits
 
@@ -502,14 +523,16 @@ data. Judge them with the runner's worst-case row next to the result, or on tick
     then to the other one and the close. TradingView's strategy tester makes the same assumption.
   * That is **optimistic whenever the break-even step fits inside a typical bar**. Price that
     reaches the trigger inside a bar often comes back to the moved stop before the close, and
-    no order of a bar's high and low shows that. On simulated tick paths with NQ's 1-minute
-    volatility (`tests/PathCheck`), bars overstated the default 80 / 80 (break-even +40 → +20) by
-    about 1–2 ticks a trade, and a 40 / 40 bracket with break-even at +20 → +10 by 4–5 ticks.
-    Brackets without break-even, and ATR-sized ones, came out within about half a tick.
+    no order of a bar's high and low shows that. On the real ticks of 71 days of 1-minute NQ
+    (see the backtest above), bars overstated the default 80 / 80 (break-even +40 → +20) by about
+    2.6 ticks a trade, and a 40 / 40 bracket with break-even at +20 → +10 by about 4 in regular
+    hours and 5 in their first two. Brackets without break-even came out the same on the bars as
+    on the ticks, and ATR-sized ones within about a tick. Simulated random-walk paths
+    (`tests/PathCheck`) show somewhat less: real prices come back inside a minute more often.
   * *Worst case* assumes the order that hurts the trade. With break-even on, that means any bar
-    that reaches +40 from an open below +20 counts as stopped at break-even: about 9 ticks a trade
-    too pessimistic for the default bracket, 1–2 for the 40 / 40 one. The truth usually lies
-    between the two, and the backtest runner shows both.
+    that reaches +40 from an open below +20 counts as stopped at break-even: on the real ticks,
+    4–7 ticks a trade too pessimistic for both brackets. The truth usually lies between the
+    two; the backtest runner shows both, and settles on ticks when you give it some.
   * Live bars follow the trades as they happen, so they don't have this problem. Reloading the
     chart can settle such a trade differently, and the odds on the labels come from history
     settled this way, so with a tight break-even step they lean optimistic too.
@@ -673,9 +696,9 @@ New in this version, all off by default, so the signals and their odds stay as t
 * **limit entries** on a pullback into the signal bar;
 * **odds split** by time of day, volatility and trend, as well as by confirmations;
 * the **backtest runner** takes commission and slippage off, reports two stretches apart
-  (`--split`), and replays the history with the worst-case order inside each bar next to the
-  result. See [Backtest](#backtest-two-years-of-1-minute-nq) for what two years of NQ said about
-  all of this.
+  (`--split`), replays the history with the worst-case order inside each bar next to the result,
+  and settles trades on real ticks (`--ticks`). See [Backtest](#backtest-two-years-of-1-minute-nq)
+  for what two years of NQ said about all of this.
 
 New since the rewrite, in the previous version:
 

@@ -15,20 +15,24 @@
 //                           a limit entry has none, so it costs commission + 1 slippage, a market one + 2
 //   --split <date>          also report the signals before and from this date apart (year 1 / year 2)
 //   --summary               print one line of JSON (all / before / from the split, and the same with the
-//                           worst-case high / low order under "worst") instead of the report
+//                           worst-case high / low order under "worst", and on the bars alone under
+//                           "assumed" when there are ticks) instead of the report
 //   --price-scale <x>       multiply every price, for files with scaled integer prices
 //   --symbol <name>         keep only the rows of this symbol, when the file has a symbol column;
 //                           otherwise each day keeps its most traded symbol
 //   --preset defaults|1min  settings to start from (default: the indicator's defaults)
 //   --set <Name>=<Value>    any indicator setting, e.g. --set SignalHours=AllHours (repeatable)
 //   --trades <file.csv>     write every signal (shown and hidden) to a CSV
+//   --ticks <file>          ticks (time, price) inside the bars: where a bar has them, trades are settled
+//                           on them, as a live chart does, instead of on an assumed path (repeatable)
 //
 // Files can be .csv, .csv.gz or .zip. Columns are found by their header (time / date + time,
 // open, high, low, close, volume, symbol) or, without a header, taken as time, open, high, low,
 // close, volume (a date and a time may be two columns). Times can be text or Unix seconds,
 // milliseconds or nanoseconds. Bars carry no footprint, so big fills (and the Fill signals and
 // order-flow confirmation they give) and the delta confirmation need data this runner does not
-// read; everything built from candles works as on the chart.
+// read; everything built from candles works as on the chart. With --ticks, bars that have ticks are
+// replayed tick by tick, so trades follow the real path inside them, as on a live chart.
 
 using System;
 using System.Collections;
@@ -54,6 +58,7 @@ internal static class Program
 	private sealed class Options
 	{
 		public List<string> Files = new List<string>();
+		public List<string> TickFiles = new List<string>();
 		public TimeZoneInfo Zone = TimeZoneInfo.Utc;
 		public bool CloseTimes;
 		public DateTime From = DateTime.MinValue;
@@ -138,6 +143,7 @@ internal static class Program
 		List<string> notes;
 		List<string> changed;
 		var ind = new FvgReactionLiquiditySweep();
+		int[][] paths = null;
 
 		try
 		{
@@ -150,6 +156,16 @@ internal static class Program
 			candles = BuildCandles(rows, options, out notes);
 			ind.InstrumentInfo = new InstrumentInfo { TickSize = options.Tick };
 			changed = ApplySettings(ind, options);
+
+			if (options.TickFiles.Count > 0)
+			{
+				var ticks = new List<(long Time, int Price)>();
+
+				foreach (var file in options.TickFiles)
+					ticks.AddRange(ReadTicks(file, options));
+
+				paths = AttachTicks(candles, ticks, options, notes);
+			}
 		}
 		catch (Exception e) when (e is ArgumentException || e is FormatException || e is IOException || e is InvalidDataException)
 		{
@@ -164,23 +180,43 @@ internal static class Program
 			return 1;
 		}
 
-		Replay(ind, candles);
-		var trades = ReadTrades(ind, candles, o: options);
+		FvgReactionLiquiditySweep Fresh()
+		{
+			var fresh = new FvgReactionLiquiditySweep { InstrumentInfo = new InstrumentInfo { TickSize = options.Tick } };
+			ApplySettings(fresh, options);
+			return fresh;
+		}
+
+		// with ticks, the trades settled on them are the result; the bars with the assumed order
+		// inside them are what a chart loading this history would show
+		List<Trade> assumed = null;
+		List<Trade> trades;
+
+		if (paths != null)
+		{
+			var onBars = Fresh();
+			Replay(onBars, candles);
+			assumed = ReadTrades(onBars, candles, o: options);
+			ReplayTicks(ind, candles, paths);
+		}
+		else
+			Replay(ind, candles);
+
+		trades = ReadTrades(ind, candles, o: options);
 
 		// the same history again, with the high / low order inside a bar that is worst for every
 		// trade: on OHLC bars the truth usually lies between the two
 		List<Trade> worst = null;
 
-		if (ind.SameBarRule != FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst)
+		if (ind.SameBarRule != FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst || paths != null)
 		{
-			var pessimist = new FvgReactionLiquiditySweep { InstrumentInfo = new InstrumentInfo { TickSize = options.Tick } };
-			ApplySettings(pessimist, options);
+			var pessimist = Fresh();
 			pessimist.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst;
 			Replay(pessimist, candles);
 			worst = ReadTrades(pessimist, candles, o: options);
 		}
 
-		var report = Report(ind, candles, trades, worst, options, changed, notes, DateTime.UtcNow - started);
+		var report = Report(ind, candles, trades, assumed, worst, paths, options, changed, notes, DateTime.UtcNow - started);
 		Console.Write(report);
 
 		if (options.TradesFile != null)
@@ -205,6 +241,47 @@ internal static class Program
 
 		for (var i = 0; i < candles.Count; i++)
 			ind.HarnessCalculate(i);
+	}
+
+	// the same bars, but each one that has ticks is built tick by tick, as ATAS feeds a live
+	// chart, so open trades follow the real path inside it
+	private static void ReplayTicks(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, int[][] paths)
+	{
+		var tick = ind.InstrumentInfo.TickSize;
+
+		for (var i = 1; i < candles.Count; i++)
+		{
+			if (TradingDay(candles[i].Time) != TradingDay(candles[i - 1].Time))
+				ind.SessionStarts.Add(i);
+		}
+
+		ind.HarnessRecalculate();
+
+		for (var i = 0; i < candles.Count; i++)
+		{
+			var bar = candles[i];
+			var path = paths[i];
+
+			if (path == null)
+			{
+				ind.Candles.Add(bar);
+				ind.HarnessCalculate(i);
+				continue;
+			}
+
+			var first = path[0] * tick;
+			var forming = new IndicatorCandle { Open = first, High = first, Low = first, Close = first, Volume = bar.Volume, Time = bar.Time };
+			ind.Candles.Add(forming);
+
+			foreach (var step in path)
+			{
+				var price = step * tick;
+				forming.High = Math.Max(forming.High, price);
+				forming.Low = Math.Min(forming.Low, price);
+				forming.Close = price;
+				ind.HarnessCalculate(i);
+			}
+		}
 	}
 
 	#region Input
@@ -294,6 +371,10 @@ internal static class Program
 
 				case "--trades":
 					o.TradesFile = Next(ref i);
+					break;
+
+				case "--ticks":
+					o.TickFiles.Add(Next(ref i));
 					break;
 
 				default:
@@ -545,6 +626,150 @@ internal static class Program
 		return true;
 	}
 
+	// Ticks as (UTC time, price in ticks). A header names the time (or date and time) and the
+	// price (price, last, bid...) columns; without one they are time, price.
+	private static List<(long Time, int Price)> ReadTicks(string path, Options o)
+	{
+		var ticks = new List<(long, int)>();
+		char separator = ',';
+		int time = -1, date = -1, clock = -1, price = -1;
+		var first = true;
+		var skipped = 0;
+
+		foreach (var raw in ReadLines(path))
+		{
+			var line = raw.Trim();
+
+			if (line.Length == 0)
+				continue;
+
+			if (first)
+			{
+				first = false;
+				separator = new[] { ',', ';', '\t', '|' }.OrderByDescending(c => line.Count(ch => ch == c)).First();
+				var names = Split(line, separator).Select(n => n.Trim('<', '>', ' ').ToLowerInvariant()).ToArray();
+
+				if (names.Any(n => n.Length > 0 && char.IsLetter(n[0])))
+				{
+					int Find(params string[] candidates) => Array.FindIndex(names, n => candidates.Contains(n));
+
+					time = Find("timestamp", "ts_event", "datetime", "date_time", "time (utc)", "gmt time", "local time", "utc", "ts", "time");
+					date = Find("date", "day");
+					clock = Find("time");
+					price = Find("price", "last", "trade price", "px", "bid", "close", "mid");
+
+					if (date >= 0 && clock >= 0 && clock != date && (time < 0 || time == clock))
+						time = -1;
+					else
+					{
+						if (time < 0)
+							time = date;
+
+						date = -1;
+						clock = -1;
+					}
+
+					if ((time < 0 && date < 0) || price < 0)
+						throw new InvalidDataException($"{path}: can't find the time and price columns in \"{line}\"");
+
+					continue;
+				}
+
+				(time, price) = (0, 1);
+			}
+
+			var f = Split(line, separator);
+
+			try
+			{
+				var stamp = time >= 0 ? f[time] : f[date] + " " + f[clock];
+
+				if (!TryParseTime(stamp, o.Zone, out var utc))
+					throw new FormatException($"time \"{stamp}\"");
+
+				var value = Number(f[price]) * o.PriceScale;
+				ticks.Add((utc.Ticks, (int)Math.Round(value / o.Tick, MidpointRounding.AwayFromZero)));
+			}
+			catch (Exception e) when (e is FormatException || e is IndexOutOfRangeException || e is OverflowException)
+			{
+				if (++skipped <= 3)
+					Console.Error.WriteLine($"{path}: skipped \"{line}\" ({e.Message})");
+			}
+		}
+
+		return ticks;
+	}
+
+	// Gives each bar the ticks inside it (null where there are none) and rebuilds those bars
+	// from them, so the bars and the path inside them agree.
+	private static int[][] AttachTicks(List<IndicatorCandle> candles, List<(long Time, int Price)> ticks, Options o, List<string> notes)
+	{
+		var paths = new int[candles.Count][];
+
+		if (candles.Count < 2 || ticks.Count == 0)
+			return paths;
+
+		// the bar length: the most common step between bars
+		var length = candles.Zip(candles.Skip(1), (a, b) => b.Time - a.Time).Where(d => d > TimeSpan.Zero)
+			.GroupBy(d => d).OrderByDescending(g => g.Count()).First().Key.Ticks;
+
+		var ordered = ticks.Select((t, i) => (t.Time, t.Price, Index: i)).OrderBy(t => t.Time).ThenBy(t => t.Index).ToList();
+		var bar = 0;
+		var outside = 0;
+		var current = new List<int>();
+		var currentBar = -1;
+		var changed = 0;
+
+		void Close()
+		{
+			if (currentBar < 0 || current.Count == 0)
+				return;
+
+			paths[currentBar] = current.ToArray();
+			var c = candles[currentBar];
+			var open = current[0] * o.Tick;
+			var high = current.Max() * o.Tick;
+			var low = current.Min() * o.Tick;
+			var close = current[current.Count - 1] * o.Tick;
+
+			if (c.Open != open || c.High != high || c.Low != low || c.Close != close)
+				changed++;
+
+			c.Open = open;
+			c.High = high;
+			c.Low = low;
+			c.Close = close;
+			current.Clear();
+		}
+
+		foreach (var (time, price, _) in ordered)
+		{
+			while (bar < candles.Count && candles[bar].Time.Ticks + length <= time)
+				bar++;
+
+			if (bar >= candles.Count || candles[bar].Time.Ticks > time)
+			{
+				outside++;
+				continue;
+			}
+
+			if (bar != currentBar)
+			{
+				Close();
+				currentBar = bar;
+			}
+
+			current.Add(price);
+		}
+
+		Close();
+		var withTicks = paths.Count(p => p != null);
+		notes.Add($"{ordered.Count - outside:N0} ticks inside {withTicks:N0} bars ({100.0 * withTicks / candles.Count:0.0}% of them); trades are settled on the ticks there, "
+			+ $"on the bars elsewhere{(changed > 0 ? $"; {changed} bars rebuilt from their ticks came out different" : string.Empty)}"
+			+ $"{(outside > 0 ? $"; {outside:N0} ticks outside the bars left out" : string.Empty)}");
+		return paths;
+	}
+
 	// sorted UTC bars on the tick grid; one symbol per trading day when a file mixes contracts
 	private static List<IndicatorCandle> BuildCandles(List<Row> rows, Options o, out List<string> notes)
 	{
@@ -722,8 +947,8 @@ internal static class Program
 		return trades;
 	}
 
-	private static string Report(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<Trade> trades, List<Trade> worst, Options o,
-		List<string> changed, List<string> notes, TimeSpan elapsed)
+	private static string Report(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles, List<Trade> trades, List<Trade> assumed, List<Trade> worst,
+		int[][] paths, Options o, List<string> changed, List<string> notes, TimeSpan elapsed)
 	{
 		var sb = new StringBuilder();
 		void Line(string text = "") => sb.AppendLine(text);
@@ -754,11 +979,22 @@ internal static class Program
 		var panelExpired = Field("_expired");
 		var agrees = panelTp == all.Tp && panelBe == all.Be && panelSl == all.Sl && panelExpired == all.Ex && panelNet == all.Ticks;
 
-		// the worst-case replay's trades on the chart that ended
+		// the other replays' trades on the chart that ended: on the bars with the assumed order
+		// (when the result is settled on ticks), and with the worst-case order
+		var assumedEnded = assumed?.Where(t => t.IsShown && t.Ended).ToList();
 		var worstEnded = worst?.Where(t => t.IsShown && t.Ended).ToList();
 
+		// how much of the trades' time the ticks covered: the bars after each entry, to its exit
+		double? coverage = null;
+
+		if (paths != null)
+		{
+			var lived = closed.Where(t => t.ExitBar > t.EntryBar).SelectMany(t => Enumerable.Range(t.EntryBar + 1, t.ExitBar - t.EntryBar)).ToList();
+			coverage = lived.Count == 0 ? 0 : (double)lived.Count(i => paths[i] != null) / lived.Count;
+		}
+
 		if (o.Summary)
-			return Summary(ended, worstEnded, o, agrees) + Environment.NewLine;
+			return Summary(ended, assumedEnded, worstEnded, coverage, o, agrees) + Environment.NewLine;
 
 		var first = NewYorkTime(candles[0].Time);
 		var last = NewYorkTime(candles[candles.Count - 1].Time);
@@ -842,26 +1078,41 @@ internal static class Program
 		Line();
 
 		// how much the result leans on the assumed order of each bar's high and low
-		var assumed = closed.Count(t => t.Ambiguous);
+		var onBars = assumedEnded ?? ended;
+		var decided = (assumed?.Where(t => t.IsShown && t.Closed) ?? closed).Count(t => t.Ambiguous);
+		var decidedOf = (assumed?.Where(t => t.IsShown && t.Closed) ?? closed).Count();
 
 		if (worstEnded != null)
 		{
-			var orderRows = new List<(string, Tally)> { ($"As assumed ({ind.SameBarRule})", all), ("Worst case (stop first)", Sum(worstEnded)) };
+			// each way of settling the trades, overall and before / from the split
+			var ways = new List<(string Name, string Short, List<Trade> Trades)>();
+
+			if (assumedEnded != null)
+				ways.Add(("On the ticks", "On the ticks", ended));
+
+			ways.Add(($"As assumed ({ind.SameBarRule})", "As assumed", onBars));
+			ways.Add(("Worst case (stop first)", "Worst case", worstEnded));
+			var orderRows = ways.Select(w => (w.Name, Sum(w.Trades))).ToList();
 
 			if (o.Split.HasValue)
 			{
 				var split = o.Split.Value;
-				orderRows.Add(($"As assumed, before {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime < split))));
-				orderRows.Add(($"Worst case, before {split:yyyy-MM-dd}", Sum(worstEnded.Where(t => t.SignalTime < split))));
-				orderRows.Add(($"As assumed, from {split:yyyy-MM-dd}", Sum(ended.Where(t => t.SignalTime >= split))));
-				orderRows.Add(($"Worst case, from {split:yyyy-MM-dd}", Sum(worstEnded.Where(t => t.SignalTime >= split))));
+				orderRows.AddRange(ways.Select(w => ($"{w.Short}, before {split:yyyy-MM-dd}", Sum(w.Trades.Where(t => t.SignalTime < split)))));
+				orderRows.AddRange(ways.Select(w => ($"{w.Short}, from {split:yyyy-MM-dd}", Sum(w.Trades.Where(t => t.SignalTime >= split)))));
 			}
 
-			Table("High / low order inside a bar", orderRows);
-			Line($"Bars don't show the path inside them. On {assumed} of {closed.Count} trades ({Percent(assumed, closed.Count)}) the order of the exit bar's "
-				+ "high and low decided the result, and more depend on the path unflagged: after a break-even trigger inside a bar, price often "
-				+ "comes back to the moved stop before the close, which no order of high and low shows. The truth usually lies between the two rows: "
-				+ "nearer the first when the break-even step is wide next to a typical bar, nearer the worst case when it is narrow.");
+			Table(assumedEnded != null ? "Ticks against bars" : "High / low order inside a bar", orderRows);
+
+			if (assumedEnded != null)
+			{
+				Line($"The first rows follow the ticks inside the bars that have them, as a live chart does ({coverage * 100:0.0}% of the bars the trades lived through); "
+					+ "the others settle the same history on the bars alone, with an assumed or the worst-case order of each bar's high and low.");
+			}
+
+			Line($"Bars don't show the path inside them. On {decided} of {decidedOf} trades ({Percent(decided, decidedOf)}) the order of the exit bar's "
+				+ "high and low decided the result on the bars, and more depend on the path unflagged: after a break-even trigger inside a bar, price often "
+				+ "comes back to the moved stop before the close, which no order of high and low shows. On bars alone the truth usually lies between the "
+				+ "assumed and the worst case: nearer the first when the break-even step is wide next to a typical bar, nearer the worst case when it is narrow.");
 
 			// how wide the break-even step is next to the bars the trades lived through
 			var ranges = closed.Where(t => t.ExitBar > t.EntryBar)
@@ -874,15 +1125,15 @@ internal static class Program
 			if (ranges.Count > 0 && steps.Count > 0)
 			{
 				Line($"Here the median bar during a trade spans {ranges[ranges.Count / 2].ToString("0", Inv)} ticks, the break-even step "
-					+ $"(trigger back to the moved stop) {steps[steps.Count / 2]}. tests/PathCheck measures what bars get wrong for a bracket "
-					+ "on simulated tick paths; tick data settles it.");
+					+ $"(trigger back to the moved stop) {steps[steps.Count / 2]}. "
+					+ (paths != null ? "The ticks settle it where they cover the trades." : "tests/PathCheck measures what bars get wrong for a bracket on simulated tick paths; tick data (--ticks) settles it."));
 			}
 
 			Line();
 		}
 		else
 		{
-			Line($"On {assumed} of {closed.Count} trades ({Percent(assumed, closed.Count)}) the order of the exit bar's high and low decided the result; "
+			Line($"On {decided} of {decidedOf} trades ({Percent(decided, decidedOf)}) the order of the exit bar's high and low decided the result; "
 				+ "every such bar was taken in the order worst for the trade.");
 			Line();
 		}
@@ -925,7 +1176,7 @@ internal static class Program
 	}
 
 	// one line of JSON: every signal that ended, and before / from the split when there is one
-	private static string Summary(List<Trade> ended, List<Trade> worstEnded, Options o, bool agrees)
+	private static string Summary(List<Trade> ended, List<Trade> assumedEnded, List<Trade> worstEnded, double? coverage, Options o, bool agrees)
 	{
 		string Part(IEnumerable<Trade> group)
 		{
@@ -966,6 +1217,10 @@ internal static class Program
 		}
 
 		var json = Parts(ended);
+
+		// with ticks: the same parts on the bars alone, with the assumed order inside each bar
+		if (assumedEnded != null)
+			json += $",\"assumed\":{{{Parts(assumedEnded)}}},\"tickCoverage\":{coverage.GetValueOrDefault().ToString("0.####", Inv)}";
 
 		// the same parts with the worst-case order inside each bar
 		if (worstEnded != null)
