@@ -5,20 +5,26 @@ A custom indicator for the [ATAS](https://atas.net) platform that:
 1. **reads candlestick patterns**: the ones on [TraderLion's cheat sheet](https://traderlion.com/technical-analysis/candlestick-patterns-cheat-sheet/)
    plus ten stronger, confirmed ones;
 2. uses those patterns to tell whether price reacted **bullish or bearish off a Fair Value Gap**;
-3. finds **the price inside each bar where the most contracts were filled**, marks whether the
-   resting bids or offers were filled there, and reads the reaction that followed (bullish or bearish);
+3. finds **the price inside each bar where the most contracts were filled** (big compared with
+   recent bars, so the size follows the market), marks whether the resting bids or offers were
+   filled there, and reads the reaction that followed (bullish or bearish);
 4. shows the **resting limit orders of 70+ contracts still waiting in the order book**, live
    from Level 2, and tells filled orders from pulled ones;
 5. **stops watching a gap once it has been used or filled**;
-6. turns reactions and liquidity sweeps into **BUY / SHORT signals with the odds of each way the
+6. marks the **key levels** where stops pile up: the prior day's, the overnight and the opening
+   range's high and low, and equal highs / lows. It shows which ones price swept and which it broke;
+7. turns reactions and liquidity sweeps into **BUY / SHORT signals with the odds of each way the
    trade can end**: the take profit (80 ticks), the break-even stop (the stop moves to +20 ticks
-   once the trade is 40 ticks in profit) or the stop loss (80 ticks).
+   once the trade is 40 ticks in profit) or the stop loss (80 ticks). By default they only fire
+   during regular hours, 09:30–16:00 New York time;
+8. keeps a **scoreboard** of how each setup and each candlestick pattern has done on your chart,
+   and checks whether the odds it showed held up.
 
 ![Layout preview](docs/preview.png)
 
-*Layout preview produced by the test harness from synthetic data, with a simulated order book and
-the mouse over a big fill. It is not an ATAS screenshot: ATAS draws the candles and arrows itself,
-with its own fonts and theme.*
+*Layout preview produced by the test harness from synthetic data (a 1-minute chart in regular
+hours), with a simulated order book and the mouse over the overnight low's tag. It is not an ATAS
+screenshot: ATAS draws the candles and arrows itself, with its own fonts and theme.*
 
 ## What it draws
 
@@ -30,12 +36,14 @@ with its own fonts and theme.*
 | White ring around a bubble | The order book saw a resting order of 70+ contracts filled right there |
 | Blue / orange bands with a size tag | Resting **bids / offers of 70+ contracts** still waiting in the order book, from the bar where they appeared; the tag at the right edge shows their size. The bigger the order, the stronger the color. A filled one stops, faintly, where it was filled |
 | Dotted line ending in a dot | A liquidity sweep: from the swing high / low that held the stops to the bar that ran them |
+| Lavender lines labelled `PDH`, `ONL`, `ORH`, `EQL`... | Key levels: prior day, overnight and opening range highs / lows, equal highs / lows. Bright while untouched. Where a bar swept one, the line stops, dimmer, with a dot (red for highs, green for lows). Faint and dashed where a bar closed beyond it |
 | **Large arrows + card** | **BUY / SHORT signal** of the open trade: the setup, the odds of TP / break-even / SL and the expected ticks |
 | Large arrows + small chip | A signal whose trade has ended, with its result: `TP +80t`, `BE +20t`, `SL -80t` or `EXP` |
 | Shaded boxes | The open trade: entry → TP shaded green, entry → SL shaded red, amber dotted line at the break-even trigger (+40 ticks), solid amber once the stop has moved to +20, price tags at the right end. Trades that have ended leave a faint box |
-| Panel | Results, the labels' track record, the fills and resting orders so far, and the live odds of the open trade |
+| Panel | Results, the labels' track record, the signal hours, the fills and resting orders so far with the size each needs now, and the live odds of the open trade. Hover it for the scoreboard |
 
-Hover the mouse over a card or chip, a bubble, a reaction marker or an order band for the details.
+Hover the mouse over a card or chip, a bubble, a reaction marker, an order band or a key level's
+label for the details.
 Gaps that are no longer watched can also be kept as faint boxes (*Show used / filled zones*).
 
 ## Fair Value Gaps
@@ -126,9 +134,17 @@ the way it points.
 
 ## Big fills and the reaction after them
 
-For every closed bar the indicator reads the footprint: the price where **the most contracts
-traded** counts as a big fill when it has at least *Min filled volume at one price* contracts
-(150) and at least *Filled volume vs bar average* (3×) the bar's average volume per price.
+For every closed bar the indicator reads the footprint. The price where **the most contracts
+traded** is a big fill when it stands out twice:
+
+* **against recent bars** (*Big fill size*). By default it has to rank in the top *Top share of
+  recent bars* (10%) of the busiest prices of the last *Fill lookback* bars (200). So the size
+  follows the instrument, the timeframe and the time of day on its own. It is measured against
+  earlier bars only (no look-ahead), and needs 20 bars with a footprint to start. The panel shows
+  the size it takes now (`big ≥412`). Set *Big fill size* to *A fixed number of contracts* to use
+  *Min filled volume at one price* (150) instead;
+* **inside its bar**: at least *Filled volume vs bar average* (3×) the bar's average volume per
+  price.
 
 Whoever waited there got filled:
 
@@ -152,13 +168,18 @@ the offer is a resting order. It is drawn as a band on its price from the bar wh
 appeared, with its size at the right edge. **These are the big orders that have not been filled
 yet.** The panel counts them and names the largest.
 
-When such a level drops below 70, the indicator checks the trades printed at its price:
+*Resting order size* can instead ask for a multiple of what is normal in the book: at least
+*Resting order vs typical level* (5×) the median size of the prices in the book when the order
+appears (70 while the book shows fewer than 5 prices). Each order keeps the size it was measured
+against, so it doesn't come and go as the rest of the book changes.
+
+When such a level drops below its size, the indicator checks the trades printed at its price:
 
 * **Filled**: trades against it (sells into a bid, buys into an offer) took at least *Filled when
   traded* (50%) of its size. The band stops there. If the bar's big fill is at that price, on that
   side, its bubble gets a white ring. If not, the order becomes a big fill of its own (a bubble
-  with a ring) once at least *Min filled volume* (150) traded against it. Its reaction is read like
-  any other fill.
+  with a ring) once as many contracts traded against it as a big fill needs (the panel's `big ≥`,
+  or *Min filled volume*, 150, with a fixed size). Its reaction is read like any other fill.
 * **Pulled**: the trades at its price did not reach that share within 2 seconds, so the orders
   were cancelled rather than filled.
 * **Left the visible depth**: not filled either, but it was the deepest level in the book when it
@@ -186,6 +207,34 @@ What Level 2 can and can't do inside an indicator:
 A sweep is a bar that wicks beyond the high / low of the last *Swing Lookback* bars (10) and closes
 back inside: a stop run. A dotted line joins the swing it took to the sweep bar.
 
+## Key levels
+
+Some highs and lows are watched by everyone, so stops pile up just beyond them. The indicator
+marks them in New York time, whatever time zone the chart shows (summer time included). Its
+trading day starts at 18:00, when CME's overnight session opens.
+
+| Level | Tag | The high and low of | Watched from |
+|---|---|---|---|
+| Prior day | `PDH` / `PDL` | the previous regular session (*Regular hours start / end*: 09:30–16:00) | the start of the trading day |
+| Overnight | `ONH` / `ONL` | 18:00 until regular hours open | the first bar of regular hours |
+| Opening range | `ORH` / `ORL` | the first *Opening range* minutes (30) of regular hours | the first bar after the opening range |
+| Equal highs / lows | `EQH` / `EQL` | two swing highs (lows) within *Equal level match* ticks (2) of each other, at most *Equal level lookback* bars (120) apart, with no bar trading beyond them in between | the bar after the second swing is confirmed |
+
+A swing high is higher than the 3 bars before it, and none of the 3 after it goes higher, so it
+is confirmed 3 bars later (swing lows the other way round). Equal highs are marked at the higher
+of the two highs, equal lows at the lower of the two lows.
+
+The first bar that trades beyond a level takes it, and the level is not watched after that:
+
+* **swept**: the bar closes back inside. The stops were run and price came back. The line stops
+  there with a dot;
+* **broken**: the bar closes beyond it. Price accepted the other side. The line turns faint and
+  dashed.
+
+A day's levels that nothing took by the end of the trading day stop there. Equal highs / lows
+stop once *Equal level lookback* bars have passed since their second swing. Hover a level's tag to
+see what it is, when it started to count and how it ended.
+
 ## BUY / SHORT signals
 
 A signal is decided when a bar **closes**, so it never repaints. It needs a trigger (*Signal
@@ -194,10 +243,17 @@ source*):
 * **FVG**: a reaction off a gap. A bullish reaction gives a BUY, a bearish one a SHORT.
 * **Sweep+FVG**: an FVG reaction within *Sweep -> FVG window* bars (10) after a sweep on the same
   side: liquidity is taken, then price reverses out of an imbalance.
+* **Key sweep+FVG** (e.g. `PDL sweep+FVG`): the same after a sweep of a key level.
 * **Fill**: a reaction to a big footprint fill.
+* **Key sweep** (e.g. `Sweep ONH`): a bar that sweeps a key level: lows for a BUY, highs for a
+  SHORT. When it sweeps several, the most important one names it: the prior day first, then the
+  overnight range, the opening range and equal highs / lows. Between two of a kind, the further
+  one wins: it took more stops.
 * **Sweep**: a liquidity sweep: of lows for a BUY, of highs for a SHORT.
 
-When a bar has several, the FVG reaction comes first, then the fill reaction, then the sweep.
+When a bar has several, the FVG reaction comes first, then the fill reaction, the key sweep and
+the plain sweep. A key sweep outranks a plain one, so an FVG reaction after both is a *Key
+sweep+FVG*.
 
 Each signal counts up to four confirmations, and any of them can be made mandatory:
 
@@ -214,6 +270,20 @@ default 80 / 80 on NQ that is 20 points each way ($400 per NQ contract, $40 per 
 trade is *Break-even trigger* ticks in profit (40), its stop moves to *Break-even stop* ticks in
 profit (+20), so from then on it ends at +80 or +20. Set the trigger to 0 to trade the plain
 80 / 80 bracket.
+
+### Signal hours
+
+By default signals only fire during **regular hours**, 09:30–16:00 New York time (*Signal
+hours*). A bar counts by the time it opens, in New York time whatever time zone the chart shows.
+Gaps, fills, sweeps and key levels are still found around the clock; only the signals wait. Bars
+outside the hours give no signals at all, so they don't count in the statistics either. The
+other choices:
+
+* **All hours**: signals around the clock, as before;
+* **First two hours of regular hours**: 09:30–11:30, usually the busiest stretch;
+* **Regular hours, not 11:30 – 13:30**: skips the lunch lull.
+
+The panel shows which one is on, with the New York time of the last bar to check it against.
 
 ### Where the probability comes from
 
@@ -259,24 +329,65 @@ The panel shows:
 
 * TP / BE / SL counts and net ticks for longs, shorts and total (signals shown on the chart);
 * open, expired and hidden signals, and how many settled trades the model has learned from;
+* the signal hours, and the New York time of the last bar;
 * **track record**: the average ticks actually made by signals labelled with a positive EV and
   by the rest, so you can see whether the labels have been reliable on this chart;
-* the big fills so far and how many had a bullish or bearish reaction, and the resting orders
-  of 70+ in the book now, with the largest;
+* the big fills so far, how many had a bullish or bearish reaction and the size a big fill takes
+  now; the resting orders in the book now, the size they need and the largest;
 * for an open trade, **live odds** from the current price, e.g.
   `Live BUY +44t, stop +20t:  TP 38% · BE 62% · SL 0%`. Each leg (reaching +40 before the stop,
   then TP before the break-even stop) is a random walk with the drift implied by the entry odds.
 
+### Scoreboard
+
+Hover the panel, or switch on *Keep the scoreboard open*, for a table of how each kind of signal
+has done on this chart. It opens under the panel (above it when the panel sits at the bottom).
+Every signal that ended at TP, BE or SL counts, hidden ones included; expired ones don't.
+
+```
+Scoreboard: 118 closed signals, hidden ones included
+Setup          n   TP   BE   SL     avg
+FVG           41    9   17   15   -3.4t
+Key sweep     23    8    9    6  +14.8t
+...
+Pattern        n   TP   BE   SL     avg
+Hammer        17    5    7    5   +8.2t
+...
+Odds check (were the TP odds right?)
+Said TP 20–30%: hit 24% of 41
+...
+```
+
+* **Setup**: a row per trigger (FVG, Sweep, Sweep+FVG, Fill, Key sweep, Key sweep+FVG).
+* **Pattern**: a row per candlestick pattern (the ten most frequent) and one for *No pattern*. A
+  signal whose bar completed several patterns counts in each of their rows.
+* Each row: the number of signals, how many ended at TP / BE / SL, and the average ticks per
+  signal, green when it made money, red when it lost.
+* **Odds check**: the signals grouped by the TP odds their label showed (under 20%, 20–30%, ...,
+  60% and more), with how often they really hit the TP. A line like `Said TP 30–40%: hit 35% of
+  52` means the odds have been honest on this chart.
+
+Use it to prune: switch off the patterns that keep losing ticks, pick a narrower *Signal source*,
+or change the hours. A row with a handful of signals is mostly noise, so wait for a few dozen
+before you judge it.
+
 ## Tuning
 
-* **Too many bubbles?** *Min filled volume at one price* is a plain contract count, so the right
-  value depends on the instrument, the timeframe and the session. Raise it, or the multiplier,
-  until only the fills that stand out are left.
+* **Too many bubbles?** Lower *Top share of recent bars* (say to 5%), or raise the multiplier.
+  With *A fixed number of contracts*, *Min filled volume at one price* is a plain count whose right
+  value depends on the instrument, the timeframe and the session: raise it until only the fills
+  that stand out are left.
 * **Resting orders.** 70 contracts at one price usually stands out on NQ. On markets with a much deeper
-  book, such as ES, most levels hold more than that, so raise *Min resting order* there.
+  book, such as ES, most levels hold more than that: raise *Min resting order* there, or set
+  *Resting order size* to *Times the typical level in the book*.
+* **Too many lines?** Switch off the key levels you don't trade. Equal highs / lows are the most
+  frequent; a smaller *Equal level match* or *Equal level lookback* keeps fewer. With *Draw key
+  levels* off their sweeps still give signals, without the lines.
 * **Gaps piling up in a trend?** Lower *Zone Max Age* or raise *Min FVG Size*. For fewer, cleaner
   reactions switch off the weaker patterns (marubozu, harami, inverted hammer / hanging man),
   or turn on *Require candlestick pattern* to filter the sweeps.
+* **Prune with the scoreboard** once its rows hold a few dozen signals each: switch off the
+  patterns and setups that keep losing ticks on your chart.
 
 ## Honest limits
 
@@ -299,6 +410,14 @@ The panel shows:
   pulled a moment before price arrives, look like any other resting or pulled order.
 * Signals close together often ride the same move. The cooldown limits that, but *n* can still
   overstate the independent evidence.
+* Key levels and signal hours assume CME's session: a trading day that turns at 18:00 New York
+  time, with US summer time. For another market, set *Regular hours start / end* to its session
+  in New York time, or use *All hours*. The day still turns at 18:00 New York time.
+* Sessions are read from each bar's open time, so they work best on minute charts. On 1-hour
+  bars the bar that opens at 09:00 still counts as overnight, and there is no 30-minute opening
+  range.
+* Key levels come from the bars loaded on the chart: the first day has no prior day, and a day
+  that starts partway through gets partial ranges.
 
 ## Install
 
@@ -366,16 +485,28 @@ show while the chart is open.
 | | Draw FVG Zones, Show zone midline (50%) | on | |
 | | Show used / filled zones | off | a faint box for each gap that is no longer watched |
 | | Bullish zone color, Bearish zone color | translucent teal / red | |
+| Sessions & Key Levels | Signal hours (New York) | Regular hours | or all hours; the first two hours of regular hours; regular hours but not 11:30 – 13:30 |
+| | Regular hours start / end (New York) | 09:30 / 16:00 | for the signal hours, the prior day, the overnight range and the opening range |
+| | Opening range (minutes) | 30 | |
+| | Prior day high / low, Overnight high / low, Opening range high / low, Equal highs / lows | on | which key levels to watch |
+| | Equal level match (ticks) | 2 | how far apart two swing highs (lows) may be and still count as equal |
+| | Equal level lookback (bars) | 120 | how many bars apart the two swings may be, and how long the level counts after the second one |
+| | Draw key levels | on | the lines; their sweeps count either way |
 | Order Flow | Show big fills | on | the bubbles |
-| | Min filled volume at one price | 150 | contracts at the bar's busiest price |
+| | Big fill size | Among the biggest of recent bars | or a fixed number of contracts |
+| | Top share of recent bars (%) | 10 | the bar's busiest price must rank this high among the busiest prices of recent bars |
+| | Fill lookback (bars) | 200 | the recent bars it is ranked against |
+| | Min filled volume at one price | 150 | with a fixed size: contracts at the bar's busiest price |
 | | Filled volume vs bar average (x) | 3.0 | and this many times the bar's average per price |
 | | Reaction window (bars) | 3 | bars after the fill bar a reaction may take |
 | | Show resting orders | on | live, from Level 2 |
-| | Min resting order (contracts) | 70 | at one price |
+| | Resting order size | A fixed number of contracts | or times the typical level in the book |
+| | Min resting order (contracts) | 70 | at one price, with a fixed size |
+| | Resting order vs typical level (x) | 5.0 | times the median size of the prices in the book |
 | | Filled when traded (%) | 50 | share of an order that must trade at its price for it to count as filled rather than pulled |
 | | Show pulled orders | off | a faint trace of big orders that were cancelled |
 | Signals | Buy signals, Short signals | on | |
-| | Signal source | FVG reaction, fill reaction or sweep | or FVG reaction only, liquidity sweep only, sweep then FVG reaction, fill reaction only |
+| | Signal source | FVG reaction, fill reaction or sweep | or FVG reaction only, liquidity sweep only, sweep then FVG reaction, fill reaction only, key-level sweeps only (alone or then FVG). Wherever sweeps count, key sweeps do too |
 | | Sweep -> FVG window (bars) | 10 | |
 | | Trend EMA period (0 = off) | 50 | |
 | | Only trade with the trend / Require delta / Require order-flow confirmation / Require candlestick pattern | off | |
@@ -395,6 +526,7 @@ show while the chart is open.
 | | Order of high and low inside a bar | Open to the nearer extreme first | or worst case for the trade, or candle direction (O-L-H-C / O-H-L-C) |
 | | Probability smoothing (virtual trades) | 10 | higher = steadier numbers that need more history to move |
 | Display | Show signal labels, Compact labels for closed trades, Show TP / SL levels, Show statistics panel | on | closed trades keep a small result chip and a faint box |
+| | Keep the scoreboard open | off | shows the scoreboard without hovering the panel |
 | | Show reaction labels | off | name the pattern next to each reaction marker (hovering one always does) |
 | | Statistics panel position, Label offset (px), Label font, Take profit / Stop loss / Break-even line | top right, 24, Arial 9 | |
 | Alerts | Alert on new signal / Alert on TP / SL / break-even / Alert sound file | off / off / alert1 | the second also fires when a stop moves to break-even; only in real time, never while history loads |
@@ -402,11 +534,25 @@ show while the chart is open.
 The signal arrows are regular data series (*Buy Signal*, *Short Signal*), so ATAS can also use
 them for alerts or automation. The reaction and sweep series (*FVG Bull Reaction*, *Liquidity
 Sweep Low*...) keep their names and values for the same purpose, but are hidden, since the chart
-draws its own markers for them.
+draws its own markers for them. The sweep series also mark sweeps of key levels.
 
 ## Changes in this version
 
-This version is a rewrite.
+New since the rewrite:
+
+* **key levels**: the prior day's, the overnight and the opening range's highs / lows and equal
+  highs / lows, swept or broken, with two new triggers, *Key sweep* and *Key sweep+FVG*;
+* **signal hours**: by default signals only fire during regular hours, in New York time;
+* **big fills sized against recent bars** by default instead of a fixed 150 contracts, and an
+  optional resting-order size relative to the book;
+* the **scoreboard** per setup and per pattern, with the odds check;
+* the Windows DLL for ATAS builds that run on .NET 8 now compiles (that target was missing
+  `System.Drawing.Common`).
+
+For the signals of the rewrite, set *Signal hours* to *All hours* and *Big fill size* to *A fixed
+number of contracts*, and switch the four key levels off.
+
+The rewrite itself:
 
 * **Kept**: the Fair Value Gaps and their settings, liquidity sweeps, every pattern of the cheat
   sheet, and the BUY / SHORT signals with their TP / BE / SL odds (80 / 80, break-even +40 → +20).

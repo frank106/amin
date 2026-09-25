@@ -51,6 +51,13 @@ internal static class Program
 		Run("Order book: resting orders, filled vs pulled", OrderBookRestingOrders);
 		Run("Order book: fills merge with the footprint and get a reaction", OrderBookFillReaction);
 		Run("Order book: a fill on the other side of the footprint stays apart", OrderBookFillSides);
+		Run("Defaults of the newer features", DefaultSettings);
+		Run("New York time, trading days and signal hours", NewYorkTimeAndHours);
+		Run("Key levels: overnight, opening range and prior day, swept and broken", KeyLevelDaysScenario);
+		Run("Key levels: equal highs, their near misses and expiry", EqualHighsScenario);
+		Run("Adaptive sizes: big fills among the biggest of recent bars", AdaptiveFills);
+		Run("Adaptive sizes: resting orders against the typical level", AdaptiveRestingOrders);
+		Run("Scoreboard: results per setup and pattern, and the odds check", ScoreboardCounts);
 		Run("Fuzz: historical run vs oracle", () => FuzzHistorical(seed: 7, configure: null));
 		Run("Fuzz: expiry + session end + cooldown 0", () => FuzzHistorical(seed: 11, configure: i =>
 		{
@@ -101,8 +108,54 @@ internal static class Program
 			i.FillMinVolume = 250;
 			i.FillVolumeMultiplier = 2;
 		}));
+		Run("Fuzz: the defaults - key levels, regular hours, adaptive fills", () => FuzzHistorical(seed: 53, configure: Defaults));
+		Run("Fuzz: key levels around the clock, sweeps only, other sizes", () => FuzzHistorical(seed: 59, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.AllHours;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.LiquiditySweepOnly;
+			i.EqualToleranceTicks = 1;
+			i.EqualLookbackBars = 60;
+			i.OpeningRangeMinutes = 15;
+			i.FillTopPercent = 20;
+			i.FillLookbackBars = 50;
+		}));
+		Run("Fuzz: key-level sweeps only, around the clock", () => FuzzHistorical(seed: 61, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.AllHours;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.KeyLevelSweeps;
+			i.OneTradeAtATime = false;
+			i.SignalCooldownBars = 0;
+			i.EqualToleranceTicks = 8;
+			i.EqualLookbackBars = 400;
+		}, rich: false));
+		Run("Fuzz: the first two hours of regular hours", () => FuzzHistorical(seed: 71, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.FirstTwoHours;
+			i.OneTradeAtATime = false;
+			i.SignalCooldownBars = 1;
+		}));
+		Run("Fuzz: no lunch, confluence mode, other session times", () => FuzzHistorical(seed: 67, configure: i =>
+		{
+			Defaults(i);
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.RegularHoursNoLunch;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.SweepThenFvg;
+			i.RegularHoursStart = new TimeSpan(8, 30, 0);
+			i.RegularHoursEnd = new TimeSpan(15, 15, 0);
+			i.OneTradeAtATime = false;
+			i.LevelOvernight = false;
+		}));
 		Run("Fuzz: filters hide signals, the model still learns", FuzzFilters);
-		Run("Fuzz: live ticks and a live order book match history", FuzzLiveMatchesHistory);
+		Run("Fuzz: live ticks and a live order book match history", () => FuzzLiveMatchesHistory());
+		Run("Fuzz: live matches history with key levels", () => FuzzLiveMatchesHistory(i =>
+		{
+			Defaults(i);
+			i.FillSize = FvgReactionLiquiditySweep.FillSizeRule.FixedContracts;
+			i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.AllHours;
+			i.EqualToleranceTicks = 4;
+		}, seed: 83));
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
@@ -1273,22 +1326,526 @@ internal static class Program
 		Check(Orders(ind).Count(o => o.State == "Filled") == 4, "all four orders were filled");
 	}
 
+	private static void DefaultSettings()
+	{
+		var fresh = new FvgReactionLiquiditySweep();
+		Check(fresh.SignalHours == FvgReactionLiquiditySweep.SignalHoursRule.RegularHours && fresh.RegularHoursStart == new TimeSpan(9, 30, 0)
+			&& fresh.RegularHoursEnd == new TimeSpan(16, 0, 0) && fresh.OpeningRangeMinutes == 30, "signals in regular hours 9:30 - 16:00 New York, 30-minute opening range");
+		Check(fresh.LevelPriorDay && fresh.LevelOvernight && fresh.LevelOpeningRange && fresh.LevelEqual && fresh.EqualToleranceTicks == 2
+			&& fresh.EqualLookbackBars == 120 && fresh.DrawKeyLevels, "every key level on");
+		Check(fresh.FillSize == FvgReactionLiquiditySweep.FillSizeRule.TopOfRecentBars && fresh.FillTopPercent == 10 && fresh.FillLookbackBars == 200
+			&& fresh.FillMinVolume == 150 && fresh.FillVolumeMultiplier == 3.0, "big fills among the top 10% of the last 200 bars");
+		Check(fresh.RestingSize == FvgReactionLiquiditySweep.RestingSizeRule.FixedContracts && fresh.RestingOrderMin == 70 && fresh.RestingMultiplier == 5.0,
+			"resting orders of 70 contracts");
+		Check(!fresh.ShowScoreboard, "the scoreboard opens on hover");
+
+		// every setting has its own place in the settings window
+		var orders = IndicatorType.GetProperties()
+			.Select(p => p.GetCustomAttribute<System.ComponentModel.DataAnnotations.DisplayAttribute>())
+			.Where(d => d != null)
+			.Select(d => d.GetOrder())
+			.ToList();
+		Check(orders.Count > 60 && orders.All(o => o.HasValue) && orders.Distinct().Count() == orders.Count, $"{orders.Count} settings, each with its own order");
+	}
+
+	private static void NewYorkTimeAndHours()
+	{
+		var toNewYork = IndicatorType.GetMethod("NewYorkTime", PrivateStatic);
+		DateTime Ny(DateTime utc) => (DateTime)toNewYork.Invoke(null, new object[] { utc });
+
+		// US daylight saving 2026: March 8 2:00 to November 1 2:00
+		Check(Ny(new DateTime(2026, 3, 8, 6, 59, 0)) == new DateTime(2026, 3, 8, 1, 59, 0), "a minute before summer time: UTC-5");
+		Check(Ny(new DateTime(2026, 3, 8, 7, 0, 0)) == new DateTime(2026, 3, 8, 3, 0, 0), "summer time: UTC-4");
+		Check(Ny(new DateTime(2026, 11, 1, 5, 59, 0)) == new DateTime(2026, 11, 1, 1, 59, 0), "a minute before winter time");
+		Check(Ny(new DateTime(2026, 11, 1, 6, 0, 0)) == new DateTime(2026, 11, 1, 1, 0, 0), "winter time again");
+		Check(Ny(DateTime.MinValue) == DateTime.MinValue, "no time, no conversion");
+
+		// every half hour of 2024 - 2028 against the system's New York time zone
+		var zone = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+		var wrong = 0;
+
+		for (var t = new DateTime(2024, 1, 1); t < new DateTime(2029, 1, 1); t = t.AddMinutes(30))
+			wrong += Ny(t) != TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(t, DateTimeKind.Utc), zone) ? 1 : 0;
+
+		Check(wrong == 0, $"{wrong} half hours differ from the system's New York time");
+
+		var tradingDay = IndicatorType.GetMethod("TradingDayOf", PrivateStatic);
+		DateTime Day(DateTime t) => (DateTime)tradingDay.Invoke(null, new object[] { t });
+		Check(Day(new DateTime(2026, 1, 14, 17, 59, 0)) == new DateTime(2026, 1, 14) && Day(new DateTime(2026, 1, 14, 18, 0, 0)) == new DateTime(2026, 1, 15),
+			"18:00 starts the next trading day");
+
+		// the signal hours, New York time in January (UTC-5)
+		var inHours = IndicatorType.GetMethod("InSignalHours", Private);
+
+		bool At(FvgReactionLiquiditySweep.SignalHoursRule rule, int hour, int minute, Action<FvgReactionLiquiditySweep> more = null)
+		{
+			var ind = NewIndicator(i =>
+			{
+				i.SignalHours = rule;
+				more?.Invoke(i);
+			});
+
+			return (bool)inHours.Invoke(ind, new object[] { new DateTime(2026, 1, 14, hour, minute, 0).AddHours(5) });
+		}
+
+		var regular = FvgReactionLiquiditySweep.SignalHoursRule.RegularHours;
+		var firstTwo = FvgReactionLiquiditySweep.SignalHoursRule.FirstTwoHours;
+		var noLunch = FvgReactionLiquiditySweep.SignalHoursRule.RegularHoursNoLunch;
+		Check(!At(regular, 9, 29) && At(regular, 9, 30) && At(regular, 15, 59) && !At(regular, 16, 0), "regular hours 9:30 - 16:00");
+		Check(!At(firstTwo, 9, 29) && At(firstTwo, 9, 30) && At(firstTwo, 11, 29) && !At(firstTwo, 11, 30), "first two hours 9:30 - 11:30");
+		Check(At(noLunch, 11, 29) && !At(noLunch, 11, 30) && !At(noLunch, 13, 29) && At(noLunch, 13, 30) && !At(noLunch, 16, 0), "lunch 11:30 - 13:30 left out");
+		Check(At(FvgReactionLiquiditySweep.SignalHoursRule.AllHours, 3, 0), "all hours");
+
+		Action<FvgReactionLiquiditySweep> early = i =>
+		{
+			i.RegularHoursStart = new TimeSpan(8, 30, 0);
+			i.RegularHoursEnd = new TimeSpan(20, 0, 0);
+		};
+
+		Check(At(regular, 8, 30, early) && At(regular, 17, 59, early) && !At(regular, 18, 0, early), "other hours; the session ends by 18:00");
+		Check(!At(firstTwo, 10, 30, early) && At(firstTwo, 10, 29, early), "the first two hours follow the start");
+	}
+
+	// a bar opening at a New York time in January 2026 (UTC-5)
+	private static IndicatorCandle NyBar(int day, int hour, int minute, decimal open, decimal high, decimal low, decimal close)
+	{
+		var bar = Bar(open, high, low, close);
+		bar.Time = new DateTime(2026, 1, day, hour, minute, 0).AddHours(5);
+		return bar;
+	}
+
+	// Two trading days in 30-minute bars. Jan 13: overnight 99.5 - 100.5, regular hours 98 - 102;
+	// bar 6 sweeps the overnight and opening-range highs, bar 10 their lows. Jan 14 (from 18:00
+	// on the 13th): an overnight sweep of the swing lows at bar 22, the open at bar 27, bar 28
+	// breaks the new overnight and opening-range highs, and the shooting star at bar 31 sweeps
+	// the prior day high.
+	private static List<IndicatorCandle> KeyLevelDays()
+	{
+		IndicatorCandle Flat(int day, int hour, int minute) => NyBar(day, hour, minute, 100, 100.5m, 99.5m, 100);
+
+		return new List<IndicatorCandle>
+		{
+			Flat(13, 8, 0), Flat(13, 8, 30), Flat(13, 9, 0),
+			Flat(13, 9, 30), Flat(13, 10, 0), Flat(13, 10, 30),
+			NyBar(13, 11, 0, 100, 102, 99.5m, 100.25m),
+			Flat(13, 11, 30), Flat(13, 12, 0), Flat(13, 12, 30),
+			NyBar(13, 13, 0, 100, 100.5m, 98, 99.75m),
+			Flat(13, 13, 30), Flat(13, 14, 0), Flat(13, 14, 30), Flat(13, 15, 0), Flat(13, 15, 30),
+			Flat(13, 16, 0), Flat(13, 16, 30), Flat(13, 17, 0), Flat(13, 17, 30),
+			Flat(13, 18, 0), Flat(13, 19, 0),
+			NyBar(13, 21, 0, 100, 100.5m, 99, 100),
+			Flat(14, 1, 0), Flat(14, 5, 0), Flat(14, 8, 0), Flat(14, 9, 0),
+			Flat(14, 9, 30),
+			NyBar(14, 10, 0, 100, 101, 99.75m, 100.75m),
+			NyBar(14, 10, 30, 100.75m, 101.5m, 100.5m, 101.25m),
+			NyBar(14, 11, 0, 101.25m, 101.75m, 101, 101.5m),
+			NyBar(14, 11, 30, 101.75m, 102.5m, 101.5m, 101.5m),
+			NyBar(14, 12, 0, 101.5m, 101.75m, 100.75m, 101),
+			NyBar(14, 12, 30, 101, 101.25m, 100.75m, 101)
+		};
+	}
+
+	private static void KeyLevelDaysScenario()
+	{
+		Action<FvgReactionLiquiditySweep> Levels(FvgReactionLiquiditySweep.SignalHoursRule hours, Action<FvgReactionLiquiditySweep> more = null) => i =>
+		{
+			i.SignalHours = hours;
+			i.LevelPriorDay = true;
+			i.LevelOvernight = true;
+			i.LevelOpeningRange = true;
+			i.SwingLookback = 2;
+			i.OneTradeAtATime = false;
+			more?.Invoke(i);
+		};
+
+		string TradeKey(TradeView t) => $"{t.EntryBar}|{(t.IsLong ? "BUY" : "SHORT")}|{t.Trigger}|{t.SweptLevel}|{string.Join(",", t.CandlePatterns)}";
+
+		var ind = RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.RegularHours));
+		var expectedLevels = new[]
+		{
+			"OvernightHigh|100.5|3|6|Swept|-1|-1", "OvernightLow|99.5|3|10|Swept|-1|-1",
+			"OpeningRangeHigh|100.5|4|6|Swept|-1|-1", "OpeningRangeLow|99.5|4|10|Swept|-1|-1",
+			"PriorDayHigh|102|20|31|Swept|-1|-1", "PriorDayLow|98|20|-1|Fresh|-1|-1",
+			"OvernightHigh|100.5|27|28|Broken|-1|-1", "OvernightLow|99|27|-1|Fresh|-1|-1",
+			"OpeningRangeHigh|100.5|28|28|Broken|-1|-1", "OpeningRangeLow|99.5|28|-1|Fresh|-1|-1"
+		}.OrderBy(k => k, StringComparer.Ordinal).ToList();
+		var levels = KeyLevelKeys(ind);
+		Check(levels.SequenceEqual(expectedLevels), $"key levels: {string.Join("; ", levels)}");
+
+		var trades = Trades(ind).Select(TradeKey).ToList();
+		var expected = new[]
+		{
+			"6|SHORT|KeySweep|OvernightHigh@100.5@6|", "10|BUY|KeySweep|OvernightLow@99.5@10|", "31|SHORT|KeySweep|PriorDayHigh@102@31|ShootingStar"
+		};
+		Check(trades.SequenceEqual(expected), $"regular hours: {string.Join("; ", trades)}");
+
+		// the overnight sweep of bar 22 only counts around the clock
+		trades = Trades(RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.AllHours))).Select(TradeKey).ToList();
+		Check(trades.SequenceEqual(expected.Take(2).Append("22|BUY|Sweep||").Concat(expected.Skip(2))), $"all hours: {string.Join("; ", trades)}");
+
+		trades = Trades(RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.RegularHoursNoLunch))).Select(TradeKey).ToList();
+		Check(trades.SequenceEqual(expected.Take(1)), $"no lunch: 13:00 and 11:30 are left out ({string.Join("; ", trades)})");
+
+		trades = Trades(RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.FirstTwoHours))).Select(TradeKey).ToList();
+		Check(trades.SequenceEqual(expected.Take(1)), $"first two hours: 11:30 is too late ({string.Join("; ", trades)})");
+
+		// without the overnight levels bar 6 sweeps the opening range high instead
+		trades = Trades(RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.RegularHours, i => i.LevelOvernight = false)))
+			.Select(TradeKey).ToList();
+		Check(trades.Take(2).SequenceEqual(new[] { "6|SHORT|KeySweep|OpeningRangeHigh@100.5@6|", "10|BUY|KeySweep|OpeningRangeLow@99.5@10|" }),
+			$"opening range next in line: {string.Join("; ", trades)}");
+
+		// and without any key level they are plain sweeps
+		trades = Trades(RunHistorical(KeyLevelDays(), i => { i.SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.RegularHours; i.SwingLookback = 2; i.OneTradeAtATime = false; }))
+			.Select(TradeKey).ToList();
+		Check(trades.SequenceEqual(new[] { "6|SHORT|Sweep||", "10|BUY|Sweep||", "31|SHORT|Sweep||ShootingStar" }), $"plain sweeps: {string.Join("; ", trades)}");
+
+		// key-level sweeps only
+		trades = Trades(RunHistorical(KeyLevelDays(), Levels(FvgReactionLiquiditySweep.SignalHoursRule.AllHours,
+			i => i.SignalSource = FvgReactionLiquiditySweep.SignalMode.KeyLevelSweeps))).Select(TradeKey).ToList();
+		Check(trades.SequenceEqual(expected), $"key-level sweeps only: {string.Join("; ", trades)}");
+
+		// drawn: lines, a dot per sweep, names, and a tooltip on a name
+		ind.FirstVisibleBarNumber = 0;
+		ind.LastVisibleBarNumber = ind.Candles.Count - 1;
+		var chart = (FakeChart)ind.ChartInfo;
+		chart.TopPrice = 110;
+		var context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 220) == 5, "a dot where each of the five sweeps took its level");
+		Check(context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 220 && o.Color.R == 239) == 3
+			&& context.Operations.Count(o => o.Kind == "ellipse" && o.Color.A == 220 && o.Color.R == 38) == 2, "red dots for the three swept highs, green for the two lows");
+		Check(context.Operations.Count(o => o.Kind == "line" && o.Dashed && o.Color.R == 149 && o.Color.A == 70) == 2, "dashed where the two breaks went through");
+		Check(context.Strings.Contains("PDH") && context.Strings.Contains("PDL"), "the prior day levels are named");
+		Check(CardsOf(context).Any(c => c.Setup == "Sweep PDH · Shooting star"), "the open short's card names the level it swept");
+
+		var pdl = context.Operations.First(o => o.Kind == "text" && o.Text == "PDL");
+		chart.MouseLocationInfo.LastPosition = new Point(pdl.From.X + 2, pdl.From.Y + 2);
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Contains("Prior day low 98.00") && context.Strings.Any(t => t.StartsWith("Waiting since bar 20")), "level tooltip on hover");
+
+		// the signal tooltip names the swept level
+		var pdhCard = context.Operations.First(o => o.Kind == "text" && o.Text == "Sweep PDH · Shooting star");
+		chart.MouseLocationInfo.LastPosition = new Point(pdhCard.From.X + 2, pdhCard.From.Y + 2);
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Contains("Swept the prior day high 102.00 on bar 31"), "signal tooltip names the swept level");
+		Check(context.Strings.Any(t => t.StartsWith("Signals: regular hours 09:30–16:00 · last bar 12:30 New York")), "the panel shows the hours and the New York clock");
+	}
+
+	// flat bars with swing highs at bar 20 (101) and bar `second`, then a shooting star through
+	// both five bars later
+	private static List<IndicatorCandle> EqualHighsMarket(decimal secondHigh, decimal between = 100.5m, bool sweep = true, int length = 35, int second = 28)
+	{
+		var bars = Enumerable.Range(0, 20).Select(_ => Bar(100, 100.5m, 99.5m, 100)).ToList();
+		bars.Add(Bar(100, 101, 99.5m, 100));
+
+		for (var i = 21; i < second; i++)
+			bars.Add(Bar(100, i == 24 ? between : 100.5m, 99.5m, 100));
+
+		bars.Add(Bar(100, secondHigh, 99.5m, 100));
+
+		while (bars.Count < length - 1)
+			bars.Add(sweep && bars.Count == second + 5 ? Bar(101, 101.75m, 100.75m, 100.75m) : Bar(100, 100.5m, 99.5m, 100));
+
+		bars.Add(Bar(100, 100.5m, 99.5m, 100));
+		return bars;
+	}
+
+	private static void EqualHighsScenario()
+	{
+		Action<FvgReactionLiquiditySweep> Equal(Action<FvgReactionLiquiditySweep> more = null) => i =>
+		{
+			i.LevelEqual = true;
+			more?.Invoke(i);
+		};
+
+		var ind = RunHistorical(EqualHighsMarket(101.25m), Equal());
+		Check(KeyLevelKeys(ind).SequenceEqual(new[] { "EqualHighs|101.25|32|33|Swept|20|28" }), $"equal highs: {string.Join("; ", KeyLevelKeys(ind))}");
+		// each swing high sweeps the highs before it; the shooting star takes the pair
+		var trades = Trades(ind);
+		Check(trades.Select(t => $"{t.EntryBar}|{t.Trigger}").SequenceEqual(new[] { "20|Sweep", "28|Sweep", "33|KeySweep" }),
+			$"sweeps: {string.Join("; ", trades.Select(t => $"{t.EntryBar} {t.Trigger} {t.SweptLevel}"))}");
+		var trade = trades.Last();
+		Check(!trade.IsLong && trade.EntryBar == 33 && trade.Trigger == "KeySweep" && trade.SweptLevel == "EqualHighs@101.25@33"
+			&& trade.CandlePatterns.SequenceEqual(new[] { "ShootingStar" }), "the shooting star through them is a key-level SHORT");
+
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.75m), Equal())).Count == 0, "3 ticks apart: not equal");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.5m), Equal())).Count == 1, "2 ticks apart: equal");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.25m, between: 102m), Equal())).Count == 0, "a higher bar between them");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.25m, between: 101.5m), Equal())).SequenceEqual(new[] { "EqualHighs|101.5|28|33|Swept|20|24" }),
+			"a swing between them, two ticks up, pairs with the first one as soon as it is confirmed");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.25m), Equal(i => i.EqualToleranceTicks = 0))).Count == 0, "no tolerance: a tick apart is not equal");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101m), Equal(i => i.EqualToleranceTicks = 0))).SequenceEqual(new[] { "EqualHighs|101|32|33|Swept|20|28" }),
+			"no tolerance: the same price");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.25m, second: 30, length: 40), Equal(i => i.EqualLookbackBars = 10))).Contains("EqualHighs|101.25|34|35|Swept|20|30"),
+			"10 bars apart with a 10-bar lookback");
+		Check(KeyLevelKeys(RunHistorical(EqualHighsMarket(101.25m, second: 31, length: 40), Equal(i => i.EqualLookbackBars = 10))).Count == 0, "11 bars apart with a 10-bar lookback");
+
+		// untouched, it counts until Equal level lookback bars after the second swing
+		var aging = RunHistorical(EqualHighsMarket(101.25m, sweep: false, length: 45), Equal(i => i.EqualLookbackBars = 10));
+		Check(KeyLevelKeys(aging).SequenceEqual(new[] { "EqualHighs|101.25|32|39|Expired|20|28" }), $"expiry: {string.Join("; ", KeyLevelKeys(aging))}");
+
+		// equal highs at 101 in regular hours make the prior day high 101 too; one bar that evening
+		// sweeps both, and the prior day names it although the equal highs were posted first
+		IndicatorCandle Flat(int hour, int minute) => NyBar(13, hour, minute, 100, 100.5m, 99.5m, 100);
+		IndicatorCandle Top(int hour, int minute) => NyBar(13, hour, minute, 100, 101, 99.5m, 100);
+		var twoKinds = new List<IndicatorCandle>
+		{
+			Flat(9, 30), Flat(10, 0), Flat(10, 30), Top(11, 0), Flat(11, 30), Flat(12, 0), Flat(12, 30),
+			Top(13, 0), Flat(13, 30), Flat(14, 0), Flat(14, 30), Flat(15, 0), Flat(15, 30),
+			Flat(16, 0), Flat(17, 0), Flat(18, 0),
+			NyBar(13, 19, 0, 100, 101.5m, 99.75m, 100.25m),
+			Flat(20, 0), Flat(21, 0)
+		};
+		var both = RunHistorical(twoKinds, Equal(i => i.LevelPriorDay = true));
+		Check(KeyLevelKeys(both).SequenceEqual(new[] { "EqualHighs|101|11|16|Swept|3|7", "PriorDayHigh|101|15|16|Swept|-1|-1", "PriorDayLow|99.5|15|-1|Fresh|-1|-1" }),
+			$"two kinds at one price: {string.Join("; ", KeyLevelKeys(both))}");
+		Check(Trades(both).Select(t => $"{t.EntryBar}|{t.Trigger}|{t.SweptLevel}").SequenceEqual(new[] { "16|KeySweep|PriorDayHigh@101@16" }),
+			$"the prior day outranks the equal highs before it: {string.Join("; ", Trades(both).Select(t => $"{t.EntryBar} {t.Trigger} {t.SweptLevel}"))}");
+	}
+
+	// bar i trades most at 100: 100 + 10 * (i % 20) contracts, sold into the bids
+	private static List<IndicatorCandle> PeakMarket(int count)
+	{
+		var bars = new List<IndicatorCandle>();
+
+		for (var i = 0; i < count; i++)
+		{
+			var bar = Bar(100, 101, 99, 100);
+			var peak = 100 + 10 * (i % 20);
+
+			foreach (var price in new[] { 99m, 99.5m, 100m, 100.5m, 101m })
+			{
+				bar.Levels.Add(price == 100m
+					? new PriceVolumeInfo { Price = price, Volume = peak, Bid = peak, Ask = 0 }
+					: new PriceVolumeInfo { Price = price, Volume = 10, Bid = 5, Ask = 5 });
+			}
+
+			bars.Add(bar);
+		}
+
+		return bars;
+	}
+
+	private static void AdaptiveFills()
+	{
+		Action<FvgReactionLiquiditySweep> Adaptive(int top, int lookback) => i =>
+		{
+			i.FillSize = FvgReactionLiquiditySweep.FillSizeRule.TopOfRecentBars;
+			i.FillTopPercent = top;
+			i.FillLookbackBars = lookback;
+		};
+
+		// each value once per 20 bars: the top 10% of the last 20 is the 2nd biggest, 280
+		var ind = RunHistorical(PeakMarket(61), Adaptive(10, 20));
+		var bars = Fills(ind).Select(f => f.Bar).ToList();
+		Check(bars.SequenceEqual(new[] { 38, 39, 58, 59 }), $"top 10%: {string.Join(",", bars)}");
+		Check((decimal)IndicatorType.GetField("_fillThreshold", Private).GetValue(ind) == 280, "a big fill takes 280 now");
+
+		bars = Fills(RunHistorical(PeakMarket(61), Adaptive(25, 20))).Select(f => f.Bar).ToList();
+		Check(bars.SequenceEqual(new[] { 35, 36, 37, 38, 39, 55, 56, 57, 58, 59 }), $"top 25% (the 5th biggest, 250): {string.Join(",", bars)}");
+
+		bars = Fills(RunHistorical(PeakMarket(61), Adaptive(10, 40))).Select(f => f.Bar).ToList();
+		Check(!bars.Any(b => b < 20) && bars.Contains(59) && !bars.Contains(57), $"a longer lookback: {string.Join(",", bars)}");
+
+		// bars without a footprint are not ranked: with the first ten empty, the size is still the
+		// 2nd biggest of the 20 footprints in the window
+		var gappy = PeakMarket(61);
+		gappy.Take(10).ToList().ForEach(b => b.Levels.Clear());
+		bars = Fills(RunHistorical(gappy, Adaptive(10, 20))).Select(f => f.Bar).ToList();
+		Check(bars.SequenceEqual(new[] { 38, 39, 58, 59 }), $"empty bars left out: {string.Join(",", bars)}");
+
+		// with the fixed size every bar of 150+ counts
+		Check(Fills(RunHistorical(PeakMarket(61))).Count == 45, "fixed: 150 contracts");
+
+		// an order-book fill of its own takes what a big fill takes now
+		var live = LiveIndicator(PeakMarket(61), Adaptive(10, 20));
+		live.MarketTime = new DateTime(2026, 3, 2, 15, 0, 0);
+		Depth(live, false, 100.5m, 300);
+		Print(live, 100.5m, 279, sell: false);
+		Depth(live, false, 100.5m, 0);
+		Check(Fills(live).Count(f => !f.FromFootprint) == 0, "279 traded against it: under 280");
+		Depth(live, false, 100.75m, 300);
+		Print(live, 100.75m, 280, sell: false);
+		Depth(live, false, 100.75m, 0);
+		Check(Fills(live).Count(f => !f.FromFootprint) == 1, "280 traded against it: a big fill of its own");
+
+		// the panel says what a big fill takes
+		live.FirstVisibleBarNumber = 0;
+		live.LastVisibleBarNumber = live.Candles.Count - 1;
+		var context = new RenderContext();
+		live.HarnessRender(context);
+		Check(context.Strings.Any(t => t.StartsWith("Fills ") && t.EndsWith(" · big ≥280")), "the panel shows the big-fill size");
+	}
+
+	private static void AdaptiveRestingOrders()
+	{
+		var ind = LiveIndicator(FvgSetup(), i =>
+		{
+			i.RestingSize = FvgReactionLiquiditySweep.RestingSizeRule.TimesTypicalLevel;
+			i.RestingMultiplier = 5;
+		});
+
+		// fewer than five prices in the book: the fixed 70 still applies
+		Depth(ind, true, 99m, 10);
+		Depth(ind, true, 98.75m, 10);
+		Depth(ind, true, 98.5m, 60);
+		Check(Orders(ind).Count == 0, "a thin book: 60 is under 70");
+
+		Depth(ind, false, 101m, 10);
+		Depth(ind, true, 98.5m, 60);
+		Check(Orders(ind).Count == 0, "four prices are still a thin book");
+
+		Depth(ind, false, 101.25m, 10);
+		Depth(ind, false, 101.5m, 10);
+		Depth(ind, true, 98.25m, 55);
+		var order = Orders(ind).Single();
+		Check(order.Price == 98.25m && order.Threshold == 50, "the typical level is 10, so 55 is 5x of it");
+
+		Depth(ind, true, 98.5m, 61);
+		Check(Orders(ind).Count == 2, "the 60 comes back as 61 and is judged again");
+
+		// the book fills up: a new order now takes 5x 40, the ones already there keep their size
+		foreach (var (bid, price) in new[] { (true, 99m), (true, 98.75m), (false, 101m), (false, 101.25m) })
+			Depth(ind, bid, price, 40);
+
+		Depth(ind, false, 102m, 150);
+		Check(!Orders(ind).Any(o => o.Price == 102m), "150 is under 5x the typical 40");
+		Depth(ind, true, 98.25m, 52);
+		Check(Orders(ind).Single(o => o.Price == 98.25m).State == "Active" && !Orders(ind).Single(o => o.Price == 98.25m).Leaving,
+			"52 is still above the 50 it needed");
+		Depth(ind, true, 98.25m, 45);
+		Check(Orders(ind).Single(o => o.Price == 98.25m).Leaving, "under its own 50 it leaves");
+
+		ind.FirstVisibleBarNumber = 0;
+		ind.LastVisibleBarNumber = ind.Candles.Count - 1;
+		var context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Any(t => t.StartsWith("Resting ≥200 (5× typical): ")), "the panel shows what a resting order takes now");
+
+		// eight prices, 40 40 40 40 45 50 61 150: the median is halfway between 40 and 45
+		Depth(ind, false, 101.5m, 50);
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Any(t => t.StartsWith("Resting ≥213 (5× typical): ")), "an even book: 5x 42.5, rounded up");
+	}
+
+	private static void ScoreboardCounts()
+	{
+		// some trades run out of bars: expired ones are left out
+		var market = Generate(3000, 41);
+		var ind = RunHistorical(market.Candles, i => i.MaxBarsInTrade = 30, market.SessionStarts);
+		var closed = Trades(ind).Where(t => t.Outcome == "TakeProfit" || t.Outcome == "BreakEven" || t.Outcome == "StopLoss").ToList();
+		var expired = Trades(ind).Count(t => t.Outcome == "Expired");
+		var board = IndicatorType.GetMethod("BuildScoreboard", Private).Invoke(ind, null);
+		Check((int)Get(board, "Closed") == closed.Count && closed.Count > 50 && expired > 5, $"{closed.Count} closed signals, {expired} expired");
+
+		string Row(object r) => $"{Get(r, "Name")}|{Get(r, "Count")}|{Get(r, "Wins")}|{Get(r, "BreakEvens")}|{Get(r, "Losses")}|{Get(r, "Ticks")}";
+		decimal TicksOf(TradeView t) => (t.ExitPrice - t.EntryPrice) / Tick * (t.IsLong ? 1 : -1);
+		string Expected(string name, List<TradeView> group) =>
+			$"{name}|{group.Count}|{group.Count(t => t.Outcome == "TakeProfit")}|{group.Count(t => t.Outcome == "BreakEven")}|{group.Count(t => t.Outcome == "StopLoss")}|{group.Sum(TicksOf)}";
+
+		var labels = new Dictionary<string, string> { ["Fvg"] = "FVG", ["Sweep"] = "Sweep", ["SweepThenFvg"] = "Sweep+FVG", ["Fill"] = "Fill" };
+		var order = new[] { "Fvg", "Sweep", "SweepThenFvg", "Fill" };
+		var expectedTriggers = order.Where(k => closed.Any(t => t.Trigger == k)).Select(k => Expected(labels[k], closed.Where(t => t.Trigger == k).ToList())).ToList();
+		var triggers = ((IList)Get(board, "Triggers")).Cast<object>().Select(Row).ToList();
+		Check(triggers.SequenceEqual(expectedTriggers), $"per trigger: {string.Join("; ", triggers)} vs {string.Join("; ", expectedTriggers)}");
+
+		// per pattern: every signal counts for each pattern it had; the ten most frequent
+		var names = PatternDisplayNames();
+		var groups = closed.SelectMany(t => t.CandlePatterns.Count == 0 ? new[] { "No pattern" } : t.CandlePatterns.Select(n => names[n]).ToArray(), (t, n) => (t, n))
+			.GroupBy(x => x.n)
+			.Select(g => (Name: g.Key, Trades: g.Select(x => x.t).ToList()))
+			.OrderByDescending(g => g.Trades.Count).ThenBy(g => g.Name, StringComparer.Ordinal)
+			.Take(10)
+			.Select(g => Expected(g.Name, g.Trades))
+			.ToList();
+		var patterns = ((IList)Get(board, "Patterns")).Cast<object>().Select(Row).ToList();
+		Check(patterns.SequenceEqual(groups), $"per pattern: {string.Join("; ", patterns.Take(3))} vs {string.Join("; ", groups.Take(3))}");
+
+		// the odds check: signals by the TP chance on their label, and how many hit TP
+		var edges = new[] { 0, 20, 30, 40, 50, 60, 101 };
+		var expectedOdds = Enumerable.Range(0, 6)
+			.Select(k => closed.Where(t => LabelPercentsOf(t)[0] >= edges[k] && LabelPercentsOf(t)[0] < edges[k + 1]).ToList())
+			.Select((g, k) => $"{edges[k]}|{edges[k + 1]}|{g.Count}|{g.Count(t => t.Outcome == "TakeProfit")}")
+			.Where(k => !k.Split('|')[2].Equals("0"))
+			.ToList();
+		var odds = ((IList)Get(board, "OddsCheck")).Cast<object>().Select(b => $"{Get(b, "From")}|{Get(b, "To")}|{Get(b, "Count")}|{Get(b, "Hits")}").ToList();
+		Check(odds.SequenceEqual(expectedOdds) && odds.Count > 1, $"odds check: {string.Join("; ", odds)} vs {string.Join("; ", expectedOdds)}");
+
+		// shown on hover of the statistics panel, instead of a tooltip, or kept open
+		var last = market.Candles.Count - 1;
+		ind.FirstVisibleBarNumber = last - 300;
+		ind.LastVisibleBarNumber = last;
+		var chart = (FakeChart)ind.ChartInfo;
+		chart.FirstBar = last - 300;
+		chart.TopPrice = market.Candles.Skip(last - 300).Max(c => c.High) + 40;
+		var context = new RenderContext();
+		ind.HarnessRender(context);
+		var title = $"Scoreboard: {closed.Count} closed signals, hidden ones included";
+		Check(!context.Strings.Contains(title), "no scoreboard until the panel is hovered");
+
+		var panel = (Rectangle)IndicatorType.GetField("_lastPanel", Private).GetValue(ind);
+		chart.MouseLocationInfo.LastPosition = new Point(panel.X + 5, panel.Y + 5);
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Contains(title) && context.Strings.Contains("Setup") && context.Strings.Contains("Pattern")
+			&& context.Strings.Contains("Odds check (were the TP odds right?)") && context.Strings.Any(t => t.StartsWith("Said TP ")),
+			"hovering the panel shows the scoreboard");
+		Check(expectedTriggers.All(r => context.Strings.Contains(r.Split('|')[0])), "a row per trigger");
+
+		chart.MouseLocationInfo.LastPosition = new Point(-100, -100);
+		ind.ShowScoreboard = true;
+		context = new RenderContext();
+		ind.HarnessRender(context);
+		Check(context.Strings.Contains(title), "kept open");
+	}
+
+	// every card drawn, left to right: side, setup, odds and EV
+	private static List<(string Side, string Setup, string Odds)> CardsOf(RenderContext drawn)
+	{
+		var found = new List<(string Side, string Setup, string Odds)>();
+
+		for (var i = 0; i + 2 < drawn.Strings.Count; i++)
+		{
+			if (drawn.Strings[i] == "BUY" || drawn.Strings[i] == "SHORT")
+				found.Add((drawn.Strings[i], drawn.Strings[i + 1], drawn.Strings[i + 2]));
+		}
+
+		return found;
+	}
+
+	// "Hammer" -> "Hammer", "BullishEngulfing" -> "Bullish engulfing", as the indicator names them
+	private static Dictionary<string, string> PatternDisplayNames()
+	{
+		var info = (Array)IndicatorType.GetField("CandlePatternInfo", PrivateStatic).GetValue(null);
+		return info.Cast<object>().ToDictionary(
+			x => x.GetType().GetField("Item1").GetValue(x).ToString(),
+			x => (string)x.GetType().GetField("Item2").GetValue(x));
+	}
+
 	#endregion
 
 	#region Fuzz
 
-	private static void FuzzHistorical(int seed, Action<FvgReactionLiquiditySweep> configure)
+	// rich = the market must be varied enough to exercise every trigger and confirmation (a
+	// narrow setup, like key-level sweeps only, gives few signals on a random walk)
+	private static void FuzzHistorical(int seed, Action<FvgReactionLiquiditySweep> configure, bool rich = true)
 	{
 		var market = Generate(6000, seed);
 		var ind = RunHistorical(market.Candles, configure, market.SessionStarts);
 		var trades = Trades(ind);
 
-		Check(trades.Count > 30, $"fuzz produced only {trades.Count} trades");
-		Check(trades.Any(t => t.Outcome == "TakeProfit") && trades.Any(t => t.Outcome == "StopLoss"), "fuzz needs both outcomes");
+		Check(trades.Count > (rich ? 30 : 3), $"fuzz produced only {trades.Count} trades");
+
+		if (rich)
+			Check(trades.Any(t => t.Outcome == "TakeProfit") && trades.Any(t => t.Outcome == "StopLoss"), "fuzz needs both outcomes");
 
 		VerifyOutcomes(ind, market, trades, liveFromBar: int.MaxValue);
 		VerifyInvariants(ind, trades, market.Candles.Count);
-		VerifySignalsAgainstOracle(ind, market, trades);
+		VerifySignalsAgainstOracle(ind, market, trades, rich);
 
 		var patterns = VerifyPatternsOnEveryBar(ind, market.Candles);
 
@@ -1326,17 +1883,18 @@ internal static class Program
 		}
 	}
 
-	private static void FuzzLiveMatchesHistory()
+	private static void FuzzLiveMatchesHistory(Action<FvgReactionLiquiditySweep> configure = null, int seed = 19)
 	{
-		var market = Generate(4000, 19);
+		var market = Generate(4000, seed);
 		const int historyBars = 2500;
 
-		var historical = RunHistorical(market.Candles, null, market.SessionStarts);
+		var historical = RunHistorical(market.Candles, configure, market.SessionStarts);
 
 		// same market, but only the first 2500 bars are loaded; the rest streams in tick by tick,
 		// with a made-up order book trading around it
 		var live = NewIndicator(i =>
 		{
+			configure?.Invoke(i);
 			i.UseAlerts = true;
 			i.AlertOnTradeResult = true;
 		});
@@ -1355,7 +1913,7 @@ internal static class Program
 		var book = new BookSimulator(live, seed: 3, start: new DateTime(2026, 3, 9, 14, 30, 0));
 
 		for (var b = historyBars; b < market.Candles.Count; b++)
-			StreamBar(live, market.Paths[b], market.Candles[b].Delta, market.Candles[b].Levels, book);
+			StreamBar(live, market.Paths[b], market.Candles[b].Delta, market.Candles[b].Levels, book, market.Candles[b].Time);
 
 		var liveTrades = Trades(live);
 		var histTrades = Trades(historical);
@@ -1369,10 +1927,13 @@ internal static class Program
 		var liveZones = ZoneKeys(live);
 		var histZones = ZoneKeys(historical);
 		Check(liveZones.SequenceEqual(histZones), "live stream produced different FVG zones");
+		Check(KeyLevelKeys(live).SequenceEqual(KeyLevelKeys(historical)), "live stream produced different key levels");
 
+		// live, the order book can report a fill on the new bar before the bar before it closes, so
+		// the fills are compared in bar order rather than in the order they were found
 		string FillKey(FillView f) => $"{f.Bar}|{f.Price}|{f.Volume}|{f.BidsFilled}|{f.Reaction}|{f.ReactionBar}|{string.Join(",", f.ReactionPatterns)}";
-		var liveFills = Fills(live).Where(f => f.FromFootprint).Select(FillKey).ToList();
-		var histFills = Fills(historical).Select(FillKey).ToList();
+		var liveFills = Fills(live).Where(f => f.FromFootprint).OrderBy(f => f.Bar).ThenBy(f => f.Price).Select(FillKey).ToList();
+		var histFills = Fills(historical).OrderBy(f => f.Bar).ThenBy(f => f.Price).Select(FillKey).ToList();
 		Check(liveFills.SequenceEqual(histFills), $"live stream produced different footprint fills ({liveFills.Count} vs {histFills.Count})");
 
 		VerifyOutcomes(live, market, liveTrades, liveFromBar: historyBars);
@@ -1490,7 +2051,7 @@ internal static class Program
 		Check(new[] { "Longs", "Shorts", "Total" }.All(context.Strings.Contains), "panel rows");
 		Check(context.Strings.Any(s => s.StartsWith("Labelled EV>0: ") && s.Contains("EV≤0: ")), "track record line");
 		var fills = Fills(ind);
-		Check(context.Strings.Contains($"Fills {fills.Count}: {fills.Count(f => f.Reaction > 0)} bullish · {fills.Count(f => f.Reaction < 0)} bearish reactions"),
+		Check(context.Strings.Contains($"Fills {fills.Count}: {fills.Count(f => f.Reaction > 0)} bullish · {fills.Count(f => f.Reaction < 0)} bearish reactions · big ≥150"),
 			"fills line");
 		Check(context.Strings.Contains("Resting ≥70: 0 bids · 0 offers"), "no order book in history");
 
@@ -1638,6 +2199,21 @@ internal static class Program
 		bookInd.HarnessRender(context);
 		Check(context.Strings.Any(s => s.StartsWith("Resting bid 120 @ 103.00") || s.StartsWith("Resting offer 95 @ 106.00")), "order tooltip on hover");
 
+		// the 120 bid's band runs under the panel: next to the panel it has a tooltip, over the
+		// panel the scoreboard shows instead
+		var bookPanel = (Rectangle)IndicatorType.GetField("_lastPanel", Private).GetValue(bookInd);
+		bookChart.TopPrice = 103m + (bookPanel.Y + bookPanel.Height / 2 + 1) / 8m;
+		var bandY = bookChart.GetYByPrice(103m) + 1;
+		bookChart.MouseLocationInfo.LastPosition = new Point(bookPanel.X - 20, bandY);
+		context = new RenderContext();
+		bookInd.HarnessRender(context);
+		Check(context.Strings.Any(s => s.StartsWith("Resting bid 120 @ 103.00")), "the band's tooltip next to the panel");
+		bookChart.MouseLocationInfo.LastPosition = new Point(bookPanel.X + 4, bandY);
+		context = new RenderContext();
+		bookInd.HarnessRender(context);
+		Check(!context.Strings.Any(s => s.StartsWith("Resting bid 120 @ 103.00")) && context.Strings.Any(s => s.StartsWith("Scoreboard: ")),
+			"over the panel: the scoreboard, not the tooltip of the band under it");
+
 		// hover a reaction marker's label
 		var reactionInd = RunHistorical(FvgBearishBars(), i =>
 		{
@@ -1732,6 +2308,274 @@ internal static class Program
 		public bool Decided;
 	}
 
+	private sealed class OracleLevel
+	{
+		public string Kind;
+		public bool High;
+		public int Rank;            // 0 prior day, 1 overnight, 2 opening range, 3 equal highs / lows
+		public decimal Price;
+		public int From;
+		public int End = -1;
+		public string State = "Fresh";
+		public int First = -1;
+		public int Second = -1;
+	}
+
+	// The key-level and signal-hours rules written again from the README, with New York time
+	// taken from the system's time zone database rather than the indicator's own rule
+	private sealed class OracleSessions
+	{
+		private static readonly TimeZoneInfo NewYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+
+		private readonly FvgReactionLiquiditySweep _ind;
+		private readonly List<IndicatorCandle> _candles;
+		private readonly List<int> _swingHighs = new List<int>();
+		private readonly List<int> _swingLows = new List<int>();
+		private DateTime _day = DateTime.MinValue;
+		private decimal? _rthHigh;
+		private decimal? _rthLow;
+		private decimal? _priorHigh;
+		private decimal? _priorLow;
+		private decimal? _onHigh;
+		private decimal? _onLow;
+		private decimal? _orHigh;
+		private decimal? _orLow;
+		private bool _onPosted;
+		private bool _orPosted;
+
+		public OracleSessions(FvgReactionLiquiditySweep ind, List<IndicatorCandle> candles)
+		{
+			_ind = ind;
+			_candles = candles;
+		}
+
+		public List<OracleLevel> Levels { get; } = new List<OracleLevel>();
+
+		public static DateTime NewYorkTime(DateTime utc)
+		{
+			return TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utc, DateTimeKind.Utc), NewYork);
+		}
+
+		private bool Regular(TimeSpan time)
+		{
+			return time >= _ind.RegularHoursStart && time < _ind.RegularHoursEnd;
+		}
+
+		public bool InSignalHours(int b)
+		{
+			var time = NewYorkTime(_candles[b].Time).TimeOfDay;
+
+			switch (_ind.SignalHours)
+			{
+				case FvgReactionLiquiditySweep.SignalHoursRule.AllHours:
+					return true;
+
+				case FvgReactionLiquiditySweep.SignalHoursRule.FirstTwoHours:
+					return Regular(time) && time < _ind.RegularHoursStart.Add(TimeSpan.FromHours(2));
+
+				case FvgReactionLiquiditySweep.SignalHoursRule.RegularHoursNoLunch:
+					return Regular(time) && (time < new TimeSpan(11, 30, 0) || time >= new TimeSpan(13, 30, 0));
+
+				default:
+					return Regular(time);
+			}
+		}
+
+		private void Post(string kind, bool high, int rank, decimal price, int from, int first = -1, int second = -1)
+		{
+			Levels.Add(new OracleLevel { Kind = kind, High = high, Rank = rank, Price = price, From = from, First = first, Second = second });
+		}
+
+		private static decimal? Max(decimal? a, decimal b) => a == null || b > a ? b : a;
+
+		private static decimal? Min(decimal? a, decimal b) => a == null || b < a ? b : a;
+
+		// the most important swept level: prior day, overnight, opening range, equal; then the
+		// furthest; then the one that counted first
+		private static OracleLevel Better(OracleLevel best, OracleLevel level)
+		{
+			if (best == null || level.Rank < best.Rank)
+				return level;
+
+			if (level.Rank > best.Rank)
+				return best;
+
+			if (level.Price != best.Price)
+				return (level.High ? level.Price > best.Price : level.Price < best.Price) ? level : best;
+
+			return level.From < best.From ? level : best;
+		}
+
+		// one closed bar: returns the level swept below (for a buy) and above (for a short)
+		public (OracleLevel Low, OracleLevel High) Step(int b)
+		{
+			var c = _candles[b];
+			var ny = NewYorkTime(c.Time);
+			var day = ny.Hour >= 18 ? ny.Date.AddDays(1) : ny.Date;
+			var time = ny.TimeOfDay;
+			var regular = Regular(time);
+			var openingEnd = _ind.RegularHoursStart.Add(TimeSpan.FromMinutes(_ind.OpeningRangeMinutes));
+
+			if (day != _day)
+			{
+				if (_rthHigh != null)
+				{
+					_priorHigh = _rthHigh;
+					_priorLow = _rthLow;
+				}
+
+				foreach (var level in Levels.Where(l => l.State == "Fresh" && l.Rank < 3))
+				{
+					level.State = "Expired";
+					level.End = b - 1;
+				}
+
+				_day = day;
+				_rthHigh = _rthLow = _onHigh = _onLow = _orHigh = _orLow = null;
+				_onPosted = _orPosted = false;
+
+				if (_ind.LevelPriorDay && _priorHigh != null)
+				{
+					Post("PriorDayHigh", true, 0, _priorHigh.Value, b);
+					Post("PriorDayLow", false, 0, _priorLow.Value, b);
+				}
+			}
+
+			if (regular && !_onPosted)
+			{
+				_onPosted = true;
+
+				if (_ind.LevelOvernight && _onHigh != null)
+				{
+					Post("OvernightHigh", true, 1, _onHigh.Value, b);
+					Post("OvernightLow", false, 1, _onLow.Value, b);
+				}
+			}
+
+			if (regular && time >= openingEnd && !_orPosted)
+			{
+				_orPosted = true;
+
+				if (_ind.LevelOpeningRange && _orHigh != null)
+				{
+					Post("OpeningRangeHigh", true, 2, _orHigh.Value, b);
+					Post("OpeningRangeLow", false, 2, _orLow.Value, b);
+				}
+			}
+
+			OracleLevel low = null;
+			OracleLevel high = null;
+
+			foreach (var level in Levels.Where(l => l.State == "Fresh" && l.From <= b).ToList())
+			{
+				if (!(level.High ? c.High > level.Price : c.Low < level.Price))
+				{
+					if (level.Rank == 3 && b - level.Second > _ind.EqualLookbackBars)
+					{
+						level.State = "Expired";
+						level.End = b;
+					}
+
+					continue;
+				}
+
+				var back = level.High ? c.Close < level.Price : c.Close > level.Price;
+				level.State = back ? "Swept" : "Broken";
+				level.End = b;
+
+				if (back && level.High)
+					high = Better(high, level);
+				else if (back)
+					low = Better(low, level);
+			}
+
+			if (regular)
+			{
+				_rthHigh = Max(_rthHigh, c.High);
+				_rthLow = Min(_rthLow, c.Low);
+
+				if (time < openingEnd)
+				{
+					_orHigh = Max(_orHigh, c.High);
+					_orLow = Min(_orLow, c.Low);
+				}
+			}
+			else if (!_onPosted)
+			{
+				_onHigh = Max(_onHigh, c.High);
+				_onLow = Min(_onLow, c.Low);
+			}
+
+			if (_ind.LevelEqual)
+				Swings(b);
+
+			return (low, high);
+		}
+
+		// a swing high is above the three bars before it and not below the three after it
+		private void Swings(int b)
+		{
+			var pivot = b - 3;
+
+			if (pivot < 3)
+				return;
+
+			foreach (var high in new[] { true, false })
+			{
+				decimal V(int i) => high ? _candles[i].High : _candles[i].Low;
+				var swing = Enumerable.Range(pivot - 3, 7).Where(i => i != pivot)
+					.All(i => high ? (i < pivot ? V(i) < V(pivot) : V(i) <= V(pivot)) : (i < pivot ? V(i) > V(pivot) : V(i) >= V(pivot)));
+
+				if (!swing)
+					continue;
+
+				var swings = high ? _swingHighs : _swingLows;
+				var tolerance = _ind.EqualToleranceTicks * Tick;
+				var kind = high ? "EqualHighs" : "EqualLows";
+
+				foreach (var first in Enumerable.Reverse(swings).ToList())
+				{
+					if (pivot - first > _ind.EqualLookbackBars)
+						break;
+
+					if (Math.Abs(V(first) - V(pivot)) > tolerance)
+						continue;
+
+					var level = high ? Math.Max(V(first), V(pivot)) : Math.Min(V(first), V(pivot));
+
+					if (Enumerable.Range(first + 1, pivot - first - 1).Any(i => high ? V(i) > level : V(i) < level))
+						continue;
+
+					if (!Levels.Any(l => l.State == "Fresh" && l.Kind == kind && Math.Abs(l.Price - level) <= tolerance))
+						Post(kind, high, 3, level, b + 1, first, pivot);
+
+					break;
+				}
+
+				swings.Add(pivot);
+			}
+
+			_swingHighs.RemoveAll(p => pivot - p > _ind.EqualLookbackBars);
+			_swingLows.RemoveAll(p => pivot - p > _ind.EqualLookbackBars);
+		}
+	}
+
+	// what a big fill takes: Min filled volume, or the busiest price ranked at the Top share of
+	// the recent bars' (nothing until 20 of them had a footprint)
+	private static decimal OracleFillMinimum(FvgReactionLiquiditySweep ind, List<decimal> peaks)
+	{
+		if (ind.FillSize == FvgReactionLiquiditySweep.FillSizeRule.FixedContracts)
+			return ind.FillMinVolume;
+
+		var known = peaks.Where(p => p > 0).OrderByDescending(p => p).ToList();
+
+		if (known.Count < 20)
+			return 0;
+
+		var rank = (int)Math.Ceiling(known.Count * ind.FillTopPercent / 100m);
+		return known[Math.Max(1, rank) - 1];
+	}
+
 	// strongest first; twins share a rank - the order is part of the rules
 	private static readonly string[] PatternStrength =
 	{
@@ -1795,7 +2639,7 @@ internal static class Program
 
 	// Re-derives every gap, reaction, fill, sweep and signal from the raw bars and checks the
 	// indicator's against them - including the hidden trigger series.
-	private static void VerifySignalsAgainstOracle(FvgReactionLiquiditySweep ind, Market market, List<TradeView> trades)
+	private static void VerifySignalsAgainstOracle(FvgReactionLiquiditySweep ind, Market market, List<TradeView> trades, bool rich = true)
 	{
 		var candles = market.Candles;
 		var mirrored = Mirror(candles);
@@ -1811,6 +2655,13 @@ internal static class Program
 		var lastShort = -1;
 		var minGap = Math.Max(ind.MinFvgTicks, 1) * Tick;
 		var none = new List<string>();
+		var sessions = new OracleSessions(ind, candles);
+		var peaks = new List<decimal>();
+		var keyMarkers = new Dictionary<int, (bool Low, bool High)>();
+		OracleLevel lastLowKey = null;
+		OracleLevel lastHighKey = null;
+		var lastLowKeyBar = -1;
+		var lastHighKeyBar = -1;
 
 		List<string> P(int b, bool bullish, bool afterDecline) => OraclePatterns(ind, candles, mirrored, b, bullish, afterDecline);
 
@@ -1820,13 +2671,21 @@ internal static class Program
 			var c = candles[b];
 			ema.Add(b == 0 || ind.TrendEmaPeriod <= 0 ? c.Close : ema[b - 1] + 2m / (ind.TrendEmaPeriod + 1) * (c.Close - ema[b - 1]));
 
-			// the price where the bar filled the most, if it stands out
-			if (c.Levels.Count > 0)
+			// the price where the bar filled the most, if it stands out: at least Min filled volume,
+			// or among the Top share of the busiest prices of the bars before it
+			var best = c.Levels.Count > 0 ? c.Levels.OrderByDescending(l => l.Volume).ThenBy(l => l.Price).First() : null;
+			var peak = best != null && best.Volume > 0 ? best.Volume : 0;
+			var minimum = OracleFillMinimum(ind, peaks);
+			peaks.Add(peak);
+
+			if (peaks.Count > ind.FillLookbackBars)
+				peaks.RemoveAt(0);
+
+			if (peak > 0 && minimum > 0)
 			{
-				var best = c.Levels.OrderByDescending(l => l.Volume).ThenBy(l => l.Price).First();
 				var average = c.Levels.Sum(l => l.Volume) / c.Levels.Count;
 
-				if (best.Volume > 0 && best.Volume >= Math.Max(ind.FillMinVolume, (decimal)ind.FillVolumeMultiplier * average))
+				if (best.Volume >= Math.Max(minimum, (decimal)ind.FillVolumeMultiplier * average))
 				{
 					var fill = new OracleFill { Bar = b, Price = best.Price, Volume = best.Volume, BidsFilled = best.Bid >= best.Ask };
 					fills.Add(fill);
@@ -1858,6 +2717,22 @@ internal static class Program
 				}
 				else if (b >= fill.Bar + ind.ReactionBars)
 					fill.Decided = true;
+			}
+
+			// key levels follow every bar, warm-up included
+			var (keyLow, keyHigh) = sessions.Step(b);
+			keyMarkers[b] = (keyLow != null, keyHigh != null);
+
+			if (keyLow != null)
+			{
+				lastLowKey = keyLow;
+				lastLowKeyBar = b;
+			}
+
+			if (keyHigh != null)
+			{
+				lastHighKey = keyHigh;
+				lastHighKeyBar = b;
 			}
 
 			if (b < ind.SwingLookback + 3)
@@ -1948,6 +2823,9 @@ internal static class Program
 			if (ind.ExpireAtSessionEnd && market.SessionStarts.Contains(b + 1))
 				continue;
 
+			if (!sessions.InSignalHours(b))
+				continue;
+
 			foreach (var isLong in new[] { true, false })
 			{
 				if (!(isLong ? ind.EnableBuySignals : ind.EnableShortSignals))
@@ -1958,7 +2836,10 @@ internal static class Program
 				var sweepNow = isLong ? sweptLows : sweptHighs;
 				var lastSweep = isLong ? lastLowSweep : lastHighSweep;
 				var confluence = lastSweep >= 0 && b - lastSweep <= ind.ConfluenceBars;
-				var fvgTrigger = zone == null ? null : confluence ? "SweepThenFvg" : "Fvg";
+				var keyNow = isLong ? keyLow : keyHigh;
+				var lastKeyBar = isLong ? lastLowKeyBar : lastHighKeyBar;
+				var keyBefore = lastKeyBar >= 0 && b - lastKeyBar <= ind.ConfluenceBars;
+				var fvgTrigger = zone == null ? null : keyBefore ? "KeySweepThenFvg" : confluence ? "SweepThenFvg" : "Fvg";
 				string trigger;
 
 				switch (ind.SignalSource)
@@ -1968,19 +2849,23 @@ internal static class Program
 						break;
 
 					case FvgReactionLiquiditySweep.SignalMode.LiquiditySweepOnly:
-						trigger = sweepNow ? "Sweep" : null;
+						trigger = keyNow != null ? "KeySweep" : sweepNow ? "Sweep" : null;
 						break;
 
 					case FvgReactionLiquiditySweep.SignalMode.SweepThenFvg:
-						trigger = fvgTrigger == "SweepThenFvg" ? fvgTrigger : null;
+						trigger = fvgTrigger == "SweepThenFvg" || fvgTrigger == "KeySweepThenFvg" ? fvgTrigger : null;
 						break;
 
 					case FvgReactionLiquiditySweep.SignalMode.FillReactionOnly:
 						trigger = fill != null ? "Fill" : null;
 						break;
 
+					case FvgReactionLiquiditySweep.SignalMode.KeyLevelSweeps:
+						trigger = fvgTrigger == "KeySweepThenFvg" ? fvgTrigger : keyNow != null ? "KeySweep" : null;
+						break;
+
 					default:
-						trigger = fvgTrigger ?? (fill != null ? "Fill" : sweepNow ? "Sweep" : null);
+						trigger = fvgTrigger ?? (fill != null ? "Fill" : keyNow != null ? "KeySweep" : sweepNow ? "Sweep" : null);
 						break;
 				}
 
@@ -1992,7 +2877,8 @@ internal static class Program
 				if (lastSignal >= 0 && b - lastSignal <= ind.SignalCooldownBars)
 					continue;
 
-				var patterns = trigger == "Fill" ? fill.Patterns : trigger == "Sweep" ? P(b, isLong, isLong) : zone.Patterns;
+				var patterns = trigger == "Fill" ? fill.Patterns : trigger == "Sweep" || trigger == "KeySweep" ? P(b, isLong, isLong) : zone.Patterns;
+				var swept = trigger == "KeySweep" ? keyNow : trigger == "KeySweepThenFvg" ? (isLong ? lastLowKey : lastHighKey) : null;
 				var withTrend = ind.TrendEmaPeriod > 0 && b >= ind.TrendEmaPeriod && (isLong ? c.Close > ema[b] : c.Close < ema[b]);
 				var delta = isLong ? c.Delta > 0 : c.Delta < 0;
 				var fillOk = OracleSupportingFill(candles, fillByBar, b, isLong);
@@ -2002,7 +2888,8 @@ internal static class Program
 					continue;
 
 				var confirmations = (withTrend ? 1 : 0) + (delta ? 1 : 0) + (fillOk ? 1 : 0) + (patterns.Count > 0 ? 1 : 0);
-				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{withTrend}|{delta}|{fillOk}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}");
+				expected.Add($"{b}|{isLong}|{trigger}|{confirmations}|{c.Close}|{withTrend}|{delta}|{fillOk}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}"
+					+ $"|{(swept == null ? "" : $"{swept.Kind}@{swept.Price}@{swept.End}")}");
 
 				if (isLong)
 					lastLong = b;
@@ -2013,7 +2900,8 @@ internal static class Program
 
 		var actual = trades
 			.OrderBy(t => t.EntryBar).ThenBy(t => !t.IsLong)
-			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.WithTrend}|{t.DeltaConfirms}|{t.FillConfirms}|{string.Join(",", t.CandlePatterns)}")
+			.Select(t => $"{t.EntryBar}|{t.IsLong}|{t.Trigger}|{t.Confirmations}|{t.EntryPrice}|{t.WithTrend}|{t.DeltaConfirms}|{t.FillConfirms}|{string.Join(",", t.CandlePatterns)}"
+				+ $"|{t.SweptLevel}")
 			.ToList();
 
 		var firstDiff = Enumerable.Range(0, Math.Min(actual.Count, expected.Count)).FirstOrDefault(i => actual[i] != expected[i]);
@@ -2021,11 +2909,36 @@ internal static class Program
 			$"signals differ from the oracle ({actual.Count} vs {expected.Count}); first difference: "
 			+ $"{actual.ElementAtOrDefault(firstDiff)} vs {expected.ElementAtOrDefault(firstDiff)}");
 
-		Check((ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms) && trades.Any(t => t.FillConfirms)
-			&& trades.Any(t => t.CandlePatterns.Count > 0), "fuzz market should exercise every confirmation");
+		Check(!rich || ((ind.TrendEmaPeriod == 0 || trades.Any(t => t.WithTrend)) && trades.Any(t => t.DeltaConfirms) && trades.Any(t => t.FillConfirms)
+			&& trades.Any(t => t.CandlePatterns.Count > 0)), "fuzz market should exercise every confirmation");
+
+		var keyLevelsOn = ind.LevelPriorDay || ind.LevelOvernight || ind.LevelOpeningRange || ind.LevelEqual;
 
 		if (ind.SignalSource == FvgReactionLiquiditySweep.SignalMode.AnyTrigger)
-			Check(new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg" }.All(k => trades.Any(t => t.Trigger == k)), "fuzz market should exercise every trigger");
+		{
+			var triggers = keyLevelsOn ? new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg", "KeySweep", "KeySweepThenFvg" } : new[] { "Fvg", "Sweep", "Fill", "SweepThenFvg" };
+			var missingTriggers = triggers.Where(k => !trades.Any(t => t.Trigger == k)).ToList();
+			Check(missingTriggers.Count == 0, $"fuzz market should exercise every trigger, missing {string.Join(", ", missingTriggers)}");
+		}
+
+		// every key level and how it ended
+		var expectedLevels = sessions.Levels.Select(l => $"{l.Kind}|{l.Price}|{l.From}|{l.End}|{l.State}|{l.First}|{l.Second}")
+			.OrderBy(k => k, StringComparer.Ordinal).ToList();
+		var actualLevels = KeyLevelKeys(ind);
+		var levelDiff = Enumerable.Range(0, Math.Min(actualLevels.Count, expectedLevels.Count)).FirstOrDefault(i => actualLevels[i] != expectedLevels[i]);
+		Check(actualLevels.SequenceEqual(expectedLevels), $"key levels differ from the oracle ({actualLevels.Count} vs {expectedLevels.Count}): "
+			+ $"{actualLevels.ElementAtOrDefault(levelDiff)} vs {expectedLevels.ElementAtOrDefault(levelDiff)}");
+
+		if (keyLevelsOn)
+		{
+			var kinds = new[] { (ind.LevelPriorDay, "PriorDay"), (ind.LevelOvernight, "Overnight"), (ind.LevelOpeningRange, "OpeningRange"), (ind.LevelEqual, "Equal") }
+				.Where(k => k.Item1).Select(k => k.Item2).ToList();
+			var missingKinds = kinds.Where(k => !sessions.Levels.Any(l => l.Kind.StartsWith(k))).ToList();
+			Check(missingKinds.Count == 0, $"fuzz market should post every kind of key level, missing {string.Join(", ", missingKinds)}");
+			var states = new[] { "Swept", "Broken", "Expired" };
+			Check(states.All(st => sessions.Levels.Any(l => l.State == st)),
+				$"fuzz market should sweep, break and expire key levels: {string.Join(", ", sessions.Levels.GroupBy(l => l.State).Select(g => $"{g.Key} {g.Count()}"))}");
+		}
 
 		// every gap and how it ended
 		string ZoneKey(OracleZone z) => $"{z.Start}|{z.Top}|{z.Bottom}|{z.Bull}|{z.State}|{z.End}|{z.LastTouch}|{z.State == "Used" && z.ReactionBull}|"
@@ -2043,7 +2956,7 @@ internal static class Program
 		string FillKey(int bar, decimal price, decimal volume, bool bids, int reaction, int reactionBar, bool decided, IEnumerable<string> patterns) =>
 			$"{bar}|{price}|{volume}|{bids}|{reaction}|{reactionBar}|{decided}|{string.Join(",", patterns.OrderBy(n => n, StringComparer.Ordinal))}";
 		var expectedFills = fills.Select(f => FillKey(f.Bar, f.Price, f.Volume, f.BidsFilled, f.Reaction, f.ReactionBar, f.Decided, f.Patterns)).ToList();
-		var actualFills = Fills(ind).Where(f => f.FromFootprint)
+		var actualFills = Fills(ind).Where(f => f.FromFootprint).OrderBy(f => f.Bar)
 			.Select(f => FillKey(f.Bar, f.Price, f.Volume, f.BidsFilled, f.Reaction, f.ReactionBar, f.Decided, f.ReactionPatterns)).ToList();
 		var fillDiff = Enumerable.Range(0, Math.Min(actualFills.Count, expectedFills.Count)).FirstOrDefault(i => actualFills[i] != expectedFills[i]);
 		Check(actualFills.SequenceEqual(expectedFills), $"fills differ from the oracle ({actualFills.Count} vs {expectedFills.Count}): "
@@ -2061,13 +2974,14 @@ internal static class Program
 		for (var b = 0; b < candles.Count; b++)
 		{
 			markers.TryGetValue(b, out var m);
+			keyMarkers.TryGetValue(b, out var k);
 			var low = candles[b].Low - 2 * Tick;
 			var high = candles[b].High + 2 * Tick;
 
 			wrong += bullReactionSeries[b] != (m.BullReaction ? low : 0) ? 1 : 0;
-			wrong += bullSweepSeries[b] != (m.SweptLows ? low : 0) ? 1 : 0;
+			wrong += bullSweepSeries[b] != (m.SweptLows || k.Low ? low : 0) ? 1 : 0;
 			wrong += bearReactionSeries[b] != (m.BearReaction ? high : 0) ? 1 : 0;
-			wrong += bearSweepSeries[b] != (m.SweptHighs ? high : 0) ? 1 : 0;
+			wrong += bearSweepSeries[b] != (m.SweptHighs || k.High ? high : 0) ? 1 : 0;
 		}
 
 		Check(wrong == 0, $"{wrong} trigger series values differ from the oracle");
@@ -2920,6 +3834,7 @@ internal static class Program
 		public decimal ZoneBottom;
 		public decimal FillPrice;
 		public decimal FillVolume;
+		public string SweptLevel;
 		public double TakeProfit;
 		public double BreakEven;
 		public double StopLoss;
@@ -2972,18 +3887,40 @@ internal static class Program
 		public int EndBar;
 		public string State;
 		public bool Leaving;
+		public decimal Threshold;
 	}
 
+	// Most checks were written for signals at any hour, a fixed big-fill size and no key levels;
+	// they start from those settings. The checks of the newer features switch them back on (see
+	// Defaults for what a fresh indicator has).
 	private static FvgReactionLiquiditySweep NewIndicator(Action<FvgReactionLiquiditySweep> configure)
 	{
 		var ind = new FvgReactionLiquiditySweep
 		{
 			InstrumentInfo = new InstrumentInfo { TickSize = Tick },
-			ChartInfo = new FakeChart()
+			ChartInfo = new FakeChart(),
+			SignalHours = FvgReactionLiquiditySweep.SignalHoursRule.AllHours,
+			FillSize = FvgReactionLiquiditySweep.FillSizeRule.FixedContracts,
+			LevelPriorDay = false,
+			LevelOvernight = false,
+			LevelOpeningRange = false,
+			LevelEqual = false
 		};
 
 		configure?.Invoke(ind);
 		return ind;
+	}
+
+	// back to what a fresh indicator has
+	private static void Defaults(FvgReactionLiquiditySweep ind)
+	{
+		var fresh = new FvgReactionLiquiditySweep();
+		ind.SignalHours = fresh.SignalHours;
+		ind.FillSize = fresh.FillSize;
+		ind.LevelPriorDay = fresh.LevelPriorDay;
+		ind.LevelOvernight = fresh.LevelOvernight;
+		ind.LevelOpeningRange = fresh.LevelOpeningRange;
+		ind.LevelEqual = fresh.LevelEqual;
 	}
 
 	private static FvgReactionLiquiditySweep RunHistorical(List<IndicatorCandle> bars,
@@ -3031,9 +3968,9 @@ internal static class Program
 	// append a new bar and feed it one tick at a time, like ATAS does in real time - with an
 	// order book trading around it if there is one
 	private static void StreamBar(FvgReactionLiquiditySweep ind, IList<decimal> path, decimal delta = 0, List<PriceVolumeInfo> levels = null,
-		BookSimulator book = null)
+		BookSimulator book = null, DateTime? time = null)
 	{
-		var candle = new IndicatorCandle { Open = path[0], High = path[0], Low = path[0], Close = path[0], Time = DateTime.MinValue };
+		var candle = new IndicatorCandle { Open = path[0], High = path[0], Low = path[0], Close = path[0], Time = time ?? DateTime.MinValue };
 		ind.Candles.Add(candle);
 		var bar = ind.Candles.Count - 1;
 
@@ -3131,6 +4068,7 @@ internal static class Program
 				ZoneBottom = (decimal)Get(t, "ZoneBottom"),
 				FillPrice = (decimal)Get(t, "FillPrice"),
 				FillVolume = (decimal)Get(t, "FillVolume"),
+				SweptLevel = LevelKeyOf(Get(t, "SweptLevel")),
 				TakeProfit = EstimateValue("TakeProfit"),
 				BreakEven = EstimateValue("BreakEven"),
 				StopLoss = EstimateValue("StopLoss"),
@@ -3172,6 +4110,27 @@ internal static class Program
 		return Zones(ind)
 			.Select(z => $"{z.StartBar}|{z.Top}|{z.Bottom}|{z.IsBullish}|{z.State}|{z.EndBar}|{z.LastTouchBar}|{z.State == "Used" && z.ReactionBullish}|"
 				+ string.Join(",", z.ReactionPatterns))
+			.OrderBy(k => k, StringComparer.Ordinal)
+			.ToList();
+	}
+
+	// "PriorDayHigh@102.00@25": a swept key level, as a trade names it ("" for none)
+	private static string LevelKeyOf(object level)
+	{
+		return level == null ? "" : $"{Get(level, "Kind")}@{Get(level, "Price")}@{Get(level, "EndBar")}";
+	}
+
+	private static List<object> KeyLevelsOf(FvgReactionLiquiditySweep ind)
+	{
+		var active = (IList)IndicatorType.GetField("_keyLevels", Private).GetValue(ind);
+		var ended = (IList)IndicatorType.GetField("_endedLevels", Private).GetValue(ind);
+		return active.Cast<object>().Concat(ended.Cast<object>()).ToList();
+	}
+
+	private static List<string> KeyLevelKeys(FvgReactionLiquiditySweep ind)
+	{
+		return KeyLevelsOf(ind)
+			.Select(l => $"{Get(l, "Kind")}|{Get(l, "Price")}|{Get(l, "FromBar")}|{Get(l, "EndBar")}|{Get(l, "State")}|{Get(l, "FirstSwingBar")}|{Get(l, "SecondSwingBar")}")
 			.OrderBy(k => k, StringComparer.Ordinal)
 			.ToList();
 	}
@@ -3219,7 +4178,8 @@ internal static class Program
 				FirstBar = (int)Get(o, "FirstBar"),
 				EndBar = (int)Get(o, "EndBar"),
 				State = Get(o, "State").ToString(),
-				Leaving = (bool)Get(o, "Leaving")
+				Leaving = (bool)Get(o, "Leaving"),
+				Threshold = (decimal)Get(o, "Threshold")
 			})
 			.ToList();
 	}

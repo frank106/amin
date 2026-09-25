@@ -80,7 +80,10 @@ namespace ATAS.Indicators.Technical
 			SweepThenFvg,
 
 			[Display(Name = "Fill reaction only")]
-			FillReactionOnly
+			FillReactionOnly,
+
+			[Display(Name = "Key-level sweeps only (alone or then FVG)")]
+			KeyLevelSweeps
 		}
 
 		// When a gap counts as filled, and stops being watched
@@ -94,6 +97,42 @@ namespace ATAS.Indicators.Technical
 
 			[Display(Name = "Price reaches its middle (50%)")]
 			Middle
+		}
+
+		// When signals may fire, in New York time
+		public enum SignalHoursRule
+		{
+			[Display(Name = "All hours")]
+			AllHours,
+
+			[Display(Name = "Regular hours")]
+			RegularHours,
+
+			[Display(Name = "First two hours of regular hours")]
+			FirstTwoHours,
+
+			[Display(Name = "Regular hours, not 11:30 - 13:30")]
+			RegularHoursNoLunch
+		}
+
+		// How many contracts the busiest price of a bar needs to be a big fill
+		public enum FillSizeRule
+		{
+			[Display(Name = "Among the biggest of recent bars")]
+			TopOfRecentBars,
+
+			[Display(Name = "A fixed number of contracts")]
+			FixedContracts
+		}
+
+		// How many contracts a price in the order book needs to be a resting order
+		public enum RestingSizeRule
+		{
+			[Display(Name = "A fixed number of contracts")]
+			FixedContracts,
+
+			[Display(Name = "Times the typical level in the book")]
+			TimesTypicalLevel
 		}
 
 		// How to order a bar's high and low when only O/H/L/C are known
@@ -129,7 +168,30 @@ namespace ATAS.Indicators.Technical
 			Fvg = 0,
 			Sweep = 1,
 			SweepThenFvg = 2,
-			Fill = 3
+			Fill = 3,
+			KeySweep = 4,          // a sweep of a key level
+			KeySweepThenFvg = 5    // an FVG reaction after a sweep of a key level
+		}
+
+		// in order of importance, two by two
+		private enum KeyLevelKind
+		{
+			PriorDayHigh,
+			PriorDayLow,
+			OvernightHigh,
+			OvernightLow,
+			OpeningRangeHigh,
+			OpeningRangeLow,
+			EqualHighs,
+			EqualLows
+		}
+
+		private enum KeyLevelState
+		{
+			Fresh,        // price has not traded beyond it yet
+			Swept,        // a bar wicked beyond it and closed back inside
+			Broken,       // a bar closed beyond it
+			Expired       // its day ended, or it got too old, untouched
 		}
 
 		private enum TradeOutcome
@@ -250,6 +312,27 @@ namespace ATAS.Indicators.Technical
 			public bool SweptLows;          // swept the lows (bullish) - else the highs
 		}
 
+		// A price where stops tend to rest: the prior day's regular-hours high / low, the overnight
+		// high / low, the opening range high / low, or two swing highs / lows at the same price.
+		// It counts until price trades beyond it.
+		private class KeyLevel
+		{
+			public KeyLevelKind Kind;
+			public decimal Price;
+			public int FromBar;             // the first bar that can take it
+			public int EndBar = -1;         // the bar that swept, broke or expired it
+			public KeyLevelState State;
+			public int FirstSwingBar = -1;  // equal highs / lows: the two swings
+			public int SecondSwingBar = -1;
+
+			public bool IsHigh => ((int)Kind & 1) == 0;
+
+			public KeyLevel Clone()
+			{
+				return (KeyLevel)MemberwiseClone();
+			}
+		}
+
 		// A price where unusually many contracts were filled, and what price did next
 		private class FillEvent
 		{
@@ -292,6 +375,7 @@ namespace ATAS.Indicators.Technical
 			public bool AtBookEdge;         // it was the deepest level when it left
 			public int EndBar = -1;
 			public DateTime EndTime;
+			public decimal Threshold;       // the size it needed when it appeared; it leaves below that
 
 			public RestingOrder Clone()
 			{
@@ -365,7 +449,7 @@ namespace ATAS.Indicators.Technical
 		private class ProbabilityModel
 		{
 			private const int Directions = 2;
-			private const int Triggers = 4;
+			private const int Triggers = 6;
 			private const int ConfirmationLevels = MaxConfirmations + 1;
 
 			private readonly OutcomeCounter[] _byDirection = new OutcomeCounter[Directions];
@@ -477,6 +561,7 @@ namespace ATAS.Indicators.Technical
 			public decimal FillPrice;             // the fill it reacted to (0 = none)
 			public decimal FillVolume;
 			public bool FillBidsFilled;
+			public KeyLevel SweptLevel;           // the key level a key-level sweep took (null = none)
 			public ProbabilityEstimate Estimate;
 			public bool IsShown;          // false = tracked for the statistics only (filtered, or a position was already open)
 			public bool HasBreakEven;     // the break-even stop was on when the signal fired
@@ -548,6 +633,39 @@ namespace ATAS.Indicators.Technical
 			public int RestingBids;
 			public int RestingAsks;
 			public RestingOrder Largest;
+			public decimal FillThreshold;      // what a big fill takes now (0 = not known yet)
+			public decimal RestingThreshold;   // what a resting order takes now
+			public DateTime LastBarTime;       // for the New York clock
+			public Scoreboard Board;
+		}
+
+		// Every closed signal, hidden ones included, by trigger and by candlestick pattern, and
+		// how the labelled take-profit odds held up
+		private class Scoreboard
+		{
+			public int Closed;
+			public List<ScoreRow> Triggers = new List<ScoreRow>();
+			public List<ScoreRow> Patterns = new List<ScoreRow>();
+			public List<OddsBucket> OddsCheck = new List<OddsBucket>();
+		}
+
+		private class ScoreRow
+		{
+			public string Name;
+			public int Count;
+			public int Wins;
+			public int BreakEvens;
+			public int Losses;
+			public decimal Ticks;
+		}
+
+		// signals labelled with a TP chance in [From, To) %, and how many hit TP
+		private class OddsBucket
+		{
+			public int From;
+			public int To;
+			public int Count;
+			public int Hits;
 		}
 
 		private readonly struct PendingAlert
@@ -615,6 +733,23 @@ namespace ATAS.Indicators.Technical
 		// signal arrows sit this many ticks beyond the bar's low / high
 		private const int ArrowOffsetTicks = 2;
 
+		// the adaptive big-fill size needs this many recent bars with a footprint
+		private const int MinFillHistory = 20;
+
+		// the scoreboard lists this many patterns, the most frequent first
+		private const int ScoreboardPatterns = 10;
+
+		// the adaptive resting-order size needs this many prices in the book
+		private const int MinBookLevels = 5;
+
+		// a swing high / low is higher / lower than this many bars on each side
+		private const int SwingStrength = 3;
+
+		// New York time: the trading day starts at 18:00, lunch is 11:30 - 13:30
+		private static readonly TimeSpan TradingDayStart = new TimeSpan(18, 0, 0);
+		private static readonly TimeSpan LunchStart = new TimeSpan(11, 30, 0);
+		private static readonly TimeSpan LunchEnd = new TimeSpan(13, 30, 0);
+
 		private static readonly Color BullColor = Color.FromArgb(255, 38, 166, 154);
 		private static readonly Color BearColor = Color.FromArgb(255, 239, 83, 80);
 		private static readonly Color NeutralColor = Color.FromArgb(255, 144, 150, 162);
@@ -624,6 +759,7 @@ namespace ATAS.Indicators.Technical
 		private static readonly Color DimTextColor = Color.FromArgb(255, 156, 163, 175);
 		private static readonly Color CardColor = Color.FromArgb(226, 22, 25, 31);
 		private static readonly Color CardBorderColor = Color.FromArgb(255, 58, 63, 74);
+		private static readonly Color LevelColor = Color.FromArgb(255, 149, 117, 205);
 
 		// Every pattern, strongest first: labels list them in this order, and when a bar shows
 		// both a bullish and a bearish pattern the stronger one decides. Twins share a rank.
@@ -673,6 +809,44 @@ namespace ATAS.Indicators.Technical
 		private readonly List<FillEvent> _watchedFills = new List<FillEvent>();       // still inside their reaction window
 		private readonly Dictionary<int, FillEvent> _footprintFills = new Dictionary<int, FillEvent>();
 
+		// the busiest price of each of the last Fill lookback bars (0 = no footprint), and the
+		// non-zero ones sorted, for the adaptive big-fill size
+		private readonly Queue<decimal> _recentPeaks = new Queue<decimal>();
+		private readonly List<decimal> _sortedPeaks = new List<decimal>();
+		private decimal _fillThreshold;     // what a big fill takes on the next bar (0 = not known yet)
+
+		// key levels still counted, and the ones that ended
+		private readonly List<KeyLevel> _keyLevels = new List<KeyLevel>();
+		private readonly List<KeyLevel> _endedLevels = new List<KeyLevel>();
+
+		// the trading day being built (New York time, from 18:00): its regular-hours, overnight
+		// and opening ranges so far, and the last regular session that ended
+		private DateTime _tradingDay;
+		private bool _hasRth;
+		private decimal _rthHigh;
+		private decimal _rthLow;
+		private bool _hasPriorRth;
+		private decimal _priorRthHigh;
+		private decimal _priorRthLow;
+		private bool _hasOvernight;
+		private decimal _overnightHigh;
+		private decimal _overnightLow;
+		private bool _overnightPosted;
+		private bool _hasOpening;
+		private decimal _openingHigh;
+		private decimal _openingLow;
+		private bool _openingPosted;
+
+		// confirmed swing highs / lows, for equal highs / lows
+		private readonly List<int> _swingHighs = new List<int>();
+		private readonly List<int> _swingLows = new List<int>();
+
+		// the last sweep of a key level each way, for Sweep+FVG
+		private int _lastLowKeySweepBar = -1;
+		private int _lastHighKeySweepBar = -1;
+		private KeyLevel _lastLowKeySweep;
+		private KeyLevel _lastHighKeySweep;
+
 		// what the order book saw filled, by bar, price and side: the biggest resting order, and
 		// the fill of its own when one was big enough to be shown as one
 		private readonly Dictionary<(int Bar, decimal Price, bool IsBid), decimal> _filledRestingSize = new Dictionary<(int Bar, decimal Price, bool IsBid), decimal>();
@@ -693,6 +867,9 @@ namespace ATAS.Indicators.Technical
 		private readonly List<SignalTrade> _openTrades = new List<SignalTrade>();
 		private readonly List<decimal> _ema = new List<decimal>();
 		private readonly ProbabilityModel _model = new ProbabilityModel();
+
+		// where the statistics panel was drawn last (render thread only), for its hover
+		private Rectangle _lastPanel = Rectangle.Empty;
 
 		// patterns of the bar being processed, per direction and context
 		private readonly CandlePattern?[] _patternCache = new CandlePattern?[4];
@@ -804,12 +981,29 @@ namespace ATAS.Indicators.Technical
 		private Color _bullishZoneColor = Color.FromArgb(40, 38, 166, 154);
 		private Color _bearishZoneColor = Color.FromArgb(40, 239, 83, 80);
 
+		private SignalHoursRule _signalHours = SignalHoursRule.RegularHours;
+		private TimeSpan _regularHoursStart = new TimeSpan(9, 30, 0);
+		private TimeSpan _regularHoursEnd = new TimeSpan(16, 0, 0);
+		private int _openingRangeMinutes = 30;
+		private bool _levelPriorDay = true;
+		private bool _levelOvernight = true;
+		private bool _levelOpeningRange = true;
+		private bool _levelEqual = true;
+		private int _equalToleranceTicks = 2;
+		private int _equalLookbackBars = 120;
+		private bool _drawKeyLevels = true;
+
 		private bool _showFills = true;
+		private FillSizeRule _fillSize = FillSizeRule.TopOfRecentBars;
+		private int _fillTopPercent = 10;
+		private int _fillLookbackBars = 200;
 		private int _fillMinVolume = 150;
 		private double _fillVolumeMultiplier = 3.0;
 		private int _reactionBars = 3;
 		private bool _showRestingOrders = true;
+		private RestingSizeRule _restingSize = RestingSizeRule.FixedContracts;
 		private int _restingOrderMin = 70;
+		private double _restingMultiplier = 5.0;
 		private int _orderFilledPercent = 50;
 		private bool _showPulledOrders;
 
@@ -942,6 +1136,93 @@ namespace ATAS.Indicators.Technical
 			set { _bearishZoneColor = value; RedrawChart(); }
 		}
 
+		[Display(Name = "Signal hours (New York)", GroupName = "Sessions & Key Levels", Order = 30,
+			Description = "When signals may fire, in New York time whatever time zone the chart shows. Gaps, fills and levels are still found around the clock.")]
+		public SignalHoursRule SignalHours
+		{
+			get => _signalHours;
+			set { _signalHours = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Regular hours start (New York)", GroupName = "Sessions & Key Levels", Order = 31,
+			Description = "Start of the regular session, for the signal hours, the prior-day and overnight levels and the opening range.")]
+		public TimeSpan RegularHoursStart
+		{
+			get => _regularHoursStart;
+			set { _regularHoursStart = ClampToTradingDay(value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Regular hours end (New York)", GroupName = "Sessions & Key Levels", Order = 32)]
+		public TimeSpan RegularHoursEnd
+		{
+			get => _regularHoursEnd;
+			set { _regularHoursEnd = ClampToTradingDay(value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Opening range (minutes)", GroupName = "Sessions & Key Levels", Order = 33,
+			Description = "The first minutes of regular hours whose high and low become the opening range.")]
+		[Range(1, 600)]
+		public int OpeningRangeMinutes
+		{
+			get => _openingRangeMinutes;
+			set { _openingRangeMinutes = Math.Max(1, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Prior day high / low", GroupName = "Sessions & Key Levels", Order = 34,
+			Description = "The high and low of the previous regular session, for the whole next trading day.")]
+		public bool LevelPriorDay
+		{
+			get => _levelPriorDay;
+			set { _levelPriorDay = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Overnight high / low", GroupName = "Sessions & Key Levels", Order = 35,
+			Description = "The high and low from 18:00 New York time until regular hours open, for the rest of the day.")]
+		public bool LevelOvernight
+		{
+			get => _levelOvernight;
+			set { _levelOvernight = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Opening range high / low", GroupName = "Sessions & Key Levels", Order = 36)]
+		public bool LevelOpeningRange
+		{
+			get => _levelOpeningRange;
+			set { _levelOpeningRange = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Equal highs / lows", GroupName = "Sessions & Key Levels", Order = 37,
+			Description = "Two swing highs (lows) within Equal level match ticks of each other, with nothing above (below) them in between: stops pile up there.")]
+		public bool LevelEqual
+		{
+			get => _levelEqual;
+			set { _levelEqual = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Equal level match (ticks)", GroupName = "Sessions & Key Levels", Order = 38)]
+		[Range(0, 1000)]
+		public int EqualToleranceTicks
+		{
+			get => _equalToleranceTicks;
+			set { _equalToleranceTicks = Math.Max(0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Equal level lookback (bars)", GroupName = "Sessions & Key Levels", Order = 39,
+			Description = "How far apart the two swings may be, and how long the level counts after the second one.")]
+		[Range(10, 100000)]
+		public int EqualLookbackBars
+		{
+			get => _equalLookbackBars;
+			set { _equalLookbackBars = Math.Max(10, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Draw key levels", GroupName = "Sessions & Key Levels", Order = 40)]
+		public bool DrawKeyLevels
+		{
+			get => _drawKeyLevels;
+			set { _drawKeyLevels = value; RedrawChart(); }
+		}
+
 		[Display(Name = "Show big fills", GroupName = "Order Flow", Order = 50,
 			Description = "A bubble where the most contracts traded inside a bar, colored by the reaction that followed: green bullish, red bearish, gray none (yet). A white ring: the order book saw a resting order filled there.")]
 		public bool ShowFills
@@ -950,8 +1231,32 @@ namespace ATAS.Indicators.Technical
 			set { _showFills = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Min filled volume at one price", GroupName = "Order Flow", Order = 51,
-			Description = "Contracts that must trade at a single price inside one bar before it counts as a big fill.")]
+		[Display(Name = "Big fill size", GroupName = "Order Flow", Order = 51,
+			Description = "Among the biggest of recent bars: the busiest price of a bar must rank in the Top share of the last Fill lookback bars, so the size follows the market and the hour. Fixed: at least Min filled volume contracts.")]
+		public FillSizeRule FillSize
+		{
+			get => _fillSize;
+			set { _fillSize = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Top share of recent bars (%)", GroupName = "Order Flow", Order = 52)]
+		[Range(1, 50)]
+		public int FillTopPercent
+		{
+			get => _fillTopPercent;
+			set { _fillTopPercent = Math.Min(50, Math.Max(1, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Fill lookback (bars)", GroupName = "Order Flow", Order = 53)]
+		[Range(20, 100000)]
+		public int FillLookbackBars
+		{
+			get => _fillLookbackBars;
+			set { _fillLookbackBars = Math.Max(20, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Min filled volume at one price", GroupName = "Order Flow", Order = 54,
+			Description = "With a fixed big fill size: contracts that must trade at a single price inside one bar before it counts as a big fill.")]
 		[Range(1, 100000000)]
 		public int FillMinVolume
 		{
@@ -959,7 +1264,7 @@ namespace ATAS.Indicators.Technical
 			set { _fillMinVolume = Math.Max(1, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Filled volume vs bar average (x)", GroupName = "Order Flow", Order = 52,
+		[Display(Name = "Filled volume vs bar average (x)", GroupName = "Order Flow", Order = 55,
 			Description = "The price must also trade this many times the bar's average volume per price.")]
 		[Range(1.0, 1000.0)]
 		public double FillVolumeMultiplier
@@ -968,7 +1273,7 @@ namespace ATAS.Indicators.Technical
 			set { _fillVolumeMultiplier = Math.Max(1.0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Reaction window (bars)", GroupName = "Order Flow", Order = 53,
+		[Display(Name = "Reaction window (bars)", GroupName = "Order Flow", Order = 56,
 			Description = "How many bars after a big fill a candlestick pattern may take to show the reaction to it.")]
 		[Range(0, 100)]
 		public int ReactionBars
@@ -977,7 +1282,7 @@ namespace ATAS.Indicators.Technical
 			set { _reactionBars = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Show resting orders", GroupName = "Order Flow", Order = 54,
+		[Display(Name = "Show resting orders", GroupName = "Order Flow", Order = 57,
 			Description = "Live from Level 2: limit orders of at least Min resting order contracts still waiting in the order book, with their size at the right edge.")]
 		public bool ShowRestingOrders
 		{
@@ -985,7 +1290,15 @@ namespace ATAS.Indicators.Technical
 			set { _showRestingOrders = value; RedrawChart(); }
 		}
 
-		[Display(Name = "Min resting order (contracts)", GroupName = "Order Flow", Order = 55)]
+		[Display(Name = "Resting order size", GroupName = "Order Flow", Order = 58,
+			Description = "Fixed: at least Min resting order contracts at one price. Times the typical level: at least Resting order vs typical level times the median size of the prices in the book when it appears.")]
+		public RestingSizeRule RestingSize
+		{
+			get => _restingSize;
+			set { _restingSize = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Min resting order (contracts)", GroupName = "Order Flow", Order = 59)]
 		[Range(1, 100000000)]
 		public int RestingOrderMin
 		{
@@ -993,7 +1306,15 @@ namespace ATAS.Indicators.Technical
 			set { _restingOrderMin = Math.Max(1, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Filled when traded (%)", GroupName = "Order Flow", Order = 56,
+		[Display(Name = "Resting order vs typical level (x)", GroupName = "Order Flow", Order = 60)]
+		[Range(1.0, 1000.0)]
+		public double RestingMultiplier
+		{
+			get => _restingMultiplier;
+			set { _restingMultiplier = Math.Max(1.0, value); RecalculateValues(); }
+		}
+
+		[Display(Name = "Filled when traded (%)", GroupName = "Order Flow", Order = 61,
 			Description = "A resting order that leaves the book counts as filled once trades at its price took at least this share of its size; otherwise it was pulled.")]
 		[Range(1, 100)]
 		public int OrderFilledPercent
@@ -1002,7 +1323,7 @@ namespace ATAS.Indicators.Technical
 			set { _orderFilledPercent = Math.Min(100, Math.Max(1, value)); RecalculateValues(); }
 		}
 
-		[Display(Name = "Show pulled orders", GroupName = "Order Flow", Order = 57,
+		[Display(Name = "Show pulled orders", GroupName = "Order Flow", Order = 62,
 			Description = "Keep a faint trace of big orders that were cancelled instead of filled.")]
 		public bool ShowPulledOrders
 		{
@@ -1333,24 +1654,28 @@ namespace ATAS.Indicators.Technical
 		[Display(Name = "Show statistics panel", GroupName = "Display", Order = 304)]
 		public bool ShowStatsPanel { get; set; } = true;
 
-		[Display(Name = "Statistics panel position", GroupName = "Display", Order = 305)]
+		[Display(Name = "Keep the scoreboard open", GroupName = "Display", Order = 305,
+			Description = "Results per setup and per candlestick pattern, and how the odds held up, next to the statistics panel. Hovering the panel always shows it.")]
+		public bool ShowScoreboard { get; set; }
+
+		[Display(Name = "Statistics panel position", GroupName = "Display", Order = 306)]
 		public PanelCorner StatsPanelLocation { get; set; } = PanelCorner.TopRight;
 
-		[Display(Name = "Label offset (px)", GroupName = "Display", Order = 306,
+		[Display(Name = "Label offset (px)", GroupName = "Display", Order = 307,
 			Description = "Distance between the tip of the signal arrow and its label, so the label clears the arrow.")]
 		[Range(0, 500)]
 		public int LabelOffset { get; set; } = 24;
 
-		[Display(Name = "Label font", GroupName = "Display", Order = 307)]
+		[Display(Name = "Label font", GroupName = "Display", Order = 308)]
 		public FontSetting LabelFont { get; set; } = new FontSetting("Arial", 9);
 
-		[Display(Name = "Take profit line", GroupName = "Display", Order = 308)]
+		[Display(Name = "Take profit line", GroupName = "Display", Order = 309)]
 		public PenSettings TakeProfitPen { get; set; } = new PenSettings { Color = BullColor.Convert(), Width = 1 };
 
-		[Display(Name = "Stop loss line", GroupName = "Display", Order = 309)]
+		[Display(Name = "Stop loss line", GroupName = "Display", Order = 310)]
 		public PenSettings StopLossPen { get; set; } = new PenSettings { Color = BearColor.Convert(), Width = 1 };
 
-		[Display(Name = "Break-even line", GroupName = "Display", Order = 310)]
+		[Display(Name = "Break-even line", GroupName = "Display", Order = 311)]
 		public PenSettings BreakEvenPen { get; set; } = new PenSettings { Color = Color.FromArgb(255, 255, 179, 0).Convert(), Width = 1 };
 
 		[Display(Name = "Alert on new signal", GroupName = "Alerts", Order = 400)]
@@ -1456,6 +1781,24 @@ namespace ATAS.Indicators.Technical
 			_footprintFills.Clear();
 			_filledRestingSize.Clear();
 			_orderBookFills.Clear();
+			_recentPeaks.Clear();
+			_sortedPeaks.Clear();
+			_fillThreshold = 0;
+			_keyLevels.Clear();
+			_endedLevels.Clear();
+			_swingHighs.Clear();
+			_swingLows.Clear();
+			_tradingDay = DateTime.MinValue;
+			_hasRth = false;
+			_hasPriorRth = false;
+			_hasOvernight = false;
+			_overnightPosted = false;
+			_hasOpening = false;
+			_openingPosted = false;
+			_lastLowKeySweepBar = -1;
+			_lastHighKeySweepBar = -1;
+			_lastLowKeySweep = null;
+			_lastHighKeySweep = null;
 			_bids.Clear();
 			_asks.Clear();
 			_restingBids.Clear();
@@ -1518,6 +1861,9 @@ namespace ATAS.Indicators.Technical
 
 			var (bullFill, bearFill) = UpdateFillReactions(bar, candle);
 
+			// every bar belongs to a trading day, warm-up included
+			var (keyLow, keyHigh) = UpdateKeyLevels(bar, candle);
+
 			if (bar < SwingLookback + 3)
 				return;
 
@@ -1533,7 +1879,7 @@ namespace ATAS.Indicators.Technical
 
 			// no new trades on the last bar of a session when trades close at session end
 			if (!sessionEnds)
-				GenerateSignals(bar, candle, bullZone, bearZone, bullFill, bearFill, sweptLows, sweptHighs, ref alerts);
+				GenerateSignals(bar, candle, bullZone, bearZone, bullFill, bearFill, sweptLows, sweptHighs, keyLow, keyHigh, ref alerts);
 		}
 
 		private void ClearMarkers(int bar)
@@ -1733,6 +2079,322 @@ namespace ATAS.Indicators.Technical
 			{
 				_bullSweep[bar] = candle.Low - offset;
 				_sweeps.Add(new LiquiditySweep { Bar = bar, SwingBar = lowBar, Level = lowestLow, SweptLows = true });
+			}
+		}
+
+		#endregion
+
+		#region Sessions and key levels
+
+		// New York time of a candle time (UTC): UTC-5, or UTC-4 from the second Sunday of March
+		// 2:00 to the first Sunday of November 2:00 (the US daylight-saving rule since 2007)
+		private static DateTime NewYorkTime(DateTime utc)
+		{
+			// no real time (e.g. a candle ATAS has not stamped yet)
+			if (utc.Year < 2)
+				return utc;
+
+			var summerStart = NthSunday(utc.Year, 3, 2).AddHours(7);
+			var summerEnd = NthSunday(utc.Year, 11, 1).AddHours(6);
+			return utc.AddHours(utc >= summerStart && utc < summerEnd ? -4 : -5);
+		}
+
+		private static DateTime NthSunday(int year, int month, int n)
+		{
+			var first = new DateTime(year, month, 1);
+			var toSunday = ((int)DayOfWeek.Sunday - (int)first.DayOfWeek + 7) % 7;
+			return first.AddDays(toSunday + 7 * (n - 1));
+		}
+
+		// the trading day a New York time belongs to: it starts at 18:00 the evening before
+		private static DateTime TradingDayOf(DateTime newYork)
+		{
+			return newYork.TimeOfDay >= TradingDayStart ? newYork.Date.AddDays(1) : newYork.Date;
+		}
+
+		// regular hours sit between midnight and 18:00 New York time
+		private static TimeSpan ClampToTradingDay(TimeSpan time)
+		{
+			if (time < TimeSpan.Zero)
+				return TimeSpan.Zero;
+
+			return time > TradingDayStart ? TradingDayStart : time;
+		}
+
+		private bool IsRegularHours(TimeSpan time)
+		{
+			return time >= RegularHoursStart && time < RegularHoursEnd;
+		}
+
+		// whether a bar (by its open time) may give a signal
+		private bool InSignalHours(DateTime candleTime)
+		{
+			if (SignalHours == SignalHoursRule.AllHours)
+				return true;
+
+			var time = NewYorkTime(candleTime).TimeOfDay;
+
+			switch (SignalHours)
+			{
+				case SignalHoursRule.FirstTwoHours:
+					return IsRegularHours(time) && time < RegularHoursStart + TimeSpan.FromHours(2);
+
+				case SignalHoursRule.RegularHoursNoLunch:
+					return IsRegularHours(time) && !(time >= LunchStart && time < LunchEnd);
+
+				default:
+					return IsRegularHours(time);
+			}
+		}
+
+		// Follows the trading day through a closed bar: posts the levels that became known before
+		// it opened (the prior day at 18:00, the overnight range when regular hours open, the
+		// opening range when it is over), lets the bar sweep or break the levels it trades
+		// beyond, then adds the bar to today's ranges and looks for new equal highs / lows.
+		// Returns the most important level swept each way.
+		private (KeyLevel Low, KeyLevel High) UpdateKeyLevels(int bar, IndicatorCandle candle)
+		{
+			var newYork = NewYorkTime(candle.Time);
+			var day = TradingDayOf(newYork);
+			var time = newYork.TimeOfDay;
+			var regular = IsRegularHours(time);
+			var openingEnd = RegularHoursStart + TimeSpan.FromMinutes(OpeningRangeMinutes);
+
+			if (day != _tradingDay)
+			{
+				if (_hasRth)
+				{
+					_hasPriorRth = true;
+					_priorRthHigh = _rthHigh;
+					_priorRthLow = _rthLow;
+				}
+
+				// yesterday's levels only count for their day
+				foreach (var level in _keyLevels.Where(l => l.Kind < KeyLevelKind.EqualHighs).ToList())
+					EndLevel(level, KeyLevelState.Expired, bar - 1);
+
+				_tradingDay = day;
+				_hasRth = false;
+				_hasOvernight = false;
+				_hasOpening = false;
+				_overnightPosted = false;
+				_openingPosted = false;
+
+				if (LevelPriorDay && _hasPriorRth)
+				{
+					PostLevel(KeyLevelKind.PriorDayHigh, _priorRthHigh, bar);
+					PostLevel(KeyLevelKind.PriorDayLow, _priorRthLow, bar);
+				}
+			}
+
+			if (regular && !_overnightPosted)
+			{
+				_overnightPosted = true;
+
+				if (LevelOvernight && _hasOvernight)
+				{
+					PostLevel(KeyLevelKind.OvernightHigh, _overnightHigh, bar);
+					PostLevel(KeyLevelKind.OvernightLow, _overnightLow, bar);
+				}
+			}
+
+			if (regular && time >= openingEnd && !_openingPosted)
+			{
+				_openingPosted = true;
+
+				if (LevelOpeningRange && _hasOpening)
+				{
+					PostLevel(KeyLevelKind.OpeningRangeHigh, _openingHigh, bar);
+					PostLevel(KeyLevelKind.OpeningRangeLow, _openingLow, bar);
+				}
+			}
+
+			var swept = TakeKeyLevels(bar, candle);
+
+			if (regular)
+			{
+				Extend(ref _hasRth, ref _rthHigh, ref _rthLow, candle);
+
+				if (time < openingEnd)
+					Extend(ref _hasOpening, ref _openingHigh, ref _openingLow, candle);
+			}
+			else if (!_overnightPosted)
+				Extend(ref _hasOvernight, ref _overnightHigh, ref _overnightLow, candle);
+
+			if (LevelEqual)
+				FindEqualLevels(bar);
+
+			return swept;
+		}
+
+		private static void Extend(ref bool has, ref decimal high, ref decimal low, IndicatorCandle candle)
+		{
+			high = has ? Math.Max(high, candle.High) : candle.High;
+			low = has ? Math.Min(low, candle.Low) : candle.Low;
+			has = true;
+		}
+
+		private void PostLevel(KeyLevelKind kind, decimal price, int fromBar, int firstSwing = -1, int secondSwing = -1)
+		{
+			_keyLevels.Add(new KeyLevel { Kind = kind, Price = price, FromBar = fromBar, FirstSwingBar = firstSwing, SecondSwingBar = secondSwing });
+		}
+
+		private void EndLevel(KeyLevel level, KeyLevelState state, int bar)
+		{
+			level.State = state;
+			level.EndBar = bar;
+			_keyLevels.Remove(level);
+			_endedLevels.Add(level);
+		}
+
+		// A bar that trades beyond a level takes it: a sweep when it closes back inside, a break
+		// otherwise. Equal highs / lows that got too old expire.
+		private (KeyLevel Low, KeyLevel High) TakeKeyLevels(int bar, IndicatorCandle candle)
+		{
+			KeyLevel sweptLow = null;
+			KeyLevel sweptHigh = null;
+
+			foreach (var level in _keyLevels.Where(l => l.FromBar <= bar).ToList())
+			{
+				var beyond = level.IsHigh ? candle.High > level.Price : candle.Low < level.Price;
+
+				if (!beyond)
+				{
+					if (level.Kind >= KeyLevelKind.EqualHighs && bar - level.SecondSwingBar > EqualLookbackBars)
+						EndLevel(level, KeyLevelState.Expired, bar);
+
+					continue;
+				}
+
+				var back = level.IsHigh ? candle.Close < level.Price : candle.Close > level.Price;
+				EndLevel(level, back ? KeyLevelState.Swept : KeyLevelState.Broken, bar);
+
+				if (!back)
+					continue;
+
+				if (level.IsHigh)
+					sweptHigh = MoreImportant(sweptHigh, level);
+				else
+					sweptLow = MoreImportant(sweptLow, level);
+			}
+
+			var offset = ArrowOffsetTicks * TickSize;
+
+			if (sweptHigh != null)
+			{
+				_lastHighKeySweepBar = bar;
+				_lastHighKeySweep = sweptHigh;
+				_bearSweep[bar] = candle.High + offset;
+			}
+
+			if (sweptLow != null)
+			{
+				_lastLowKeySweepBar = bar;
+				_lastLowKeySweep = sweptLow;
+				_bullSweep[bar] = candle.Low - offset;
+			}
+
+			return (sweptLow, sweptHigh);
+		}
+
+		// the prior day before the overnight range, the opening range, then equal highs / lows;
+		// between two of a kind the further one (it took more stops)
+		private static KeyLevel MoreImportant(KeyLevel best, KeyLevel level)
+		{
+			if (best == null)
+				return level;
+
+			var rank = (int)level.Kind / 2;
+			var bestRank = (int)best.Kind / 2;
+
+			if (rank != bestRank)
+				return rank < bestRank ? level : best;
+
+			if (level.Price != best.Price)
+				return level.IsHigh == level.Price > best.Price ? level : best;
+
+			return level.FromBar < best.FromBar ? level : best;
+		}
+
+		// Confirms the swing SwingStrength bars back, and pairs it with an earlier swing at the
+		// same price (within Equal level match) that nothing traded beyond in between
+		private void FindEqualLevels(int bar)
+		{
+			var pivot = bar - SwingStrength;
+
+			if (pivot - SwingStrength < 0)
+				return;
+
+			if (IsSwing(pivot, true))
+			{
+				PairSwing(pivot, true, bar);
+				_swingHighs.Add(pivot);
+			}
+
+			if (IsSwing(pivot, false))
+			{
+				PairSwing(pivot, false, bar);
+				_swingLows.Add(pivot);
+			}
+
+			_swingHighs.RemoveAll(p => pivot - p > EqualLookbackBars);
+			_swingLows.RemoveAll(p => pivot - p > EqualLookbackBars);
+		}
+
+		// above (below) the SwingStrength bars before it, and not below (above) the ones after it
+		private bool IsSwing(int pivot, bool high)
+		{
+			var extreme = high ? GetCandle(pivot).High : GetCandle(pivot).Low;
+
+			for (var i = pivot - SwingStrength; i <= pivot + SwingStrength; i++)
+			{
+				if (i == pivot)
+					continue;
+
+				var value = high ? GetCandle(i).High : GetCandle(i).Low;
+				var beyond = high ? value > extreme : value < extreme;
+				var equal = value == extreme;
+
+				if (beyond || (equal && i < pivot))
+					return false;
+			}
+
+			return true;
+		}
+
+		private void PairSwing(int second, bool high, int bar)
+		{
+			var swings = high ? _swingHighs : _swingLows;
+			var tolerance = EqualToleranceTicks * TickSize;
+			var price = high ? GetCandle(second).High : GetCandle(second).Low;
+			var kind = high ? KeyLevelKind.EqualHighs : KeyLevelKind.EqualLows;
+
+			for (var i = swings.Count - 1; i >= 0; i--)
+			{
+				var first = swings[i];
+
+				if (second - first > EqualLookbackBars)
+					break;
+
+				var other = high ? GetCandle(first).High : GetCandle(first).Low;
+
+				if (Math.Abs(other - price) > tolerance)
+					continue;
+
+				var level = high ? Math.Max(other, price) : Math.Min(other, price);
+				var clear = true;
+
+				for (var b = first + 1; b < second && clear; b++)
+					clear = high ? GetCandle(b).High <= level : GetCandle(b).Low >= level;
+
+				if (!clear)
+					continue;
+
+				// one level per price
+				if (!_keyLevels.Any(l => l.Kind == kind && Math.Abs(l.Price - level) <= tolerance))
+					PostLevel(kind, level, bar + 1, first, second);
+
+				return;
 			}
 		}
 
@@ -2032,34 +2694,39 @@ namespace ATAS.Indicators.Technical
 
 		#region Order flow
 
-		// The price inside the closed bar where the most contracts traded, when it stands out: at
-		// least Min filled volume, and Filled volume vs bar average times the bar's average per
-		// price. Whoever was on the passive side there got filled - resting bids when sellers
+		// The price inside the closed bar where the most contracts traded, when it stands out:
+		// among the biggest of the recent bars (or at least Min filled volume), and Filled volume
+		// vs bar average times the bar's average per price. Whoever was on the passive side there got filled - resting bids when sellers
 		// hit them (bid volume), resting offers when buyers lifted them (ask volume).
 		private void DetectFootprintFill(int bar, IndicatorCandle candle)
 		{
 			var levels = candle.GetAllPriceLevels();
-
-			if (levels == null)
-				return;
-
 			PriceVolumeInfo best = null;
 			var total = 0m;
 			var count = 0;
 
-			foreach (var level in levels)
+			if (levels != null)
 			{
-				total += level.Volume;
-				count++;
+				foreach (var level in levels)
+				{
+					total += level.Volume;
+					count++;
 
-				if (best == null || level.Volume > best.Volume || (level.Volume == best.Volume && level.Price < best.Price))
-					best = level;
+					if (best == null || level.Volume > best.Volume || (level.Volume == best.Volume && level.Price < best.Price))
+						best = level;
+				}
 			}
 
-			if (best == null || best.Volume <= 0)
+			// the size a big fill takes comes from the bars before this one
+			var peak = best != null && best.Volume > 0 ? best.Volume : 0;
+			var minimum = FillMinimum();
+			RememberPeak(peak);
+			_fillThreshold = FillMinimum();
+
+			if (peak <= 0 || minimum <= 0)
 				return;
 
-			var threshold = Math.Max(FillMinVolume, (decimal)FillVolumeMultiplier * total / count);
+			var threshold = Math.Max(minimum, (decimal)FillVolumeMultiplier * total / count);
 
 			if (best.Volume < threshold)
 				return;
@@ -2085,6 +2752,43 @@ namespace ATAS.Indicators.Technical
 			fill.AskVolume = best.Ask;
 			fill.BidsFilled = bidsFilled;
 			_footprintFills[bar] = fill;
+		}
+
+		// What a big fill takes: Min filled volume, or - among the biggest of recent bars - the
+		// busiest price of a bar ranked at the Top share of the last Fill lookback bars (0 until
+		// MinFillHistory of them had a footprint)
+		private decimal FillMinimum()
+		{
+			if (FillSize == FillSizeRule.FixedContracts)
+				return FillMinVolume;
+
+			var count = _sortedPeaks.Count;
+
+			if (count < MinFillHistory)
+				return 0;
+
+			var rank = Math.Max(1, (count * FillTopPercent + 99) / 100);
+			return _sortedPeaks[count - rank];
+		}
+
+		// the busiest price of the bar joins the recent ones; the oldest leaves after Fill lookback bars
+		private void RememberPeak(decimal peak)
+		{
+			_recentPeaks.Enqueue(peak);
+
+			if (peak > 0)
+			{
+				var at = _sortedPeaks.BinarySearch(peak);
+				_sortedPeaks.Insert(at < 0 ? ~at : at, peak);
+			}
+
+			while (_recentPeaks.Count > FillLookbackBars)
+			{
+				var old = _recentPeaks.Dequeue();
+
+				if (old > 0)
+					_sortedPeaks.RemoveAt(_sortedPeaks.BinarySearch(old));
+			}
 		}
 
 		// Reads the reaction to every fill still in its window: the first candlestick pattern on
@@ -2228,8 +2932,8 @@ namespace ATAS.Indicators.Technical
 			}
 		}
 
-		// One price of the order book changed. Levels of at least Min resting order contracts
-		// are followed as resting orders; when one drops below that it is leaving the book, and
+		// One price of the order book changed. Levels of at least the resting order size
+		// (RestingMinimum) are followed as resting orders; when one drops below that it is leaving the book, and
 		// SettleLeavingOrders decides whether it was filled or pulled.
 		private void ApplyDepth(MarketDataArg depth)
 		{
@@ -2254,7 +2958,10 @@ namespace ATAS.Indicators.Technical
 			var orders = isBid ? _restingBids : _restingAsks;
 			orders.TryGetValue(price, out var order);
 
-			if (volume >= RestingOrderMin)
+			// an order keeps the size it needed when it appeared
+			var needed = order != null ? order.Threshold : volume > 0 ? RestingMinimum() : decimal.MaxValue;
+
+			if (volume >= needed)
 			{
 				if (order == null)
 				{
@@ -2264,7 +2971,8 @@ namespace ATAS.Indicators.Technical
 						IsBid = isBid,
 						FirstBar = LiveBar,
 						FirstTime = MarketTime,
-						TradedAtStart = TradedAgainst(price, isBid)
+						TradedAtStart = TradedAgainst(price, isBid),
+						Threshold = needed
 					};
 
 					orders[price] = order;
@@ -2293,6 +3001,24 @@ namespace ATAS.Indicators.Technical
 			// the deepest level leaving the book has usually just scrolled out of the depth the
 			// feed sends, rather than been filled or pulled
 			order.AtBookEdge = volume == 0 && (isBid ? !_bids.Keys.Any(p => p < price) : !_asks.Keys.Any(p => p > price));
+		}
+
+		// What a resting order takes now: Min resting order, or Resting order vs typical level
+		// times the median size of the prices in the book (Min resting order until it has
+		// MinBookLevels prices)
+		private decimal RestingMinimum()
+		{
+			if (RestingSize == RestingSizeRule.FixedContracts)
+				return RestingOrderMin;
+
+			var sizes = _bids.Values.Concat(_asks.Values).OrderBy(v => v).ToList();
+
+			if (sizes.Count < MinBookLevels)
+				return RestingOrderMin;
+
+			var middle = sizes.Count / 2;
+			var median = sizes.Count % 2 == 1 ? sizes[middle] : (sizes[middle - 1] + sizes[middle]) / 2;
+			return Math.Max(1, Math.Ceiling(median * (decimal)RestingMultiplier));
 		}
 
 		// A leaving order is filled once trades at its price, against its side, took Filled when
@@ -2363,7 +3089,10 @@ namespace ATAS.Indicators.Technical
 				return;
 			}
 
-			if (order.Traded < FillMinVolume)
+			// as big as a big fill: Min filled volume, or what the recent bars' big fills took
+			var minimum = FillSize == FillSizeRule.FixedContracts || _fillThreshold <= 0 ? FillMinVolume : _fillThreshold;
+
+			if (order.Traded < minimum)
 				return;
 
 			var fill = new FillEvent
@@ -2403,10 +3132,14 @@ namespace ATAS.Indicators.Technical
 		#region Signals and TP / SL tracking
 
 		private void GenerateSignals(int bar, IndicatorCandle candle, FvgZone bullZone, FvgZone bearZone, FillEvent bullFill, FillEvent bearFill,
-			bool sweptLows, bool sweptHighs, ref List<PendingAlert> alerts)
+			bool sweptLows, bool sweptHighs, KeyLevel keyLow, KeyLevel keyHigh, ref List<PendingAlert> alerts)
 		{
-			var longTrade = EnableBuySignals ? TryBuildSignal(bar, candle, true, bullZone, bullFill, sweptLows) : null;
-			var shortTrade = EnableShortSignals ? TryBuildSignal(bar, candle, false, bearZone, bearFill, sweptHighs) : null;
+			// outside the signal hours nothing is taken, not even for the statistics
+			if (!InSignalHours(candle.Time))
+				return;
+
+			var longTrade = EnableBuySignals ? TryBuildSignal(bar, candle, true, bullZone, bullFill, sweptLows, keyLow) : null;
+			var shortTrade = EnableShortSignals ? TryBuildSignal(bar, candle, false, bearZone, bearFill, sweptHighs, keyHigh) : null;
 
 			var candidates = new List<SignalTrade>(2);
 
@@ -2449,7 +3182,7 @@ namespace ATAS.Indicators.Technical
 					var zone = trade.IsLong ? bullZone : bearZone;
 					var fill = trade.IsLong ? bullFill : bearFill;
 
-					if (zone != null && (trade.Trigger == TriggerType.Fvg || trade.Trigger == TriggerType.SweepThenFvg))
+					if (zone != null && IsZoneTrigger(trade.Trigger))
 						zone.SignalShown = true;
 
 					if (fill != null && trade.Trigger == TriggerType.Fill)
@@ -2460,36 +3193,58 @@ namespace ATAS.Indicators.Technical
 			}
 		}
 
-		private SignalTrade TryBuildSignal(int bar, IndicatorCandle candle, bool isLong, FvgZone zone, FillEvent fill, bool sweepNow)
+		private SignalTrade TryBuildSignal(int bar, IndicatorCandle candle, bool isLong, FvgZone zone, FillEvent fill, bool sweepNow,
+			KeyLevel keySweepNow)
 		{
 			var lastSweep = isLong ? _lastLowSweepBar : _lastHighSweepBar;
+			var lastKeySweep = isLong ? _lastLowKeySweepBar : _lastHighKeySweepBar;
 			var sweepBefore = lastSweep >= 0 && bar - lastSweep <= ConfluenceBars;
+			var keySweepBefore = lastKeySweep >= 0 && bar - lastKeySweep <= ConfluenceBars;
+
+			// a gap reaction after a sweep of a key level outranks one after a sweep of any swing
+			var fvgTrigger = keySweepBefore ? TriggerType.KeySweepThenFvg : sweepBefore ? TriggerType.SweepThenFvg : TriggerType.Fvg;
 			TriggerType trigger;
 
 			switch (SignalSource)
 			{
 				case SignalMode.FvgReactionOnly when zone != null:
-					trigger = sweepBefore ? TriggerType.SweepThenFvg : TriggerType.Fvg;
+					trigger = fvgTrigger;
+					break;
+
+				case SignalMode.LiquiditySweepOnly when keySweepNow != null:
+					trigger = TriggerType.KeySweep;
 					break;
 
 				case SignalMode.LiquiditySweepOnly when sweepNow:
 					trigger = TriggerType.Sweep;
 					break;
 
-				case SignalMode.SweepThenFvg when zone != null && sweepBefore:
-					trigger = TriggerType.SweepThenFvg;
+				case SignalMode.SweepThenFvg when zone != null && (sweepBefore || keySweepBefore):
+					trigger = fvgTrigger;
 					break;
 
 				case SignalMode.FillReactionOnly when fill != null:
 					trigger = TriggerType.Fill;
 					break;
 
+				case SignalMode.KeyLevelSweeps when zone != null && keySweepBefore:
+					trigger = TriggerType.KeySweepThenFvg;
+					break;
+
+				case SignalMode.KeyLevelSweeps when keySweepNow != null:
+					trigger = TriggerType.KeySweep;
+					break;
+
 				case SignalMode.AnyTrigger when zone != null:
-					trigger = sweepBefore ? TriggerType.SweepThenFvg : TriggerType.Fvg;
+					trigger = fvgTrigger;
 					break;
 
 				case SignalMode.AnyTrigger when fill != null:
 					trigger = TriggerType.Fill;
+					break;
+
+				case SignalMode.AnyTrigger when keySweepNow != null:
+					trigger = TriggerType.KeySweep;
 					break;
 
 				case SignalMode.AnyTrigger when sweepNow:
@@ -2506,8 +3261,11 @@ namespace ATAS.Indicators.Technical
 			if (lastSignal >= 0 && bar - lastSignal <= SignalCooldownBars)
 				return null;
 
-			var fromZone = trigger == TriggerType.Fvg || trigger == TriggerType.SweepThenFvg;
+			var fromZone = IsZoneTrigger(trigger);
 			var fromFill = trigger == TriggerType.Fill;
+			var sweptLevel = trigger == TriggerType.KeySweep ? keySweepNow
+				: trigger == TriggerType.KeySweepThenFvg ? (isLong ? _lastLowKeySweep : _lastHighKeySweep)
+				: null;
 
 			// a reaction brings its own pattern; a sweep bar is read as coming after a dip (buys)
 			// or a rally (shorts)
@@ -2557,6 +3315,7 @@ namespace ATAS.Indicators.Technical
 				FillPrice = fromFill ? fill.Price : 0,
 				FillVolume = fromFill ? fill.Volume : 0,
 				FillBidsFilled = fromFill && fill.BidsFilled,
+				SweptLevel = sweptLevel,
 				Estimate = _model.Estimate(isLong, trigger, confirmations, PriorOdds(), ProbabilitySmoothing,
 					TakeProfitTicks, breakEven ? EffectiveBreakEvenStopTicks : 0, StopLossTicks)
 			};
@@ -2589,7 +3348,7 @@ namespace ATAS.Indicators.Technical
 
 			if (_realtime && UseAlerts)
 			{
-				var setup = string.Join(", ", PatternNames(trade.CandlePatterns).Prepend(TriggerLabel(trade.Trigger)));
+				var setup = string.Join(", ", PatternNames(trade.CandlePatterns).Prepend(SetupName(trade)));
 				var message = $"{Side(trade)} @ {FormatPrice(trade.EntryPrice)} ({setup}): {OddsText(trade, " / ")}"
 					+ $"  -  TP {FormatPrice(trade.TakeProfitPrice)}, SL {FormatPrice(trade.StopLossPrice)}";
 
@@ -2913,8 +3672,10 @@ namespace ATAS.Indicators.Technical
 			List<LiquiditySweep> sweeps = null;
 			List<FillEvent> fills = null;
 			List<RestingOrder> orders = null;
+			List<KeyLevel> levels = null;
 			List<SignalTrade> trades;
 			PanelStats stats = null;
+			var mouse = MouseLocationInfo.LastPosition;
 
 			// copy what's visible under the lock (OnCalculate and the order book may be updating
 			// on their own threads), then draw from the copies
@@ -2950,20 +3711,32 @@ namespace ATAS.Indicators.Technical
 						.ToList();
 				}
 
+				if (DrawKeyLevels)
+				{
+					levels = _keyLevels.Where(l => l.FromBar <= lastBar)
+						.Concat(_endedLevels.Where(l => l.FromBar <= lastBar && l.EndBar >= firstBar))
+						.Select(l => l.Clone())
+						.ToList();
+				}
+
 				trades = _trades
 					.Where(t => t.IsShown && t.EntryBar <= lastBar && (t.Outcome == TradeOutcome.Open || t.ExitBar >= firstBar))
 					.Select(t => t.Clone())
 					.ToList();
 
+				// the scoreboard is only worked out when it is on screen
 				if (ShowStatsPanel)
-					stats = BuildPanelStats();
+					stats = BuildPanelStats(ShowScoreboard || _lastPanel.Contains(mouse));
 			}
 
-			var hover = new Hover(MouseLocationInfo.LastPosition);
+			var hover = new Hover(mouse);
 			var priceTags = new List<(string Text, int X, int Y, Color Color)>();
 
 			if (zones != null)
 				RenderZones(context, zones);
+
+			if (levels != null)
+				RenderKeyLevels(context, levels, hover);
 
 			if (orders != null)
 				RenderRestingOrders(context, orders, hover);
@@ -2986,14 +3759,25 @@ namespace ATAS.Indicators.Technical
 			foreach (var (text, x, y, color) in priceTags)
 				DrawPriceTag(context, text, x, y, color, SmallFont);
 
-			if (stats != null)
-				RenderStatsPanel(context, stats);
+			var overPanel = false;
 
-			if (hover.Lines != null)
+			if (stats != null)
+			{
+				_lastPanel = RenderStatsPanel(context, stats);
+				overPanel = _lastPanel.Contains(mouse);
+
+				if (stats.Board != null && (ShowScoreboard || overPanel))
+					RenderScoreboard(context, stats.Board, _lastPanel);
+			}
+			else
+				_lastPanel = Rectangle.Empty;
+
+			// over the panel the scoreboard is the tooltip
+			if (hover.Lines != null && !overPanel)
 				RenderTooltip(context, hover.Lines(), hover.Mouse);
 		}
 
-		private PanelStats BuildPanelStats()
+		private PanelStats BuildPanelStats(bool withScoreboard)
 		{
 			var openTrade = _openTrades.Where(t => t.IsShown).OrderByDescending(t => t.EntryBar).FirstOrDefault();
 			var resting = _restingBids.Values.Concat(_restingAsks.Values).Where(o => !o.Leaving).ToList();
@@ -3023,8 +3807,82 @@ namespace ATAS.Indicators.Technical
 				BearishFills = _fills.Count(f => f.Reaction < 0),
 				RestingBids = resting.Count(o => o.IsBid),
 				RestingAsks = resting.Count(o => !o.IsBid),
-				Largest = resting.OrderByDescending(o => o.Volume).FirstOrDefault()?.Clone()
+				Largest = resting.OrderByDescending(o => o.Volume).FirstOrDefault()?.Clone(),
+				FillThreshold = FillSize == FillSizeRule.FixedContracts ? FillMinVolume : _fillThreshold,
+				RestingThreshold = RestingMinimum(),
+				LastBarTime = CurrentBar > 0 ? GetCandle(CurrentBar - 1).Time : DateTime.MinValue,
+				Board = withScoreboard ? BuildScoreboard() : null
 			};
+		}
+
+		// every closed signal, hidden ones included (expired ones are left out, as in the odds)
+		private Scoreboard BuildScoreboard()
+		{
+			var board = new Scoreboard();
+			var triggers = new Dictionary<TriggerType, ScoreRow>();
+			var patterns = new Dictionary<CandlePattern, ScoreRow>();
+			var noPattern = new ScoreRow { Name = "No pattern" };
+			var buckets = new[] { (0, 20), (20, 30), (30, 40), (40, 50), (50, 60), (60, 101) }
+				.Select(r => new OddsBucket { From = r.Item1, To = r.Item2 })
+				.ToList();
+
+			foreach (var trade in _trades)
+			{
+				if (trade.Outcome == TradeOutcome.Open || trade.Outcome == TradeOutcome.Expired)
+					continue;
+
+				board.Closed++;
+				var ticks = ResultTicks(trade);
+
+				if (!triggers.TryGetValue(trade.Trigger, out var row))
+					triggers[trade.Trigger] = row = new ScoreRow { Name = TriggerLabel(trade.Trigger) };
+
+				Score(row, trade, ticks);
+
+				if (trade.CandlePatterns == CandlePattern.None)
+					Score(noPattern, trade, ticks);
+
+				foreach (var info in CandlePatternInfo)
+				{
+					if ((trade.CandlePatterns & info.Pattern) == 0)
+						continue;
+
+					if (!patterns.TryGetValue(info.Pattern, out var patternRow))
+						patterns[info.Pattern] = patternRow = new ScoreRow { Name = info.Name };
+
+					Score(patternRow, trade, ticks);
+				}
+
+				var chance = LabelPercents(trade)[0];
+				var bucket = buckets.First(b => chance >= b.From && chance < b.To);
+				bucket.Count++;
+
+				if (trade.Outcome == TradeOutcome.TakeProfit)
+					bucket.Hits++;
+			}
+
+			board.Triggers = triggers.OrderBy(kv => (int)kv.Key).Select(kv => kv.Value).ToList();
+			board.Patterns = patterns.Values
+				.Concat(noPattern.Count > 0 ? new[] { noPattern } : Array.Empty<ScoreRow>())
+				.OrderByDescending(r => r.Count)
+				.ThenBy(r => r.Name, StringComparer.Ordinal)
+				.Take(ScoreboardPatterns)
+				.ToList();
+			board.OddsCheck = buckets.Where(b => b.Count > 0).ToList();
+			return board;
+		}
+
+		private static void Score(ScoreRow row, SignalTrade trade, decimal ticks)
+		{
+			row.Count++;
+			row.Ticks += ticks;
+
+			if (trade.Outcome == TradeOutcome.TakeProfit)
+				row.Wins++;
+			else if (trade.Outcome == TradeOutcome.BreakEven)
+				row.BreakEvens++;
+			else
+				row.Losses++;
 		}
 
 		// Active gaps reach to the right edge, with a thin edge top and bottom and a dashed
@@ -3068,6 +3926,51 @@ namespace ATAS.Indicators.Technical
 					var midline = new RenderPen(WithAlpha(color, Math.Min(255, color.A * 2))) { DashStyle = DashStyle.Dash };
 					context.DrawLine(midline, x1, yMiddle, x2, yMiddle);
 				}
+			}
+		}
+
+		// Key levels as thin lines from the bar they count from: solid while waiting, ending in a
+		// dot where a sweep took them, dashed where price broke through, faint once expired
+		private void RenderKeyLevels(RenderContext context, List<KeyLevel> levels, Hover hover)
+		{
+			var right = ChartInfo.Region.Width;
+			var region = ChartInfo.PriceChartContainer.Region;
+			var font = SmallFont;
+			var labels = new List<Rectangle>();
+
+			foreach (var level in levels.OrderBy(l => l.FromBar))
+			{
+				var fresh = level.State == KeyLevelState.Fresh;
+				var x1 = ChartInfo.GetXByBar(level.FromBar);
+				var x2 = fresh ? right : ChartInfo.GetXByBar(level.EndBar, false);
+				var y = ChartInfo.GetYByPrice(level.Price, false);
+
+				if (x2 <= x1)
+					continue;
+
+				var alpha = fresh ? 190 : level.State == KeyLevelState.Swept ? 130 : 70;
+				var pen = new RenderPen(WithAlpha(LevelColor, alpha)) { DashStyle = level.State == KeyLevelState.Broken ? DashStyle.Dash : DashStyle.Solid };
+				context.DrawLine(pen, x1, y, x2, y);
+
+				if (level.State == KeyLevelState.Swept)
+					context.FillEllipse(WithAlpha(level.IsHigh ? BearColor : BullColor, 220), new Rectangle(x2 - 3, y - 3, 6, 6));
+
+				// its name above a high, below a low, at the start of its visible part
+				var text = LevelTag(level);
+				var size = context.MeasureString(text, font);
+				var labelX = Math.Max(x1, region.X) + 3;
+				var rect = new Rectangle(labelX, level.IsHigh ? y - size.Height - 1 : y + 1, size.Width + 4, size.Height);
+
+				if (rect.Right > x2 || labels.Any(r => r.IntersectsWith(rect)))
+					continue;
+
+				labels.Add(rect);
+				context.DrawString(text, font, WithAlpha(LevelColor, Math.Max(alpha, 150)), rect.X + 2, rect.Y);
+
+				var captured = level;
+
+				if (rect.Contains(hover.Mouse))
+					hover.Offer(1, () => KeyLevelTooltip(captured));
 			}
 		}
 
@@ -3404,7 +4307,8 @@ namespace ATAS.Indicators.Technical
 				hover.Offer(4, () => SignalTooltip(trade));
 		}
 
-		private void RenderStatsPanel(RenderContext context, PanelStats stats)
+		// returns where it was drawn
+		private Rectangle RenderStatsPanel(RenderContext context, PanelStats stats)
 		{
 			var breakEven = BreakEvenEnabled;
 			var bracket = $"TP {TakeProfitTicks}t · SL {StopLossTicks}t";
@@ -3436,10 +4340,22 @@ namespace ATAS.Indicators.Technical
 				// expected result really made (every settled signal, hidden ones included)
 				($"Labelled EV>0: {TrackRecord(stats.PositiveEvTicks, stats.PositiveEvCount)}   "
 					+ $"EV≤0: {TrackRecord(stats.NegativeEvTicks, stats.NegativeEvCount)}", DimTextColor),
-				($"Fills {stats.Fills}: {stats.BullishFills} bullish · {stats.BearishFills} bearish reactions", DimTextColor)
+				($"Fills {stats.Fills}: {stats.BullishFills} bullish · {stats.BearishFills} bearish reactions"
+					+ (stats.FillThreshold > 0 ? $" · big ≥{FormatVolume(stats.FillThreshold)}" : string.Empty), DimTextColor)
 			};
 
-			var restingLine = $"Resting ≥{RestingOrderMin}: {stats.RestingBids} bids · {stats.RestingAsks} offers";
+			// when signals may fire, and the New York time of the last bar to check it against
+			var hours = $"Signals: {HoursText()}";
+
+			if (stats.LastBarTime > DateTime.MinValue)
+				hours += $" · last bar {NewYorkTime(stats.LastBarTime).ToString("HH:mm", CultureInfo.InvariantCulture)} New York";
+
+			footer.Insert(1, (hours, DimTextColor));
+
+			var restingSize = RestingSize == RestingSizeRule.FixedContracts
+				? $"≥{RestingOrderMin}"
+				: $"≥{FormatVolume(stats.RestingThreshold)} ({RestingMultiplier.ToString("0.#", CultureInfo.InvariantCulture)}× typical)";
+			var restingLine = $"Resting {restingSize}: {stats.RestingBids} bids · {stats.RestingAsks} offers";
 
 			if (stats.Largest != null)
 				restingLine += $" · largest {FormatVolume(stats.Largest.Volume)} {(stats.Largest.IsBid ? "bid" : "offer")} @ {FormatPrice(stats.Largest.Price)}";
@@ -3518,6 +4434,116 @@ namespace ATAS.Indicators.Technical
 				context.DrawString(text, font, color, x + pad, lineY);
 				lineY += rowHeight;
 			}
+
+			return panel;
+		}
+
+		// The scoreboard, under the statistics panel (above it when the panel sits at the bottom):
+		// every closed signal by trigger and by candlestick pattern, then how the labelled TP odds
+		// held up
+		private void RenderScoreboard(RenderContext context, Scoreboard board, Rectangle panel)
+		{
+			const int pad = 8;
+			const int gap = 12;
+			var font = LabelFont.RenderObject;
+			var breakEven = BreakEvenEnabled;
+			var title = board.Closed == 0
+				? "Scoreboard: no closed signals yet"
+				: $"Scoreboard: {board.Closed} closed signal{(board.Closed == 1 ? string.Empty : "s")}, hidden ones included";
+
+			string[] Header(string first) => breakEven ? new[] { first, "n", "TP", "BE", "SL", "avg" } : new[] { first, "n", "TP", "SL", "avg" };
+
+			string[] Cells(ScoreRow row)
+			{
+				var average = $"{(row.Ticks / row.Count).ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture)}t";
+				var n = row.Count.ToString(CultureInfo.InvariantCulture);
+
+				return breakEven
+					? new[] { row.Name, n, $"{row.Wins}", $"{row.BreakEvens}", $"{row.Losses}", average }
+					: new[] { row.Name, n, $"{row.Wins}", $"{row.Losses}", average };
+			}
+
+			// (cells, is a header, average ticks for the color)
+			var rows = new List<(string[] Cells, bool Header, decimal Average)>();
+
+			if (board.Closed > 0)
+			{
+				rows.Add((Header("Setup"), true, 0));
+				rows.AddRange(board.Triggers.Select(r => (Cells(r), false, r.Ticks / r.Count)));
+				rows.Add((Header("Pattern"), true, 0));
+				rows.AddRange(board.Patterns.Select(r => (Cells(r), false, r.Ticks / r.Count)));
+			}
+
+			// "said TP 20–30%: hit 24% of 41"
+			var odds = board.OddsCheck
+				.Select(b => $"Said TP {b.From}–{Math.Min(b.To, 100)}%: hit {(100.0 * b.Hits / b.Count).ToString("0", CultureInfo.InvariantCulture)}% of {b.Count}")
+				.ToList();
+
+			var titleSize = context.MeasureString(title, font);
+			var rowHeight = titleSize.Height;
+			var columns = Header(string.Empty).Length;
+			var widths = new int[columns];
+
+			foreach (var (cells, _, _) in rows)
+			{
+				for (var i = 0; i < columns; i++)
+					widths[i] = Math.Max(widths[i], context.MeasureString(cells[i], font).Width);
+			}
+
+			var tableWidth = rows.Count > 0 ? widths.Sum() + gap * (columns - 1) : 0;
+			var oddsWidth = odds.Count > 0 ? odds.Max(o => context.MeasureString(o, font).Width) : 0;
+			var width = Math.Max(titleSize.Width, Math.Max(tableWidth, oddsWidth)) + pad * 2;
+			var height = pad * 2 + rowHeight * (1 + rows.Count + (odds.Count > 0 ? odds.Count + 1 : 0)) + 8;
+
+			var region = ChartInfo.PriceChartContainer.Region;
+			var left = StatsPanelLocation == PanelCorner.TopLeft || StatsPanelLocation == PanelCorner.BottomLeft;
+			var top = StatsPanelLocation == PanelCorner.TopLeft || StatsPanelLocation == PanelCorner.TopRight;
+			var x = left ? panel.X : panel.Right - width;
+			var y = top ? panel.Bottom + 6 : panel.Y - 6 - height;
+			x = Math.Max(region.X, Math.Min(x, region.X + region.Width - width));
+			y = Math.Max(region.Y, Math.Min(y, region.Y + region.Height - height));
+
+			context.FillRectangle(CardColor, new Rectangle(x, y, width, height), 6);
+
+			var lineY = y + pad;
+			context.DrawString(title, font, TextColor, x + pad, lineY);
+			lineY += rowHeight + 4;
+
+			foreach (var (cells, header, average) in rows)
+			{
+				if (header)
+					context.DrawLine(new RenderPen(CardBorderColor), x + pad, lineY - 2, x + width - pad, lineY - 2);
+
+				var cellX = x + pad;
+
+				for (var i = 0; i < columns; i++)
+				{
+					var cellWidth = context.MeasureString(cells[i], font).Width;
+					var textX = i == 0 ? cellX : cellX + widths[i] - cellWidth;
+					var color = header ? DimTextColor
+						: i == columns - 1 ? (average > 0 ? BullColor : average < 0 ? BearColor : TextColor)
+						: TextColor;
+
+					context.DrawString(cells[i], font, color, textX, lineY);
+					cellX += widths[i] + gap;
+				}
+
+				lineY += rowHeight;
+			}
+
+			if (odds.Count == 0)
+				return;
+
+			lineY += 4;
+			context.DrawLine(new RenderPen(CardBorderColor), x + pad, lineY - 2, x + width - pad, lineY - 2);
+			context.DrawString("Odds check (were the TP odds right?)", font, DimTextColor, x + pad, lineY);
+			lineY += rowHeight;
+
+			foreach (var line in odds)
+			{
+				context.DrawString(line, font, TextColor, x + pad, lineY);
+				lineY += rowHeight;
+			}
 		}
 
 		// hover details for a signal: what the probabilities were built from and how the trade ended
@@ -3561,6 +4587,12 @@ namespace ATAS.Indicators.Technical
 			{
 				var ticks = (trade.ZoneTop - trade.ZoneBottom) / TickSize;
 				lines.Add(($"Reacted off the FVG {FormatPrice(trade.ZoneBottom)} - {FormatPrice(trade.ZoneTop)} ({ticks:0}t)", DimTextColor));
+			}
+
+			if (trade.SweptLevel != null)
+			{
+				lines.Add(($"Swept the {LevelName(trade.SweptLevel)} {FormatPrice(trade.SweptLevel.Price)} on bar {trade.SweptLevel.EndBar}",
+					DimTextColor));
 			}
 
 			if (trade.FillPrice > 0)
@@ -3631,6 +4663,39 @@ namespace ATAS.Indicators.Technical
 				($"{reaction} reaction on bar {zone.EndBar}: {string.Join(", ", PatternNames(zone.ReactionPatterns))}",
 					zone.ReactionBullish ? BullColor : BearColor)
 			};
+		}
+
+		private List<(string Text, Color Color)> KeyLevelTooltip(KeyLevel level)
+		{
+			var name = LevelName(level);
+			var lines = new List<(string Text, Color Color)>
+			{
+				($"{char.ToUpperInvariant(name[0])}{name.Substring(1)} {FormatPrice(level.Price)}", LevelColor)
+			};
+
+			if (level.FirstSwingBar >= 0)
+				lines.Add(($"Swings on bars {level.FirstSwingBar} and {level.SecondSwingBar}", DimTextColor));
+
+			switch (level.State)
+			{
+				case KeyLevelState.Swept:
+					lines.Add(($"Swept on bar {level.EndBar}: a wick beyond it, a close back inside", level.IsHigh ? BearColor : BullColor));
+					break;
+
+				case KeyLevelState.Broken:
+					lines.Add(($"Broken on bar {level.EndBar}: a close beyond it", DimTextColor));
+					break;
+
+				case KeyLevelState.Expired:
+					lines.Add(($"Counted until bar {level.EndBar}, untouched", DimTextColor));
+					break;
+
+				default:
+					lines.Add(($"Waiting since bar {level.FromBar}: price has not traded beyond it", DimTextColor));
+					break;
+			}
+
+			return lines;
 		}
 
 		private List<(string Text, Color Color)> OrderTooltip(RestingOrder order)
@@ -3877,8 +4942,88 @@ namespace ATAS.Indicators.Technical
 				case TriggerType.Fill:
 					return "Fill";
 
+				case TriggerType.KeySweep:
+					return "Key sweep";
+
+				case TriggerType.KeySweepThenFvg:
+					return "Key sweep+FVG";
+
 				default:
 					return "FVG";
+			}
+		}
+
+		private static bool IsZoneTrigger(TriggerType trigger)
+		{
+			return trigger == TriggerType.Fvg || trigger == TriggerType.SweepThenFvg || trigger == TriggerType.KeySweepThenFvg;
+		}
+
+		// the trigger, naming the key level a key-level sweep took: "Sweep PDH", "ONL sweep+FVG"
+		private static string SetupName(SignalTrade trade)
+		{
+			if (trade.SweptLevel == null)
+				return TriggerLabel(trade.Trigger);
+
+			return trade.Trigger == TriggerType.KeySweep ? $"Sweep {LevelTag(trade.SweptLevel)}" : $"{LevelTag(trade.SweptLevel)} sweep+FVG";
+		}
+
+		private static string LevelTag(KeyLevel level)
+		{
+			switch (level.Kind)
+			{
+				case KeyLevelKind.PriorDayHigh:
+					return "PDH";
+
+				case KeyLevelKind.PriorDayLow:
+					return "PDL";
+
+				case KeyLevelKind.OvernightHigh:
+					return "ONH";
+
+				case KeyLevelKind.OvernightLow:
+					return "ONL";
+
+				case KeyLevelKind.OpeningRangeHigh:
+					return "ORH";
+
+				case KeyLevelKind.OpeningRangeLow:
+					return "ORL";
+
+				case KeyLevelKind.EqualHighs:
+					return "EQH";
+
+				default:
+					return "EQL";
+			}
+		}
+
+		private static string LevelName(KeyLevel level)
+		{
+			switch (level.Kind)
+			{
+				case KeyLevelKind.PriorDayHigh:
+					return "prior day high";
+
+				case KeyLevelKind.PriorDayLow:
+					return "prior day low";
+
+				case KeyLevelKind.OvernightHigh:
+					return "overnight high";
+
+				case KeyLevelKind.OvernightLow:
+					return "overnight low";
+
+				case KeyLevelKind.OpeningRangeHigh:
+					return "opening range high";
+
+				case KeyLevelKind.OpeningRangeLow:
+					return "opening range low";
+
+				case KeyLevelKind.EqualHighs:
+					return "equal highs";
+
+				default:
+					return "equal lows";
 			}
 		}
 
@@ -3887,11 +5032,11 @@ namespace ATAS.Indicators.Technical
 			return trade.IsLong ? "BUY" : "SHORT";
 		}
 
-		// "FVG · Hammer", "Fill · Bullish engulfing +1", "Sweep"
+		// "FVG · Hammer", "Fill · Bullish engulfing +1", "Sweep PDH"
 		private static string SetupText(SignalTrade trade)
 		{
 			var pattern = PatternSummary(trade.CandlePatterns);
-			return pattern.Length == 0 ? TriggerLabel(trade.Trigger) : $"{TriggerLabel(trade.Trigger)} · {pattern}";
+			return pattern.Length == 0 ? SetupName(trade) : $"{SetupName(trade)} · {pattern}";
 		}
 
 		// the names of the patterns in `patterns`, strongest first
@@ -3996,6 +5141,28 @@ namespace ATAS.Indicators.Technical
 		private static string SignedTicks(int ticks)
 		{
 			return ticks.ToString("+0;-0;0", CultureInfo.InvariantCulture);
+		}
+
+		// "regular hours 09:30–16:00", "all hours"
+		private string HoursText()
+		{
+			string Clock(TimeSpan time) => time.ToString(@"hh\:mm", CultureInfo.InvariantCulture);
+
+			switch (SignalHours)
+			{
+				case SignalHoursRule.AllHours:
+					return "all hours";
+
+				case SignalHoursRule.FirstTwoHours:
+					var twoHours = RegularHoursStart + TimeSpan.FromHours(2);
+					return $"first two hours {Clock(RegularHoursStart)}–{Clock(twoHours < RegularHoursEnd ? twoHours : RegularHoursEnd)}";
+
+				case SignalHoursRule.RegularHoursNoLunch:
+					return $"regular hours {Clock(RegularHoursStart)}–{Clock(RegularHoursEnd)}, not 11:30–13:30";
+
+				default:
+					return $"regular hours {Clock(RegularHoursStart)}–{Clock(RegularHoursEnd)}";
+			}
 		}
 
 		private static string TrackRecord(decimal ticks, int count)
