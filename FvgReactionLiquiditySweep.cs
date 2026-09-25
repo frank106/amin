@@ -4,8 +4,12 @@ using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
 
+using ATAS.DataFeedsCore;
 using ATAS.Indicators;
 
 using OFT.Attributes;
@@ -32,6 +36,10 @@ namespace ATAS.Indicators.Technical
 	//      80-tick take profit and stop loss (the stop moves to +20 ticks once the trade is 40
 	//      ticks in profit) and labelled with the odds of ending at TP, at the break-even stop
 	//      or at SL.
+	//   7) Optional execution, off by default: the orders of the signals shown on the chart, with
+	//      the entry, take profit, stop and break-even their trades already carry. Paper
+	//      (simulated) unless it is armed for a live account, one position at a time, with a daily
+	//      loss limit and a CSV log of every order for reconciling with the scoreboard.
 	//
 	// How the probabilities are estimated
 	// -----------------------------------
@@ -662,6 +670,7 @@ namespace ATAS.Indicators.Technical
 			public decimal RestingThreshold;   // what a resting order takes now
 			public DateTime LastBarTime;       // for the New York clock
 			public Scoreboard Board;
+			public List<(string Text, Color Color)> Execution;   // null while execution is off
 		}
 
 		// Every closed signal, hidden ones included, by trigger and by candlestick pattern, and
@@ -725,6 +734,106 @@ namespace ATAS.Indicators.Technical
 				Priority = priority;
 				Lines = lines;
 			}
+		}
+
+		// What an order the executor sends is for
+		private enum OrderRole
+		{
+			Entry,
+			TakeProfit,
+			StopLoss,
+			Exit          // closing at market: the chart's trade ended, or the position lost its protection
+		}
+
+		// One order the executor sent, and what it knows of it. Paper orders are ATAS orders too, so
+		// paper and live go through the same code; paper ones just never leave the indicator.
+		private class ExecOrder
+		{
+			public Order Order;
+			public readonly List<Order> Replaced = new List<Order>();   // earlier versions of a modified order
+			public OrderRole Role;
+			public bool IsBuy;
+			public decimal Quantity;
+			public decimal Filled;
+			public bool Working = true;     // may still fill
+			public bool CancelSent;
+			public int CancelAttempts;      // live: cancels the broker refused
+			public bool FillPending;        // live: reported filled, its fills not in yet
+
+			public bool Matches(Order order, string id)
+			{
+				if (order != null && (ReferenceEquals(order, Order) || Replaced.Any(o => ReferenceEquals(o, order))))
+					return true;
+
+				return !string.IsNullOrEmpty(id) && (id == Order.Id || Replaced.Any(o => o.Id == id));
+			}
+		}
+
+		// The position the executor holds for one signal, from its entry order until it is flat and
+		// the chart's trade has ended. It follows its own copy of the chart's trade, walked through
+		// the same prices by the same rules, so a recalculation of the chart never changes it.
+		private class ExecPosition
+		{
+			public string SignalId;
+			public SignalTrade Trade;
+			public bool Paper;
+			public bool IsLong;
+			public decimal Contracts;
+			public decimal TickValue;        // $ per tick and contract, fixed at the entry
+			public string Account;
+			public decimal Entered;          // contracts filled on the entry
+			public decimal Open;             // contracts held now
+			public decimal AverageEntry;
+			public decimal ExitTicks;        // ticks made on the contracts closed so far, summed over them
+			public decimal StopPrice;        // where the stop sits
+			public bool StopMoved;           // to break-even (tried once)
+			public bool Exiting;             // closing at market once the bracket is out of the way
+			public bool ExitFailed;
+			public bool ChartEnded;          // the chart's trade ended (logged once)
+			public DateTime FlatSince;       // live: since when the account shows no position (MinValue: it shows one)
+			public DateTime UnprotectedSince;// live: since when the position has no working stop (MinValue: it has one)
+			public bool Done;                // flat and nothing working
+			public ExecOrder Entry;
+			public ExecOrder TakeProfit;
+			public ExecOrder Stop;
+			public ExecOrder Exit;
+			public readonly List<ExecOrder> Orders = new List<ExecOrder>();
+
+			public ExecOrder Find(Order order, string id)
+			{
+				return Orders.FirstOrDefault(o => o.Matches(order, id));
+			}
+		}
+
+		// the result of the day's closed trades, in one mode (paper and live count apart)
+		private class ExecDay
+		{
+			public DateTime Day = DateTime.MinValue;
+			public decimal Pnl;
+			public int Trades;
+			public bool Tripped;             // the daily loss limit was reached (logged once)
+		}
+
+		private enum LiveAction
+		{
+			Place,
+			Modify,
+			Cancel
+		}
+
+		// a live order call, made once the lock is released
+		private readonly struct LiveRequest
+		{
+			public LiveRequest(LiveAction action, Order order, Order newOrder = null)
+			{
+				Action = action;
+				Order = order;
+				NewOrder = newOrder;
+			}
+
+			public LiveAction Action { get; }
+			public Order Order { get; }
+			public Order NewOrder { get; }
 		}
 
 		#endregion
@@ -1101,6 +1210,60 @@ namespace ATAS.Indicators.Technical
 		private bool _oddsByVolatility;
 		private bool _oddsByTrend;
 		private bool _oddsByConfirmations = true;
+
+		// Execution. None of it is reset by a recalculation: redrawing the chart never forgets an
+		// open position or its orders.
+
+		// the columns of the execution log, in file order
+		private static readonly string[] ExecutionLogColumns =
+		{
+			"logged_utc", "bar_time_ny", "trading_day", "mode", "account", "instrument", "event", "signal", "signal_bar", "side",
+			"setup", "trigger", "patterns", "confirmations", "trend", "delta", "order_flow", "pattern", "odds_tp", "odds_be",
+			"odds_sl", "ev_ticks", "order", "type", "qty", "price", "entry", "take_profit", "stop_loss", "be_trigger", "be_stop",
+			"position", "pnl_ticks", "pnl_usd", "day_pnl_usd", "chart_outcome", "chart_ticks", "note"
+		};
+
+		// live: how long the account may show no position while the executor holds one before the
+		// position counts as closed outside the indicator (fills can arrive after the position update)
+		private static readonly TimeSpan AccountFlatGrace = TimeSpan.FromSeconds(3);
+
+		private readonly List<SignalTrade> _execCandidates = new List<SignalTrade>();   // real-time signals of the bar that just closed
+		private readonly List<ExecOrder> _paperBook = new List<ExecOrder>();            // paper orders resting in the simulator
+		private readonly HashSet<string> _execFillIds = new HashSet<string>();          // live fills already counted
+		private readonly ExecDay _paperDay = new ExecDay();
+		private readonly ExecDay _liveDay = new ExecDay();
+		private ExecPosition _execPosition;
+		private List<PendingAlert> _execAlerts;         // raised, and live orders sent, once the lock is released
+		private List<LiveRequest> _execRequests;
+		private bool _execHalted;
+		private string _execHaltReason;
+		private bool _execConfigDirty = true;           // the settings may have changed since the last MODE row
+		private string _execConfig = string.Empty;
+		private string _execLastEvent;                  // for the panel
+		private Color _execLastEventColor;
+		private string _execLogError;
+		private DateTime _execNow;                      // time of the latest price the executor saw (UTC)
+		private decimal _execPrice;                     // and that price
+		private int _paperOrderCount;
+
+		// what the executor last saw of the bars, so each update walks only what is new
+		private int _execBar = -1;
+		private DateTime _execBarTime;
+		private decimal _execHigh;
+		private decimal _execLow;
+		private decimal _execClose;
+
+		private bool _executeSignals;
+		private bool _paperTrading = true;
+		private string _liveAccount = string.Empty;
+		private int _contracts = 1;
+		private decimal _dailyLossLimit;
+		private bool _skipTradesBeyondLimit = true;
+		private decimal _tickValue = 5m;
+		private decimal _commissionPerContract = 5m;
+		private int _slippageTicks = 1;
+		private bool _alertOnOrders = true;
+		private string _executionLogFolder = string.Empty;
 
 		#endregion
 
@@ -1931,6 +2094,114 @@ namespace ATAS.Indicators.Technical
 		[Display(Name = "Alert sound file", GroupName = "Alerts", Order = 402)]
 		public string AlertFile { get; set; } = "alert1";
 
+		// Execution settings change what the executor does from now on; they don't redraw history
+		[Display(Name = "Execute signals", GroupName = "Execution", Order = 500,
+			Description = "Send orders for the BUY / SHORT signals the chart shows, in real time only. Off by default. With Paper trading on, nothing leaves the indicator. Switching it off stops new entries (an open position is still managed) and clears a halt.")]
+		public bool ExecuteSignals
+		{
+			get => _executeSignals;
+			set
+			{
+				lock (_sync)
+				{
+					if (!value)
+					{
+						_execHalted = false;
+						_execHaltReason = null;
+					}
+
+					_executeSignals = value;
+					_execConfigDirty = true;
+				}
+
+				RedrawChart();
+			}
+		}
+
+		[Display(Name = "Paper trading (simulated fills)", GroupName = "Execution", Order = 501,
+			Description = "On (the default): a simulator inside the indicator fills the orders. Off: real orders through ATAS, only to the Live account and only with a daily loss limit. A position keeps the mode it was opened in.")]
+		public bool PaperTrading
+		{
+			get => _paperTrading;
+			set { _paperTrading = value; _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "Live account (must match the chart's)", GroupName = "Execution", Order = 502,
+			Description = "With Paper trading off, orders only go out while this is the account selected on the chart. Empty: no live orders.")]
+		public string LiveAccount
+		{
+			get => _liveAccount;
+			set { _liveAccount = value?.Trim() ?? string.Empty; _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "Contracts per trade", GroupName = "Execution", Order = 503)]
+		[Range(1, 1000)]
+		public int Contracts
+		{
+			get => _contracts;
+			set { _contracts = Math.Min(1000, Math.Max(1, value)); _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "Daily loss limit ($, 0 = off)", GroupName = "Execution", Order = 504,
+			Description = "Once the day's closed trades have lost this much, commission included, no new entries until the next trading day (18:00 New York). Paper and live count apart. Live trading needs one.")]
+		[Range(0.0, 100000000.0)]
+		public decimal DailyLossLimit
+		{
+			get => _dailyLossLimit;
+			set { _dailyLossLimit = Math.Max(0, value); _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "Skip trades that could breach the limit", GroupName = "Execution", Order = 505,
+			Description = "With a daily loss limit: also skip a signal whose stop, with slippage and commission, could take the day past the limit.")]
+		public bool SkipTradesBeyondLimit
+		{
+			get => _skipTradesBeyondLimit;
+			set { _skipTradesBeyondLimit = value; _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 506,
+			Description = "5 for NQ, 0.5 for MNQ. When the trading connection reports a different one, the larger is used, so a wrong setting can only make the loss limit stricter.")]
+		[Range(0.0, 100000.0)]
+		public decimal TickValue
+		{
+			get => _tickValue;
+			set { _tickValue = Math.Max(0, value); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Commission ($ per contract, round trip)", GroupName = "Execution", Order = 507,
+			Description = "Taken off every closed trade, for the daily loss limit and the log. 5.00 is the backtest's one tick on NQ; set what your broker charges.")]
+		[Range(0.0, 100000.0)]
+		public decimal CommissionPerContract
+		{
+			get => _commissionPerContract;
+			set { _commissionPerContract = Math.Max(0, value); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Slippage (ticks per market / stop fill)", GroupName = "Execution", Order = 508,
+			Description = "Paper market and stop orders fill this many ticks worse than the price that reached them. Both modes count it in a new trade's risk.")]
+		[Range(0, 1000)]
+		public int SlippageTicks
+		{
+			get => _slippageTicks;
+			set { _slippageTicks = Math.Max(0, value); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Alert on orders", GroupName = "Execution", Order = 509,
+			Description = "An ATAS alert on each fill and each closed position. A halt, a rejected order and the daily loss limit always alert.")]
+		public bool AlertOnOrders
+		{
+			get => _alertOnOrders;
+			set => _alertOnOrders = value;
+		}
+
+		[Display(Name = "Log folder (empty = ATAS's data folder)", GroupName = "Execution", Order = 510,
+			Description = "Where the CSV log of every signal, order, fill and result goes: one file per trading day, instrument and mode. Empty: ATAS/FvgExecution in the application data folder.")]
+		public string ExecutionLogFolder
+		{
+			get => _executionLogFolder;
+			set => _executionLogFolder = value?.Trim() ?? string.Empty;
+		}
+
 		#endregion
 
 		#region ctor
@@ -1963,12 +2234,16 @@ namespace ATAS.Indicators.Technical
 		protected override void OnRecalculate()
 		{
 			lock (_sync)
+			{
 				ResetState();
+				_execConfigDirty = true;
+			}
 		}
 
 		protected override void OnCalculate(int bar, decimal value)
 		{
 			List<PendingAlert> alerts = null;
+			List<LiveRequest> requests = null;
 
 			lock (_sync)
 			{
@@ -2008,10 +2283,20 @@ namespace ATAS.Indicators.Technical
 					_realtime = true;
 					SettleLeavingOrders();
 				}
+
+				// the executor follows the chart in real time, never through history
+				if (_realtime)
+					SyncExecution(bar);
+
+				requests = TakeExecutionOutput(ref alerts);
 			}
 
 			if (alerts != null)
 				FireAlerts(alerts);
+
+			// live orders only: paper ones never leave the indicator
+			if (requests != null)
+				_ = SendLiveRequests(requests);
 		}
 
 		private void ResetState()
@@ -2102,7 +2387,7 @@ namespace ATAS.Indicators.Technical
 
 			// bar + 1 exists (that's why this bar is closed), so we already know whether
 			// it opens a new session
-			var sessionEnds = ExpireAtSessionEnd && IsNewSession(bar + 1);
+			var sessionEnds = SessionEndsAfter(bar);
 
 			if (sessionEnds)
 				ExpireAllOpenTrades(bar, candle, ref alerts);
@@ -2128,6 +2413,12 @@ namespace ATAS.Indicators.Technical
 			// no new trades on the last bar of a session when trades close at session end
 			if (!sessionEnds)
 				GenerateSignals(bar, candle, bullZone, bearZone, bullFill, bearFill, sweptLows, sweptHighs, keyLow, keyHigh, ref alerts);
+		}
+
+		// Close trades at session end: the closed bar is the session's last (bar + 1 has to exist)
+		private bool SessionEndsAfter(int bar)
+		{
+			return ExpireAtSessionEnd && IsNewSession(bar + 1);
 		}
 
 		private void ClearMarkers(int bar)
@@ -3808,6 +4099,11 @@ namespace ATAS.Indicators.Technical
 			_trades.Add(trade);
 			_openTrades.Add(trade);
 
+			// a real-time signal waits for the executor, which decides once the update is done (a
+			// hidden one only gets a line in its log)
+			if (_realtime && ExecuteSignals)
+				_execCandidates.Add(trade);
+
 			if (trade.IsLong)
 				_lastLongSignalBar = bar;
 			else
@@ -3878,29 +4174,17 @@ namespace ATAS.Indicators.Technical
 				if (bar <= trade.EntryBar)
 					continue;
 
-				var result = SettleStretch(trade, start, newHigh, newLow, candle.Close, SameBarRule, out var ambiguous);
+				var result = Walk(trade, bar, start, newHigh, newLow, candle.Close, out var filled, out var moved, out var ambiguous);
 
-				if (trade.Pending && result.Filled)
+				if (filled && _realtime && AlertOnTradeResult && trade.IsShown)
+					QueueAlert(ref alerts, $"{Side(trade)} limit filled @ {FormatPrice(trade.EntryPrice)}", trade.IsLong ? BuyColor : ShortColor);
+
+				if (moved && _realtime && AlertOnTradeResult && trade.IsShown && result.Outcome == TradeOutcome.Open)
 				{
-					trade.Pending = false;
-					trade.FillBar = bar;
+					var message = $"{Side(trade)} from {FormatPrice(trade.EntryPrice)}: +{trade.TriggerTicks}t reached, "
+						+ $"stop moved to {FormatPrice(trade.BreakEvenPrice)} (+{trade.LockedTicks}t)";
 
-					if (_realtime && AlertOnTradeResult && trade.IsShown)
-						QueueAlert(ref alerts, $"{Side(trade)} limit filled @ {FormatPrice(trade.EntryPrice)}", trade.IsLong ? BuyColor : ShortColor);
-				}
-
-				if (result.BreakEvenActive && !trade.BreakEvenActive)
-				{
-					trade.BreakEvenActive = true;
-					trade.BreakEvenBar = bar;
-
-					if (_realtime && AlertOnTradeResult && trade.IsShown && result.Outcome == TradeOutcome.Open)
-					{
-						var message = $"{Side(trade)} from {FormatPrice(trade.EntryPrice)}: +{trade.TriggerTicks}t reached, "
-							+ $"stop moved to {FormatPrice(trade.BreakEvenPrice)} (+{trade.LockedTicks}t)";
-
-						QueueAlert(ref alerts, message, BreakEvenPen.Color.Convert());
-					}
+					QueueAlert(ref alerts, message, BreakEvenPen.Color.Convert());
 				}
 
 				if (result.Outcome == TradeOutcome.Open)
@@ -3912,30 +4196,53 @@ namespace ATAS.Indicators.Technical
 			}
 		}
 
+		// Moves one trade along a stretch of trading: fills a waiting limit order and moves the stop
+		// as the stretch reaches them. How it ends is left to the caller.
+		private PathResult Walk(SignalTrade trade, int bar, decimal start, decimal? newHigh, decimal? newLow, decimal close,
+			out bool filled, out bool moved, out bool ambiguous)
+		{
+			var result = SettleStretch(trade, start, newHigh, newLow, close, SameBarRule, out ambiguous);
+			filled = trade.Pending && result.Filled;
+			moved = result.BreakEvenActive && !trade.BreakEvenActive;
+
+			if (filled)
+			{
+				trade.Pending = false;
+				trade.FillBar = bar;
+			}
+
+			if (moved)
+			{
+				trade.BreakEvenActive = true;
+				trade.BreakEvenBar = bar;
+			}
+
+			return result;
+		}
+
 		private void ExpireStaleTrades(int bar, IndicatorCandle candle, ref List<PendingAlert> alerts)
 		{
 			for (var i = _openTrades.Count - 1; i >= 0; i--)
 			{
 				var trade = _openTrades[i];
+				var outcome = StaleOutcome(trade, bar);
 
-				// a limit order that waited its bars without a fill is cancelled
-				if (trade.Pending)
-				{
-					if (bar >= trade.ExpiryBar)
-					{
-						CloseTrade(trade, TradeOutcome.Missed, bar, trade.EntryPrice, ref alerts);
-						_openTrades.RemoveAt(i);
-					}
-
-					continue;
-				}
-
-				if (MaxBarsInTrade <= 0 || bar - trade.FillBar < MaxBarsInTrade)
+				if (outcome == TradeOutcome.Open)
 					continue;
 
-				CloseTrade(trade, TradeOutcome.Expired, bar, candle.Close, ref alerts);
+				CloseTrade(trade, outcome, bar, outcome == TradeOutcome.Missed ? trade.EntryPrice : candle.Close, ref alerts);
 				_openTrades.RemoveAt(i);
 			}
+		}
+
+		// Whether a trade runs out of time on a closed bar: a limit order that waited its bars
+		// without a fill is cancelled (Missed), a trade Max bars in trade old expires. Open: neither.
+		private TradeOutcome StaleOutcome(SignalTrade trade, int bar)
+		{
+			if (trade.Pending)
+				return bar >= trade.ExpiryBar ? TradeOutcome.Missed : TradeOutcome.Open;
+
+			return MaxBarsInTrade > 0 && bar - trade.FillBar >= MaxBarsInTrade ? TradeOutcome.Expired : TradeOutcome.Open;
 		}
 
 		private void ExpireAllOpenTrades(int bar, IndicatorCandle candle, ref List<PendingAlert> alerts)
@@ -3953,10 +4260,7 @@ namespace ATAS.Indicators.Technical
 
 		private void CloseTrade(SignalTrade trade, TradeOutcome outcome, int bar, decimal exitPrice, ref List<PendingAlert> alerts)
 		{
-			trade.Outcome = outcome;
-			trade.ExitBar = bar;
-			trade.ExitPrice = exitPrice;
-			trade.Pending = false;
+			EndTrade(trade, outcome, bar, exitPrice);
 
 			// a limit order that never filled is no trade: nothing made, nothing to learn
 			if (outcome == TradeOutcome.Missed)
@@ -4027,6 +4331,14 @@ namespace ATAS.Indicators.Technical
 				var message = $"{Side(trade)} from {FormatPrice(trade.EntryPrice)}: {ResultText(trade)}";
 				QueueAlert(ref alerts, message, OutcomeColor(outcome));
 			}
+		}
+
+		private static void EndTrade(SignalTrade trade, TradeOutcome outcome, int bar, decimal exitPrice)
+		{
+			trade.Outcome = outcome;
+			trade.ExitBar = bar;
+			trade.ExitPrice = exitPrice;
+			trade.Pending = false;
 		}
 
 		// One stretch of trading for one trade: from `start` through a new high and/or a new
@@ -4192,6 +4504,1533 @@ namespace ATAS.Indicators.Technical
 
 		#endregion
 
+		#region Execution
+
+		// The executor turns the chart's own signals into orders. It decides nothing the chart has not:
+		//   * it takes the real-time signals the chart shows, so the signal hours, One trade at a time
+		//     and the show filters apply to it as they do to the chart;
+		//   * it enters as the signal's trade does: at market for an entry at the close, with a limit
+		//     order at the trade's price for a limit entry, cancelled when the chart's order expires;
+		//   * once filled it rests the trade's own stop and take profit (the stop first), moves the
+		//     stop to the break-even price when the trade reaches its trigger, and closes at market
+		//     whenever the chart's trade ends while the position is still open (a take profit only
+		//     touched, a trade that expired or closed at the session end);
+		//   * it holds one position at a time and only trades in real time, never history.
+		// It follows its own copy of the chart's trade, walked through the same prices by the same
+		// rules (Walk, StaleOutcome, SessionEndsAfter), so recalculating the chart never changes what
+		// happens to a position that is already open.
+		//
+		// Paper trading, the default, runs the same code against a simulator: market and stop orders
+		// fill Slippage ticks worse than the price that reached them, limit orders at their own price
+		// once price trades a tick through them (as the chart's limit entries do). Live orders go
+		// through ATAS's TradingManager only with Paper trading off, the chart's account being the
+		// Live account and a daily loss limit set. The chart's odds and the backtest don't make the
+		// signals profitable - see the README - so paper is where to start.
+
+		// Once per real-time update, after the chart's trades have moved: follow the prices, manage
+		// the position, then decide on the signals of the bar that just closed
+		private void SyncExecution(int bar)
+		{
+			if (!ExecuteSignals && _execPosition == null)
+			{
+				_execCandidates.Clear();
+				_execBar = -1;
+				return;
+			}
+
+			try
+			{
+				var candle = GetCandle(bar);
+				_execNow = candle.LastTime > candle.Time ? candle.LastTime : candle.Time;
+				CurrentDay(PaperTrading);
+
+				if (_execConfigDirty)
+				{
+					_execConfigDirty = false;
+					LogConfiguration();
+				}
+
+				FollowPrices(bar);
+				_execPrice = candle.Close;
+				ManagePosition();
+
+				foreach (var trade in _execCandidates)
+					ConsiderSignal(trade);
+			}
+			catch (Exception ex)
+			{
+				// a fault in the executor halts it, never the chart
+				ExecutionFault(ex);
+			}
+
+			_execCandidates.Clear();
+		}
+
+		// Walks the executor's orders and its copy of the chart's trade through what traded since the
+		// last update, the way AdvanceOpenTrades walks the chart's trades: the rest of the bar it saw
+		// last, then each newer one. Paper orders fill on the way.
+		private void FollowPrices(int bar)
+		{
+			// the chart reloaded its bars under the executor: find the bar it was on
+			if (_execBar >= 0 && (_execBar >= CurrentBar || GetCandle(_execBar).Time != _execBarTime))
+				RelocateExecution();
+
+			var pos = _execPosition;
+			var first = pos == null || _execBar < 0 ? bar : Math.Min(_execBar, bar);
+
+			for (var b = first; b <= bar; b++)
+			{
+				var candle = GetCandle(b);
+				var start = candle.Open;
+				decimal? newHigh = candle.High;
+				decimal? newLow = candle.Low;
+
+				if (b == _execBar)
+				{
+					start = _execClose;
+					newHigh = candle.High > _execHigh ? candle.High : (decimal?)null;
+					newLow = candle.Low < _execLow ? candle.Low : (decimal?)null;
+				}
+
+				_execBar = b;
+				_execBarTime = candle.Time;
+				_execHigh = candle.High;
+				_execLow = candle.Low;
+				_execClose = candle.Close;
+
+				if (pos == null)
+					continue;
+
+				// the chart's side first, so a position closed on the same prices logs how the chart's trade ended
+				FollowTrade(pos.Trade, b, start, newHigh, newLow, candle.Close, b < bar);
+
+				if (pos.Paper && !pos.Done)
+					PaperWalk(pos, start, newHigh, newLow, candle.Close);
+			}
+		}
+
+		// The executor's copy of the chart's trade, moved as the chart moves its own: along the
+		// stretch, then - once its bar has closed - through the same time limits
+		private void FollowTrade(SignalTrade trade, int bar, decimal start, decimal? newHigh, decimal? newLow, decimal close, bool barClosed)
+		{
+			if (trade.Outcome != TradeOutcome.Open || bar <= trade.EntryBar)
+				return;
+
+			var result = Walk(trade, bar, start, newHigh, newLow, close, out _, out _, out var ambiguous);
+
+			if (result.Outcome != TradeOutcome.Open)
+			{
+				trade.AmbiguousExit = ambiguous;
+				EndTrade(trade, result.Outcome, bar, result.ExitPrice);
+				return;
+			}
+
+			if (!barClosed)
+				return;
+
+			var outcome = StaleOutcome(trade, bar);
+
+			if (outcome == TradeOutcome.Open && SessionEndsAfter(bar))
+				outcome = trade.Pending ? TradeOutcome.Missed : TradeOutcome.Expired;
+
+			if (outcome != TradeOutcome.Open)
+				EndTrade(trade, outcome, bar, outcome == TradeOutcome.Missed ? trade.EntryPrice : GetCandle(bar).Close);
+		}
+
+		// The chart reloaded its bars (more history, another time frame): the bar the executor was on
+		// has another number. Found again by its time, the trade copy's bar numbers move with it.
+		private void RelocateExecution()
+		{
+			var found = -1;
+
+			for (var b = CurrentBar - 1; b >= 0 && found < 0; b--)
+			{
+				var time = GetCandle(b).Time;
+
+				if (time == _execBarTime)
+					found = b;
+				else if (time < _execBarTime)
+					break;
+			}
+
+			var pos = _execPosition;
+
+			if (found < 0)
+			{
+				if (pos != null && !pos.Done)
+					Log("WARN", pos, "the chart reloaded its bars and the one the position was on is gone: its bar counts (limit validity, Max bars in trade) may be off");
+
+				_execBar = -1;
+				return;
+			}
+
+			var shift = found - _execBar;
+			_execBar = found;
+
+			if (pos == null || shift == 0)
+				return;
+
+			var trade = pos.Trade;
+			trade.EntryBar += shift;
+
+			if (trade.FillBar >= 0)
+				trade.FillBar += shift;
+
+			if (trade.ExpiryBar >= 0)
+				trade.ExpiryBar += shift;
+
+			if (trade.BreakEvenBar >= 0)
+				trade.BreakEvenBar += shift;
+
+			if (trade.ExitBar >= 0)
+				trade.ExitBar += shift;
+		}
+
+		// What the chart's trade means for the position now
+		private void ManagePosition()
+		{
+			var pos = _execPosition;
+
+			if (pos == null)
+				return;
+
+			var trade = pos.Trade;
+
+			if (trade.Outcome != TradeOutcome.Open && !pos.ChartEnded)
+			{
+				pos.ChartEnded = true;
+				var row = LogRow("CHART", pos, null, pos.Paper);
+				row["chart_outcome"] = OutcomeBadge(trade.Outcome);
+				row["chart_ticks"] = trade.Outcome == TradeOutcome.Missed ? string.Empty : Number(ResultTicks(trade));
+				row["note"] = ResultText(trade);
+				WriteLog(row, pos.Paper);
+			}
+
+			if (!pos.Done)
+			{
+				if (!pos.Paper)
+				{
+					CheckAccount(pos);
+					CheckProtection(pos);
+				}
+
+				if (trade.Outcome != TradeOutcome.Open)
+				{
+					// the chart's trade is over, or its limit order expired: so is the position
+					CancelExecOrder(pos, pos.Entry, trade.Outcome == TradeOutcome.Missed ? "the chart's limit order expired unfilled" : "the chart's trade ended");
+
+					if (pos.Open > 0)
+						BeginExit(pos, $"the chart's trade ended ({OutcomeBadge(trade.Outcome)})");
+				}
+				else if (pos.Open == 0 && !ExecuteSignals)
+					CancelExecOrder(pos, pos.Entry, "Execute signals was switched off");
+				else if (pos.Open > 0 && trade.BreakEvenActive && !pos.StopMoved && !pos.Exiting)
+					MoveStopToBreakEven(pos);
+
+				ContinueExit(pos);
+				CheckDone(pos);
+			}
+
+			if (pos.Done && pos.ChartEnded)
+				_execPosition = null;
+		}
+
+		// A real-time signal: taken, or skipped with the reason in the log
+		private void ConsiderSignal(SignalTrade trade)
+		{
+			var paper = PaperTrading;
+			var reason = EntryBlocker(trade, paper);
+
+			if (reason != null)
+			{
+				var row = LogRow("SKIPPED", null, trade, paper);
+				row["note"] = reason;
+				WriteLog(row, paper);
+				Notify($"{Side(trade)} {SetupName(trade)} skipped: {reason}", DimTextColor, false, false);
+				return;
+			}
+
+			RetireExecPosition();
+
+			var pos = new ExecPosition
+			{
+				SignalId = SignalId(trade),
+				Trade = trade.Clone(),
+				Paper = paper,
+				IsLong = trade.IsLong,
+				Contracts = Contracts,
+				TickValue = EffectiveTickValue(),
+				Account = paper ? "paper" : TradingManager.Portfolio.AccountID,
+				StopPrice = trade.StopLossPrice,
+				FlatSince = DateTime.MinValue,
+				UnprotectedSince = DateTime.MinValue
+			};
+
+			_execPosition = pos;
+			Log("SIGNAL", pos, trade.LimitEntry ? "taken: limit entry" : "taken: market entry");
+			Notify($"{ModeName(pos)} {Side(trade)} {SetupText(trade)}: {(trade.LimitEntry ? "limit" : "market")} order sent", pos.IsLong ? BuyColor : ShortColor,
+				false, false);
+
+			var type = trade.LimitEntry ? OrderTypes.Limit : OrderTypes.Market;
+			pos.Entry = NewOrder(pos, OrderRole.Entry, pos.IsLong, type, pos.Contracts, trade.EntryPrice, null);
+			Place(pos, pos.Entry);
+		}
+
+		// Why a real-time signal is not taken (null: it is)
+		private string EntryBlocker(SignalTrade trade, bool paper)
+		{
+			if (!trade.IsShown)
+				return "hidden on the chart (One trade at a time, Min TP probability or Min expected ticks)";
+
+			if (_execHalted)
+				return $"execution is halted: {_execHaltReason}";
+
+			if (_execPosition != null && !_execPosition.Done)
+				return "a position is already open (execution holds one at a time)";
+
+			if (trade.Outcome != TradeOutcome.Open)
+				return "the chart's trade ended before an order could go in";
+
+			if (!paper)
+			{
+				var notArmed = LiveBlocker();
+
+				if (notArmed != null)
+					return $"live trading is not armed: {notArmed}";
+
+				var account = TradingManager.Position;
+
+				if (account != null && account.Volume != 0)
+					return $"the account already holds a position ({Qty(account.Volume)}) in this instrument";
+			}
+
+			var tickValue = EffectiveTickValue();
+
+			if (tickValue <= 0)
+				return "no tick value: set Tick value";
+
+			var day = CurrentDay(paper);
+
+			if (DailyLossLimit > 0 && day.Pnl <= -DailyLossLimit)
+				return $"the daily loss limit is reached ({Money(day.Pnl)} today, limit {Money(-DailyLossLimit)})";
+
+			var price = _execPrice;
+			var direction = trade.IsLong ? 1 : -1;
+
+			if ((price - trade.StopLossPrice) * direction <= 0 || (trade.TakeProfitPrice - price) * direction <= 0)
+				return $"price ({FormatPrice(price)}) is already beyond the stop or the target";
+
+			if (DailyLossLimit > 0 && SkipTradesBeyondLimit)
+			{
+				var worst = WorstLoss(trade, price, tickValue);
+				var room = DailyLossLimit + day.Pnl;
+
+				if (worst > room)
+					return $"its stop could lose {Money(worst)}, more than the {Money(room)} left before the daily loss limit";
+			}
+
+			return null;
+		}
+
+		// Why live orders can't go out now (null: armed)
+		private string LiveBlocker()
+		{
+			var manager = TradingManager;
+
+			if (manager == null)
+				return "the chart has no trading connection";
+
+			var portfolio = manager.Portfolio;
+			var security = manager.Security;
+
+			if (portfolio == null || security == null)
+				return "no account or instrument is selected on the chart";
+
+			if (LiveAccount.Length == 0)
+				return "Live account is empty";
+
+			if (!string.Equals(portfolio.AccountID?.Trim(), LiveAccount, StringComparison.OrdinalIgnoreCase))
+				return $"the chart's account ({portfolio.AccountID}) is not the Live account ({LiveAccount})";
+
+			if (DailyLossLimit <= 0)
+				return "live trading needs a daily loss limit";
+
+			if (security.TickSize > 0 && security.TickSize != TickSize)
+				return $"the instrument's tick size ({security.TickSize.ToString(CultureInfo.InvariantCulture)}) is not the chart's";
+
+			return null;
+		}
+
+		// what the trade loses if its stop is hit: from where it enters, with the slippage of a market
+		// entry and of the stop, and the commission
+		private decimal WorstLoss(SignalTrade trade, decimal price, decimal tickValue)
+		{
+			var direction = trade.IsLong ? 1 : -1;
+			var entry = !trade.LimitEntry ? price : trade.IsLong ? Math.Min(price, trade.EntryPrice) : Math.Max(price, trade.EntryPrice);
+			var ticks = (entry - trade.StopLossPrice) * direction / TickSize + (trade.LimitEntry ? 1 : 2) * SlippageTicks;
+			return (ticks * tickValue + CommissionPerContract) * Contracts;
+		}
+
+		// $ per tick and contract: the setting, or what the trading connection says when that is more,
+		// so a wrong setting can only make the loss limit stricter
+		private decimal EffectiveTickValue()
+		{
+			return Math.Max(TickValue, TradingManager?.Security?.TickCost ?? 0m);
+		}
+
+		// a new position takes over from the last one, whose chart trade may still be running
+		private void RetireExecPosition()
+		{
+			var old = _execPosition;
+
+			if (old != null && !old.ChartEnded)
+				Log("CHART", old, "no longer followed: a new position started before the chart's trade ended");
+
+			_execPosition = null;
+			_execFillIds.Clear();
+		}
+
+		private ExecOrder NewOrder(ExecPosition pos, OrderRole role, bool isBuy, OrderTypes type, decimal quantity, decimal price, string ocoGroup)
+		{
+			var order = new Order
+			{
+				Direction = isBuy ? OrderDirections.Buy : OrderDirections.Sell,
+				Type = type,
+				QuantityToFill = quantity,
+				Comment = $"FVG {pos.SignalId} {RoleName(role)}"
+			};
+
+			if (type == OrderTypes.Limit)
+				order.Price = price;
+			else if (type == OrderTypes.Stop)
+				order.TriggerPrice = price;
+
+			if (ocoGroup != null)
+				order.OCOGroup = ocoGroup;
+
+			if (!pos.Paper)
+			{
+				order.Portfolio = TradingManager?.Portfolio;
+				order.Security = TradingManager?.Security;
+			}
+
+			var exec = new ExecOrder { Order = order, Role = role, IsBuy = isBuy, Quantity = quantity };
+			pos.Orders.Add(exec);
+			return exec;
+		}
+
+		// sends an order: to the simulator for a paper position, to ATAS (once the lock is released)
+		// for a live one
+		private void Place(ExecPosition pos, ExecOrder order)
+		{
+			LogOrder("ORDER", pos, order, order.Quantity, OrderPrice(order.Order));
+
+			if (pos.Paper)
+				PaperPlace(pos, order);
+			else
+				Request(new LiveRequest(LiveAction.Place, order.Order));
+		}
+
+		private void CancelExecOrder(ExecPosition pos, ExecOrder order, string reason)
+		{
+			if (order == null || !order.Working || order.CancelSent)
+				return;
+
+			order.CancelSent = true;
+			LogOrder("CANCEL", pos, order, order.Quantity - order.Filled, OrderPrice(order.Order), reason);
+
+			if (!pos.Paper)
+			{
+				Request(new LiveRequest(LiveAction.Cancel, order.Order));
+				return;
+			}
+
+			_paperBook.Remove(order);
+			order.Order.State = OrderStates.Done;
+			order.Working = false;
+			LogOrder("CANCELLED", pos, order, order.Quantity - order.Filled, OrderPrice(order.Order));
+		}
+
+		// moves an order's price or resizes it; a live order is replaced by an updated copy
+		private void ModifyExecOrder(ExecPosition pos, ExecOrder order, decimal price, decimal quantity, string reason)
+		{
+			var old = order.Order;
+			var updated = pos.Paper ? old : old.Clone();
+
+			if (updated.Type == OrderTypes.Stop)
+				updated.TriggerPrice = price;
+			else if (updated.Type == OrderTypes.Limit)
+				updated.Price = price;
+
+			updated.QuantityToFill = quantity;
+			order.Quantity = quantity;
+
+			if (pos.Paper)
+				updated.Unfilled = quantity - order.Filled;
+			else
+			{
+				order.Replaced.Add(old);
+				order.Order = updated;
+				Request(new LiveRequest(LiveAction.Modify, old, updated));
+			}
+
+			LogOrder("MODIFY", pos, order, quantity, price, reason);
+		}
+
+		// A fill of one of the executor's orders, paper or live
+		private void ApplyFill(ExecPosition pos, ExecOrder order, decimal price, decimal quantity)
+		{
+			var filled = Math.Min(quantity, order.Quantity - order.Filled);
+
+			if (filled <= 0)
+			{
+				LogOrder("WARN", pos, order, quantity, price, "a fill beyond the order's size was ignored");
+				return;
+			}
+
+			order.Filled += filled;
+
+			if (order.Filled >= order.Quantity)
+			{
+				order.Working = false;
+				order.FillPending = false;
+			}
+
+			if (order.Role == OrderRole.Entry)
+			{
+				pos.AverageEntry = (pos.AverageEntry * pos.Entered + price * filled) / (pos.Entered + filled);
+				pos.Entered += filled;
+				pos.Open += filled;
+				LogOrder("FILL", pos, order, filled, price);
+				Notify($"{ModeName(pos)} {Side(pos.Trade)} {Qty(filled)} filled @ {FormatPrice(price)}", pos.IsLong ? BuyColor : ShortColor);
+				Protect(pos);
+				return;
+			}
+
+			var closing = Math.Min(filled, pos.Open);
+			pos.ExitTicks += (price - pos.AverageEntry) / TickSize * (pos.IsLong ? 1 : -1) * closing;
+			pos.Open -= closing;
+			LogOrder("FILL", pos, order, filled, price);
+
+			if (closing < filled)
+				Halt(pos, $"the {RoleName(order.Role)} order filled {Qty(filled - closing)} more than the position held: the account may hold that much the other way, check it in ATAS");
+
+			if (pos.Open > 0)
+				ResizeBracket(pos);
+			else
+			{
+				// flat: nothing that could open a new position may stay behind
+				foreach (var other in pos.Orders)
+					CancelExecOrder(pos, other, "the position is flat");
+			}
+
+			ContinueExit(pos);
+			CheckDone(pos);
+		}
+
+		// After an entry fill: the chart trade's own stop and take profit for what is held (the stop
+		// first), or resized when more of the entry fills
+		private void Protect(ExecPosition pos)
+		{
+			var trade = pos.Trade;
+
+			if (pos.Exiting || trade.Outcome != TradeOutcome.Open)
+			{
+				BeginExit(pos, "the chart's trade ended before the entry filled");
+				ContinueExit(pos);
+				return;
+			}
+
+			var stop = pos.StopMoved ? trade.BreakEvenPrice : trade.StopLossPrice;
+
+			// price has reached the stop by the time the entry filled: no stop order could rest there
+			if (pos.IsLong ? _execPrice <= stop : _execPrice >= stop)
+			{
+				BeginExit(pos, "price was through the stop when the entry filled");
+				return;
+			}
+
+			pos.StopPrice = stop;
+
+			if (pos.Stop != null)
+			{
+				ResizeBracket(pos);
+				return;
+			}
+
+			var group = $"FVG {pos.SignalId}";
+			pos.Stop = NewOrder(pos, OrderRole.StopLoss, !pos.IsLong, OrderTypes.Stop, pos.Open, stop, group);
+			pos.TakeProfit = NewOrder(pos, OrderRole.TakeProfit, !pos.IsLong, OrderTypes.Limit, pos.Open, trade.TakeProfitPrice, group);
+			Place(pos, pos.Stop);
+			Place(pos, pos.TakeProfit);
+		}
+
+		// the stop and the take profit always cover what is held
+		private void ResizeBracket(ExecPosition pos)
+		{
+			foreach (var order in new[] { pos.Stop, pos.TakeProfit })
+			{
+				if (order == null || !order.Working || order.CancelSent)
+					continue;
+
+				var size = order.Filled + pos.Open;
+
+				if (size != order.Quantity)
+					ModifyExecOrder(pos, order, OrderPrice(order.Order), size, "resized to the position");
+			}
+		}
+
+		// The chart's trade reached its break-even trigger: the stop moves to its break-even price
+		private void MoveStopToBreakEven(ExecPosition pos)
+		{
+			var trade = pos.Trade;
+			var price = trade.BreakEvenPrice;
+			pos.StopMoved = true;
+
+			if (pos.IsLong ? _execPrice <= price : _execPrice >= price)
+			{
+				BeginExit(pos, "price was back through the break-even price before the stop could move");
+				return;
+			}
+
+			pos.StopPrice = price;
+
+			if (pos.Stop != null && pos.Stop.Working && !pos.Stop.CancelSent)
+				ModifyExecOrder(pos, pos.Stop, price, pos.Stop.Quantity, $"break-even: +{trade.TriggerTicks}t reached, the stop moves to +{trade.LockedTicks}t");
+		}
+
+		// Closes the position at market: cancels the stop and the take profit first, and sends the
+		// closing order once neither can fill any more (a leg that fills meanwhile closes it anyway)
+		private void BeginExit(ExecPosition pos, string reason)
+		{
+			if (pos.Exiting || pos.Done)
+				return;
+
+			pos.Exiting = true;
+			Log("EXIT", pos, reason);
+			CancelExecOrder(pos, pos.Entry, reason);
+			CancelExecOrder(pos, pos.TakeProfit, reason);
+			CancelExecOrder(pos, pos.Stop, reason);
+			ContinueExit(pos);
+		}
+
+		private void ContinueExit(ExecPosition pos)
+		{
+			if (!pos.Exiting || pos.Done || pos.Open <= 0 || pos.ExitFailed)
+				return;
+
+			// the closing order goes once nothing else can fill
+			if (pos.Orders.Any(o => o.Working || o.FillPending))
+				return;
+
+			pos.Exit = NewOrder(pos, OrderRole.Exit, !pos.IsLong, OrderTypes.Market, pos.Open, 0, null);
+			Place(pos, pos.Exit);
+		}
+
+		// Flat with nothing working: the position is over and counts toward the day
+		private void CheckDone(ExecPosition pos)
+		{
+			if (pos.Done || pos.Open > 0 || pos.Orders.Any(o => o.Working || o.FillPending))
+				return;
+
+			pos.Done = true;
+
+			if (pos.Entered == 0)
+			{
+				Log("NOFILL", pos, "the entry was not filled: no trade");
+				Notify($"{ModeName(pos)} {Side(pos.Trade)}: the entry was not filled", NeutralColor, false, false);
+				return;
+			}
+
+			var ticks = pos.ExitTicks / pos.Entered;
+			var dollars = pos.ExitTicks * pos.TickValue - CommissionPerContract * pos.Entered;
+			var day = CurrentDay(pos.Paper);
+			day.Pnl += dollars;
+			day.Trades++;
+
+			var row = LogRow("CLOSED", pos, null, pos.Paper);
+			row["pnl_ticks"] = Number(ticks);
+			row["pnl_usd"] = Cents(dollars);
+			row["day_pnl_usd"] = Cents(day.Pnl);
+			row["chart_outcome"] = OutcomeBadge(pos.Trade.Outcome);
+			row["chart_ticks"] = pos.Trade.Outcome == TradeOutcome.Open || pos.Trade.Outcome == TradeOutcome.Missed ? string.Empty : Number(ResultTicks(pos.Trade));
+			row["note"] = $"{Qty(pos.Entered)} contract{(pos.Entered == 1 ? string.Empty : "s")}, average entry {Number(pos.AverageEntry)}, tick value {Cents(pos.TickValue)}, commission {Cents(CommissionPerContract)} each";
+			WriteLog(row, pos.Paper);
+
+			var color = dollars > 0 ? BullColor : dollars < 0 ? BearColor : NeutralColor;
+			Notify($"{ModeName(pos)} {Side(pos.Trade)} closed {ticks.ToString("+0.#;-0.#;0", CultureInfo.InvariantCulture)}t, {Money(dollars)} · today {Money(day.Pnl)}", color);
+
+			if (DailyLossLimit > 0 && day.Pnl <= -DailyLossLimit && !day.Tripped)
+			{
+				day.Tripped = true;
+				Log("BREAKER", pos, $"daily loss limit reached: {Money(day.Pnl)} today, limit {Money(-DailyLossLimit)}; no new entries until the next trading day");
+				Notify($"Daily loss limit reached ({Money(day.Pnl)} today): no new {(pos.Paper ? "paper" : "live")} entries until the next trading day", BearColor, true);
+			}
+		}
+
+		// Live: the account has to hold what the executor holds. When it shows no position for a few
+		// seconds while the executor holds one, and none of the executor's own exits is filling, the
+		// position was closed outside the indicator: its orders are cancelled and execution halts.
+		private void CheckAccount(ExecPosition pos)
+		{
+			var account = TradingManager?.Position;
+
+			bool Filling(ExecOrder o)
+			{
+				return o.FillPending || new[] { o.Order }.Concat(o.Replaced).Any(v => v.Status() == OrderStatus.Filled || v.Status() == OrderStatus.PartlyFilled);
+			}
+
+			if (pos.Open <= 0 || account == null || account.Volume != 0 || pos.Orders.Any(o => o.Role != OrderRole.Entry && Filling(o)))
+			{
+				pos.FlatSince = DateTime.MinValue;
+				return;
+			}
+
+			if (pos.FlatSince == DateTime.MinValue)
+			{
+				pos.FlatSince = _execNow;
+				return;
+			}
+
+			if (_execNow - pos.FlatSince < AccountFlatGrace)
+				return;
+
+			// the fill that closed it was not the executor's: its result is estimated at the last price
+			pos.ExitTicks += (_execPrice - pos.AverageEntry) / TickSize * (pos.IsLong ? 1 : -1) * pos.Open;
+			pos.Open = 0;
+			Halt(pos, "the account shows no position while the indicator held one: it was closed outside the indicator (result estimated at the last price). Check the account, then switch Execute signals off and on");
+
+			foreach (var order in pos.Orders)
+				CancelExecOrder(pos, order, "the position was closed outside the indicator");
+		}
+
+		// Live: an open position always has its stop working. One whose stop went away without the
+		// executor asking (cancelled by hand, expired at the broker) is closed at market and execution
+		// halts - after a few seconds, which leaves time for a take profit that filled as its OCO
+		// partner was cancelled to report its fill.
+		private void CheckProtection(ExecPosition pos)
+		{
+			if (pos.Open <= 0 || pos.Exiting || pos.Stop == null || pos.Stop.Working || pos.Stop.FillPending)
+			{
+				pos.UnprotectedSince = DateTime.MinValue;
+				return;
+			}
+
+			if (pos.UnprotectedSince == DateTime.MinValue)
+			{
+				pos.UnprotectedSince = _execNow;
+				return;
+			}
+
+			if (_execNow - pos.UnprotectedSince < AccountFlatGrace)
+				return;
+
+			Halt(pos, "the position's stop was cancelled outside the indicator: the unprotected position is closed at market");
+			BeginExit(pos, "unprotected: the stop was cancelled outside the indicator");
+		}
+
+		// stops new entries until Execute signals is switched off and on again
+		private void Halt(ExecPosition pos, string reason)
+		{
+			if (!_execHalted)
+			{
+				_execHalted = true;
+				_execHaltReason = reason;
+			}
+
+			Log("HALT", pos, reason);
+			Notify($"Execution halted: {reason}", BearColor, true);
+		}
+
+		private void ExecutionFault(Exception ex)
+		{
+			try
+			{
+				Halt(_execPosition, $"internal error: {ex.Message}");
+			}
+			catch (Exception)
+			{
+				// nothing more can be done here, and the chart must keep working
+				_execHalted = true;
+				_execHaltReason = ex.Message;
+			}
+		}
+
+		// ---- paper orders: the simulator ----
+
+		private void PaperPlace(ExecPosition pos, ExecOrder order)
+		{
+			var o = order.Order;
+			o.Id = $"PAPER-{++_paperOrderCount}";
+			o.State = OrderStates.Active;
+			o.Unfilled = order.Quantity;
+
+			// a limit order through the market fills at once, at the market's better price
+			decimal? fill;
+
+			if (o.Type == OrderTypes.Limit)
+				fill = (order.IsBuy ? _execPrice < o.Price : _execPrice > o.Price) ? _execPrice : (decimal?)null;
+			else
+				fill = PaperFillPrice(order, _execPrice);
+
+			if (fill.HasValue)
+				PaperFill(pos, order, fill.Value);
+			else
+				_paperBook.Add(order);
+		}
+
+		// Paper fills along one stretch of trading. When one update carries both a new high and a
+		// new low, the side of the position's stop comes first.
+		private void PaperWalk(ExecPosition pos, decimal start, decimal? newHigh, decimal? newLow, decimal close)
+		{
+			var path = new List<decimal>(4) { start };
+
+			if (newHigh.HasValue && newLow.HasValue)
+			{
+				path.Add(pos.IsLong ? newLow.Value : newHigh.Value);
+				path.Add(pos.IsLong ? newHigh.Value : newLow.Value);
+			}
+			else if (newHigh.HasValue || newLow.HasValue)
+				path.Add(newHigh ?? newLow.Value);
+
+			path.Add(close);
+
+			foreach (var price in path)
+			{
+				_execPrice = price;
+
+				// orders placed on the way wait for the next price
+				foreach (var order in _paperBook.ToList())
+				{
+					if (!_paperBook.Contains(order))
+						continue;
+
+					var fill = PaperFillPrice(order, price);
+
+					if (fill.HasValue)
+						PaperFill(pos, order, fill.Value);
+				}
+			}
+		}
+
+		// where a paper order fills at this price, if it does
+		private decimal? PaperFillPrice(ExecOrder order, decimal price)
+		{
+			var o = order.Order;
+			var slippage = SlippageTicks * TickSize;
+
+			switch (o.Type)
+			{
+				case OrderTypes.Limit:
+					// at its own price, once price trades a tick through it
+					if (order.IsBuy ? price <= o.Price - TickSize : price >= o.Price + TickSize)
+						return o.Price;
+
+					return null;
+
+				case OrderTypes.Stop:
+					// once price reaches it, Slippage ticks worse than the price that did
+					if (order.IsBuy ? price < o.TriggerPrice : price > o.TriggerPrice)
+						return null;
+
+					return order.IsBuy ? Math.Max(price, o.TriggerPrice) + slippage : Math.Min(price, o.TriggerPrice) - slippage;
+
+				default:
+					return order.IsBuy ? price + slippage : price - slippage;
+			}
+		}
+
+		private void PaperFill(ExecPosition pos, ExecOrder order, decimal price)
+		{
+			_paperBook.Remove(order);
+			order.Order.State = OrderStates.Done;
+			order.Order.Unfilled = 0;
+			ApplyFill(pos, order, price, order.Quantity - order.Filled);
+		}
+
+		// ---- live orders: ATAS's TradingManager ----
+
+		private void Request(LiveRequest request)
+		{
+			if (_execRequests == null)
+				_execRequests = new List<LiveRequest>();
+
+			_execRequests.Add(request);
+		}
+
+		// what an execution step raised: its alerts join the calculation's, its live orders are returned
+		private List<LiveRequest> TakeExecutionOutput(ref List<PendingAlert> alerts)
+		{
+			if (_execAlerts != null)
+			{
+				if (alerts == null)
+					alerts = _execAlerts;
+				else
+					alerts.AddRange(_execAlerts);
+
+				_execAlerts = null;
+			}
+
+			var requests = _execRequests;
+			_execRequests = null;
+			return requests;
+		}
+
+		// Live order calls, made outside the lock and one after the other (the stop before the take
+		// profit), with ATAS's async calls - the synchronous ones are obsolete. ATAS reports back on
+		// its own threads; a call that fails counts as a rejection of its order.
+		private async Task SendLiveRequests(List<LiveRequest> requests)
+		{
+			foreach (var request in requests)
+			{
+				try
+				{
+					var manager = TradingManager ?? throw new InvalidOperationException("the chart has no trading connection");
+
+					switch (request.Action)
+					{
+						case LiveAction.Place:
+							await manager.OpenOrderAsync(request.Order, setDefaultQuantity: false, askConfirmation: false).ConfigureAwait(false);
+							break;
+
+						case LiveAction.Modify:
+							await manager.ModifyOrderAsync(request.Order, request.NewOrder, askConfirmation: false).ConfigureAwait(false);
+							break;
+
+						default:
+							await manager.CancelOrderAsync(request.Order, askConfirmation: false).ConfigureAwait(false);
+							break;
+					}
+				}
+				catch (Exception ex)
+				{
+					var failed = request;
+					ExecutionCallback(() => OrderCallFailed(failed, ex.Message));
+				}
+			}
+		}
+
+		// an execution step on one of ATAS's threads: under the lock, then its alerts and orders
+		private void ExecutionCallback(Action step)
+		{
+			List<PendingAlert> alerts = null;
+			List<LiveRequest> requests;
+
+			lock (_sync)
+			{
+				try
+				{
+					step();
+				}
+				catch (Exception ex)
+				{
+					ExecutionFault(ex);
+				}
+
+				requests = TakeExecutionOutput(ref alerts);
+			}
+
+			if (alerts != null)
+				FireAlerts(alerts);
+
+			if (requests != null)
+				_ = SendLiveRequests(requests);
+		}
+
+		private void OrderCallFailed(LiveRequest request, string message)
+		{
+			var pos = _execPosition;
+			var exec = pos?.Find(request.NewOrder ?? request.Order, null);
+
+			if (exec == null || pos.Paper)
+				return;
+
+			switch (request.Action)
+			{
+				case LiveAction.Place:
+					OrderFailed(pos, exec, message);
+					break;
+
+				case LiveAction.Modify:
+					ModifyFailed(pos, exec, request.Order, message);
+					break;
+
+				default:
+					CancelFailed(pos, exec, message);
+					break;
+			}
+		}
+
+		// ATAS: a new fill on the chart's account and instrument
+		protected override void OnNewMyTrade(MyTrade myTrade)
+		{
+			base.OnNewMyTrade(myTrade);
+			ExecutionCallback(() => LiveFill(myTrade));
+		}
+
+		protected override void OnOrderChanged(Order order)
+		{
+			base.OnOrderChanged(order);
+			ExecutionCallback(() => LiveOrderChanged(order));
+		}
+
+		protected override void OnOrderRegisterFailed(Order order, string message)
+		{
+			base.OnOrderRegisterFailed(order, message);
+
+			ExecutionCallback(() =>
+			{
+				var pos = _execPosition;
+				var exec = order == null || pos == null || pos.Paper ? null : pos.Find(order, order.Id);
+
+				if (exec != null && (exec.Working || exec.FillPending))
+					OrderFailed(pos, exec, message);
+			});
+		}
+
+		protected override void OnOrderModifyFailed(Order order, Order newOrder, string error)
+		{
+			base.OnOrderModifyFailed(order, newOrder, error);
+
+			ExecutionCallback(() =>
+			{
+				var pos = _execPosition;
+				var exec = pos == null || pos.Paper ? null : pos.Find(newOrder, newOrder?.Id) ?? pos.Find(order, order?.Id);
+
+				if (exec != null && order != null)
+					ModifyFailed(pos, exec, order, error);
+			});
+		}
+
+		protected override void OnOrderCancelFailed(Order order, string message)
+		{
+			base.OnOrderCancelFailed(order, message);
+
+			ExecutionCallback(() =>
+			{
+				var pos = _execPosition;
+				var exec = order == null || pos == null || pos.Paper ? null : pos.Find(order, order.Id);
+
+				if (exec != null)
+					CancelFailed(pos, exec, message);
+			});
+		}
+
+		// The indicator is removed (or ATAS closes): a waiting entry must not fill later without its
+		// stop, so it is cancelled; an open live position keeps its stop and take profit
+		protected override void OnDispose()
+		{
+			ExecutionCallback(() =>
+			{
+				var pos = _execPosition;
+
+				if (pos == null || pos.Done)
+					return;
+
+				CancelExecOrder(pos, pos.Entry, "the indicator was removed");
+
+				if (!pos.Paper && pos.Open > 0)
+					Log("WARN", pos, "the indicator was removed with this live position open: its stop and take profit stay with the broker, but nothing moves the stop or closes it any more; manage it in ATAS");
+			});
+
+			base.OnDispose();
+		}
+
+		private void LiveFill(MyTrade myTrade)
+		{
+			var pos = _execPosition;
+			var exec = myTrade == null || pos == null || pos.Paper ? null : pos.Find(myTrade.Order, myTrade.OrderId);
+
+			// not one of the executor's orders (a manual trade, another strategy), or reported twice
+			if (exec == null || (!string.IsNullOrEmpty(myTrade.Id) && !_execFillIds.Add(myTrade.Id)))
+				return;
+
+			ApplyFill(pos, exec, myTrade.Price, Math.Abs(myTrade.Volume));
+		}
+
+		private void LiveOrderChanged(Order order)
+		{
+			var pos = _execPosition;
+			var exec = order == null || pos == null || pos.Paper ? null : pos.Find(order, order.Id);
+
+			// an earlier version of a modified order doesn't speak for it
+			if (exec == null || (!ReferenceEquals(exec.Order, order) && order.Id != exec.Order.Id))
+				return;
+
+			var status = order.Status();
+
+			if (order.State == OrderStates.Failed)
+			{
+				if (exec.Working)
+					OrderFailed(pos, exec, "rejected");
+			}
+			else if (status == OrderStatus.Canceled)
+			{
+				if (exec.Working || exec.FillPending)
+				{
+					exec.Working = false;
+					exec.FillPending = false;
+					LogOrder("CANCELLED", pos, exec, exec.Quantity - exec.Filled, OrderPrice(exec.Order),
+						exec.CancelSent ? null : "not asked for by the indicator (by hand, the OCO partner's fill, or the broker)");
+				}
+			}
+			else if (status == OrderStatus.Filled && exec.Filled < exec.Quantity)
+			{
+				// its fills are on their way
+				exec.Working = false;
+				exec.FillPending = true;
+			}
+
+			ContinueExit(pos);
+			CheckDone(pos);
+		}
+
+		// A live order ATAS or the broker refused
+		private void OrderFailed(ExecPosition pos, ExecOrder exec, string message)
+		{
+			exec.Working = false;
+			exec.FillPending = false;
+			LogOrder("REJECTED", pos, exec, exec.Quantity - exec.Filled, OrderPrice(exec.Order), message);
+
+			switch (exec.Role)
+			{
+				case OrderRole.Entry:
+					Notify($"Live {Side(pos.Trade)} entry rejected: {message}", BearColor, true);
+					break;
+
+				case OrderRole.Exit:
+					pos.ExitFailed = true;
+					Halt(pos, $"the closing order was rejected ({message}): close the position in ATAS");
+					break;
+
+				default:
+					if (pos.Open > 0)
+					{
+						Halt(pos, $"the {RoleName(exec.Role)} order was rejected ({message}): the unprotected position is closed at market");
+						BeginExit(pos, "unprotected: a bracket order was rejected");
+					}
+
+					break;
+			}
+
+			ContinueExit(pos);
+			CheckDone(pos);
+		}
+
+		// the order keeps its old price and size
+		private void ModifyFailed(ExecPosition pos, ExecOrder exec, Order previous, string message)
+		{
+			if (exec.Replaced.Remove(previous))
+				exec.Order = previous;
+
+			exec.Quantity = previous.QuantityToFill;
+
+			if (exec.Role == OrderRole.StopLoss)
+				pos.StopPrice = previous.TriggerPrice;
+
+			LogOrder("REJECTED", pos, exec, exec.Quantity, OrderPrice(previous), $"the change was rejected: {message}");
+			Notify($"The live {RoleName(exec.Role)} order could not be changed ({message}): it stays at {FormatPrice(OrderPrice(previous))}", BearColor, true);
+		}
+
+		// A cancel that didn't go through. Usually the order filled meanwhile (a take profit touched as
+		// the chart's trade ended) and its fill says so; one the broker still shows working is asked
+		// again, twice at most.
+		private void CancelFailed(ExecPosition pos, ExecOrder exec, string message)
+		{
+			LogOrder("WARN", pos, exec, exec.Quantity - exec.Filled, OrderPrice(exec.Order), $"cancel failed: {message}");
+			var status = exec.Order.Status();
+
+			if (!exec.Working || exec.Order.State != OrderStates.Active || (status != OrderStatus.Placed && status != OrderStatus.PartlyFilled))
+				return;
+
+			exec.CancelSent = false;
+
+			if (++exec.CancelAttempts < 3)
+			{
+				CancelExecOrder(pos, exec, "the broker still shows it working: asked again");
+				return;
+			}
+
+			Halt(pos, $"the {RoleName(exec.Role)} order could not be cancelled ({message}): manage the position in ATAS");
+		}
+
+		// ---- the log and the panel ----
+
+		// "20260302-093000-BUY": the signal bar's New York open time and the side, as the chart's
+		// tooltip names the signal
+		private static string SignalId(SignalTrade trade)
+		{
+			return $"{NewYorkTime(trade.EntryTime).ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}-{Side(trade)}";
+		}
+
+		// A MODE row whenever what the executor does changes: on or off, paper or live, the size, the
+		// limits, and the chart settings that shape its trades
+		private void LogConfiguration()
+		{
+			var platform = TradingManager?.Security?.TickCost ?? 0m;
+			var tickValue = platform > 0 && platform != TickValue
+				? $"tick value {Money(TickValue)} (the connection says {Money(platform)}; using {Money(EffectiveTickValue())})"
+				: $"tick value {Money(TickValue)}";
+
+			var config = string.Join(" · ", new[]
+			{
+				!ExecuteSignals ? "execution off (an open position is still managed)" : PaperTrading ? "paper" : $"live, account {LiveAccount}",
+				$"{Contracts} contract{(Contracts == 1 ? string.Empty : "s")}",
+				DailyLossLimit > 0
+					? $"daily loss limit {Money(DailyLossLimit)}{(SkipTradesBeyondLimit ? ", skipping trades that could breach it" : string.Empty)}"
+					: "no daily loss limit",
+				tickValue,
+				$"commission {Money(CommissionPerContract)}",
+				$"slippage {SlippageTicks}t",
+				BracketText(),
+				Entry == EntryRule.LimitPullback ? $"limit entry {PullbackPercent}% back, valid {LimitValidBars} bars" : "entry at the close",
+				$"signals {HoursText()}",
+				OneTradeAtATime ? "one trade at a time" : "overlapping signals on the chart"
+			});
+
+			if (config == _execConfig)
+				return;
+
+			_execConfig = config;
+			Log("MODE", null, config);
+		}
+
+		// The day's result in one mode. A new trading day (18:00 New York) starts from zero, or from
+		// the day's log when the indicator was restarted during it.
+		private ExecDay CurrentDay(bool paper)
+		{
+			var day = paper ? _paperDay : _liveDay;
+
+			if (_execNow.Year < 2)
+				return day;
+
+			var today = TradingDayOf(NewYorkTime(_execNow));
+
+			if (day.Day != today)
+			{
+				day.Day = today;
+				day.Pnl = 0;
+				day.Trades = 0;
+				day.Tripped = false;
+				RestoreDay(day, paper);
+
+				// each day's file starts with the settings
+				if (paper == PaperTrading)
+				{
+					_execConfig = string.Empty;
+					_execConfigDirty = true;
+				}
+			}
+
+			return day;
+		}
+
+		// the closed trades already in the day's log, so a restart can't reset the daily loss limit
+		private void RestoreDay(ExecDay day, bool paper)
+		{
+			try
+			{
+				var path = LogPath(day.Day, paper);
+
+				if (!File.Exists(path))
+					return;
+
+				var lines = File.ReadAllLines(path);
+				var header = lines.Length > 0 ? SplitCsv(lines[0]) : Array.Empty<string>();
+				var eventColumn = Array.IndexOf(header, "event");
+				var dayColumn = Array.IndexOf(header, "day_pnl_usd");
+
+				if (eventColumn < 0 || dayColumn < 0)
+					return;
+
+				foreach (var line in lines.Skip(1))
+				{
+					var cells = SplitCsv(line);
+
+					if (cells.Length > Math.Max(eventColumn, dayColumn) && cells[eventColumn] == "CLOSED"
+						&& decimal.TryParse(cells[dayColumn], NumberStyles.Number, CultureInfo.InvariantCulture, out var pnl))
+					{
+						day.Pnl = pnl;
+						day.Trades++;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				_execLogError = $"Execution log not read: {ex.Message}";
+				return;
+			}
+
+			if (day.Trades == 0)
+				return;
+
+			day.Tripped = DailyLossLimit > 0 && day.Pnl <= -DailyLossLimit;
+			Log("RESTORE", null, $"{day.Trades} closed trade{(day.Trades == 1 ? string.Empty : "s")} today, {Money(day.Pnl)}: read back from this log", paper);
+		}
+
+		// One row of the execution log. Every row names the signal behind it - setup, patterns,
+		// confirmations, the odds on its label - so it can be matched with the chart's scoreboard.
+		private Dictionary<string, string> LogRow(string evt, ExecPosition pos, SignalTrade trade, bool paper)
+		{
+			var newYork = NewYorkTime(_execNow);
+			var row = new Dictionary<string, string>
+			{
+				["logged_utc"] = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture),
+				["bar_time_ny"] = newYork.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+				["trading_day"] = TradingDayOf(newYork).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+				["mode"] = paper ? "paper" : "live",
+				["account"] = pos?.Account ?? (paper ? "paper" : TradingManager?.Portfolio?.AccountID ?? string.Empty),
+				["instrument"] = InstrumentInfo?.Instrument ?? string.Empty,
+				["event"] = evt
+			};
+
+			trade = trade ?? pos?.Trade;
+
+			if (trade != null)
+			{
+				var odds = LabelPercents(trade);
+				row["signal"] = SignalId(trade);
+				row["signal_bar"] = trade.EntryBar.ToString(CultureInfo.InvariantCulture);
+				row["side"] = Side(trade);
+				row["setup"] = SetupName(trade);
+				row["trigger"] = TriggerLabel(trade.Trigger);
+				row["patterns"] = string.Join("; ", PatternNames(trade.CandlePatterns));
+				row["confirmations"] = trade.Confirmations.ToString(CultureInfo.InvariantCulture);
+				row["trend"] = YesNo(trade.WithTrend);
+				row["delta"] = YesNo(trade.DeltaConfirms);
+				row["order_flow"] = YesNo(trade.FillConfirms);
+				row["pattern"] = YesNo(trade.CandlePatterns != CandlePattern.None);
+				row["odds_tp"] = odds[0].ToString(CultureInfo.InvariantCulture);
+				row["odds_be"] = trade.HasBreakEven ? odds[1].ToString(CultureInfo.InvariantCulture) : string.Empty;
+				row["odds_sl"] = odds[odds.Length - 1].ToString(CultureInfo.InvariantCulture);
+				row["ev_ticks"] = LabelExpectedTicks(trade).ToString(CultureInfo.InvariantCulture);
+				row["entry"] = Number(trade.EntryPrice);
+				row["take_profit"] = Number(trade.TakeProfitPrice);
+				row["stop_loss"] = Number(trade.StopLossPrice);
+				row["be_trigger"] = trade.HasBreakEven ? Number(trade.TriggerPrice) : string.Empty;
+				row["be_stop"] = trade.HasBreakEven ? Number(trade.BreakEvenPrice) : string.Empty;
+			}
+
+			if (pos != null)
+				row["position"] = Qty(pos.IsLong ? pos.Open : -pos.Open);
+
+			return row;
+		}
+
+		private void Log(string evt, ExecPosition pos, string note, bool? paper = null)
+		{
+			var mode = paper ?? pos?.Paper ?? PaperTrading;
+			var row = LogRow(evt, pos, null, mode);
+			row["note"] = note;
+			WriteLog(row, mode);
+		}
+
+		private void LogOrder(string evt, ExecPosition pos, ExecOrder order, decimal quantity, decimal price, string note = null)
+		{
+			var row = LogRow(evt, pos, null, pos.Paper);
+			row["order"] = RoleName(order.Role);
+			row["type"] = $"{(order.IsBuy ? "buy" : "sell")} {order.Order.Type.ToString().ToLowerInvariant()}";
+			row["qty"] = Qty(quantity);
+			row["price"] = price > 0 ? Number(price) : string.Empty;
+			row["note"] = note;
+			WriteLog(row, pos.Paper);
+		}
+
+		// appends a row to the day's file (one per trading day, instrument and mode). A log that can't
+		// be written never stops the executor; the panel says so.
+		private void WriteLog(Dictionary<string, string> row, bool paper)
+		{
+			try
+			{
+				var path = LogPath(TradingDayOf(NewYorkTime(_execNow)), paper);
+				Directory.CreateDirectory(Path.GetDirectoryName(path));
+
+				// the header, with a byte-order mark so spreadsheets read the file as UTF-8
+				if (!File.Exists(path))
+					File.WriteAllText(path, string.Join(",", ExecutionLogColumns) + Environment.NewLine, new UTF8Encoding(true));
+
+				var line = string.Join(",", ExecutionLogColumns.Select(c => Csv(row.TryGetValue(c, out var value) ? value : null)));
+				File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
+				_execLogError = null;
+			}
+			catch (Exception ex)
+			{
+				_execLogError = $"Execution log not written: {ex.Message}";
+			}
+		}
+
+		private string LogPath(DateTime day, bool paper)
+		{
+			var folder = ExecutionLogFolder.Length > 0
+				? ExecutionLogFolder
+				: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ATAS", "FvgExecution");
+			var invalid = Path.GetInvalidFileNameChars();
+			var name = string.IsNullOrWhiteSpace(InstrumentInfo?.Instrument) ? "chart" : InstrumentInfo.Instrument;
+			var instrument = new string(name.Select(c => invalid.Contains(c) || c == ' ' ? '_' : c).ToArray());
+			return Path.Combine(folder, $"{day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)}_{instrument}_{(paper ? "paper" : "live")}.csv");
+		}
+
+		// The panel's last line, and an ATAS alert when asked for (errors, halts and the daily loss
+		// limit always)
+		private void Notify(string message, Color color, bool critical = false, bool alert = true)
+		{
+			_execLastEvent = message;
+			_execLastEventColor = color;
+
+			if (!_realtime || !(critical || (alert && AlertOnOrders)))
+				return;
+
+			if (_execAlerts == null)
+				_execAlerts = new List<PendingAlert>();
+
+			_execAlerts.Add(new PendingAlert(message, color));
+		}
+
+		// the panel's lines while execution is on or a position is still managed
+		private List<(string Text, Color Color)> ExecutionPanelLines()
+		{
+			var pos = _execPosition;
+
+			if (!ExecuteSignals && pos == null)
+				return null;
+
+			var paper = PaperTrading;
+			var day = paper ? _paperDay : _liveDay;
+			var today = _execNow.Year > 1 && day.Day == TradingDayOf(NewYorkTime(_execNow)) ? day.Pnl : 0m;
+			var mode = !ExecuteSignals ? "off" : paper ? "PAPER" : "LIVE";
+			var limit = DailyLossLimit > 0 ? $" of {Money(-DailyLossLimit)}" : " (no loss limit)";
+			var head = ($"Execution {mode} · {Contracts} contract{(Contracts == 1 ? string.Empty : "s")} · today {Money(today)}{limit}", DimTextColor);
+
+			if (_execHalted)
+				head = ($"Execution HALTED: {_execHaltReason}", BearColor);
+			else if (ExecuteSignals && DailyLossLimit > 0 && today <= -DailyLossLimit)
+				head = ($"Execution {mode} stopped for today: {Money(today)} reached the {Money(-DailyLossLimit)} limit", BearColor);
+			else if (ExecuteSignals && !paper && LiveBlocker() is string blocked)
+				head = ($"Execution LIVE not armed: {blocked}", BearColor);
+
+			var lines = new List<(string Text, Color Color)> { head };
+
+			if (pos != null && !pos.Done)
+				lines.Add((PositionLine(pos), pos.IsLong ? BuyColor : ShortColor));
+
+			if (_execLastEvent != null)
+				lines.Add(($"Last: {_execLastEvent}", _execLastEventColor));
+
+			if (_execLogError != null)
+				lines.Add((_execLogError, BearColor));
+
+			return lines;
+		}
+
+		// "Paper BUY 1 @ 103.75 · TP 123.50 · stop 108.50 (break-even) · +12t"
+		private string PositionLine(ExecPosition pos)
+		{
+			var name = $"{ModeName(pos)} {Side(pos.Trade)}";
+
+			if (pos.Open == 0)
+			{
+				return pos.Entry.Order.Type == OrderTypes.Limit
+					? $"{name} limit {Qty(pos.Contracts)} @ {FormatPrice(pos.Entry.Order.Price)}: waiting for a fill"
+					: $"{name} {Qty(pos.Contracts)} at market: waiting for the fill";
+			}
+
+			var ticks = (_execPrice - pos.AverageEntry) / TickSize * (pos.IsLong ? 1 : -1);
+			var stop = $"stop {FormatPrice(pos.StopPrice)}{(pos.StopMoved ? " (break-even)" : string.Empty)}";
+
+			return $"{name} {Qty(pos.Open)} @ {FormatPrice(pos.AverageEntry)} · TP {FormatPrice(pos.Trade.TakeProfitPrice)} · {stop} · "
+				+ $"{ticks.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t{(pos.Exiting ? " · closing" : string.Empty)}";
+		}
+
+		private static decimal OrderPrice(Order order)
+		{
+			return order.Type == OrderTypes.Stop ? order.TriggerPrice : order.Type == OrderTypes.Limit ? order.Price : 0;
+		}
+
+		private static string RoleName(OrderRole role)
+		{
+			switch (role)
+			{
+				case OrderRole.TakeProfit:
+					return "take profit";
+
+				case OrderRole.StopLoss:
+					return "stop";
+
+				case OrderRole.Exit:
+					return "exit";
+
+				default:
+					return "entry";
+			}
+		}
+
+		private static string ModeName(ExecPosition pos)
+		{
+			return pos.Paper ? "Paper" : "Live";
+		}
+
+		// -$1,234.50
+		private static string Money(decimal value)
+		{
+			return value.ToString("$#,##0.00;-$#,##0.00", CultureInfo.InvariantCulture);
+		}
+
+		// -1234.50, for the log
+		private static string Cents(decimal value)
+		{
+			return value.ToString("0.00", CultureInfo.InvariantCulture);
+		}
+
+		private static string Number(decimal value)
+		{
+			return value.ToString("0.########", CultureInfo.InvariantCulture);
+		}
+
+		private static string Qty(decimal value)
+		{
+			return value.ToString("0.####", CultureInfo.InvariantCulture);
+		}
+
+		private static string Csv(string value)
+		{
+			if (string.IsNullOrEmpty(value))
+				return string.Empty;
+
+			return value.IndexOfAny(new[] { ',', '"', '\n', '\r' }) < 0 ? value : "\"" + value.Replace("\"", "\"\"") + "\"";
+		}
+
+		private static string[] SplitCsv(string line)
+		{
+			var cells = new List<string>();
+			var cell = new StringBuilder();
+			var quoted = false;
+
+			for (var i = 0; i < line.Length; i++)
+			{
+				var c = line[i];
+
+				if (quoted && c == '"' && i + 1 < line.Length && line[i + 1] == '"')
+				{
+					cell.Append('"');
+					i++;
+				}
+				else if (c == '"')
+					quoted = !quoted;
+				else if (c == ',' && !quoted)
+				{
+					cells.Add(cell.ToString());
+					cell.Clear();
+				}
+				else
+					cell.Append(c);
+			}
+
+			cells.Add(cell.ToString());
+			return cells.ToArray();
+		}
+
+		#endregion
+
 		#region Rendering
 
 		protected override void OnRender(RenderContext context, DrawingLayouts layout)
@@ -4347,7 +6186,8 @@ namespace ATAS.Indicators.Technical
 				FillThreshold = FillSize == FillSizeRule.FixedContracts ? FillMinVolume : _fillThreshold,
 				RestingThreshold = RestingMinimum(),
 				LastBarTime = CurrentBar > 0 ? GetCandle(CurrentBar - 1).Time : DateTime.MinValue,
-				Board = withScoreboard ? BuildScoreboard() : null
+				Board = withScoreboard ? BuildScoreboard() : null,
+				Execution = ExecutionPanelLines()
 			};
 		}
 
@@ -4929,6 +6769,9 @@ namespace ATAS.Indicators.Technical
 				footer.Add(($"Live {Side(open)} {excursion.ToString("+0;-0;0", CultureInfo.InvariantCulture)}t{stop}:  {odds}",
 					open.IsLong ? BuyColor : ShortColor));
 			}
+
+			if (stats.Execution != null)
+				footer.AddRange(stats.Execution);
 
 			const int pad = 8;
 			const int gap = 12;

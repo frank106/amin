@@ -20,7 +20,10 @@ A custom indicator for the [ATAS](https://atas.net) platform that:
    multiple of the ATR, or the stop just beyond the signal bar), and the entry can be a limit order
    on a pullback;
 8. keeps a **scoreboard** of how each setup and each candlestick pattern has done on your chart,
-   and checks whether the odds it showed held up.
+   and checks whether the odds it showed held up;
+9. can **send the orders of its own signals**, off by default: paper (simulated) unless you arm it
+   for a live account, one position at a time, with a daily loss limit and a log of every order
+   (see [Execution](#execution-sending-the-orders)).
 
 ![Layout preview](docs/preview.png)
 
@@ -42,7 +45,7 @@ screenshot: ATAS draws the candles and arrows itself, with its own fonts and the
 | **Large arrows + card** | **BUY / SHORT signal** of the open trade: the setup, the odds of TP / break-even / SL and the expected ticks |
 | Large arrows + small chip | A signal whose trade has ended, with its result: `TP +80t`, `BE +20t`, `SL -80t` or `EXP` |
 | Shaded boxes | The open trade: entry → TP shaded green, entry → SL shaded red, amber dotted line at the break-even trigger (+40 ticks), solid amber once the stop has moved to +20, price tags at the right end. Trades that have ended leave a faint box |
-| Panel | Results, the labels' track record, the signal hours, the fills and resting orders so far with the size each needs now, and the live odds of the open trade. Hover it for the scoreboard |
+| Panel | Results, the labels' track record, the signal hours, the fills and resting orders so far with the size each needs now, and the live odds of the open trade; with execution on, the executor's mode, day and position. Hover it for the scoreboard |
 
 Hover the mouse over a card or chip, a bubble, a reaction marker, an order band or a key level's
 label for the details.
@@ -552,6 +555,127 @@ live, or at least next to the runner's worst-case row.
 * Key levels come from the bars loaded on the chart: the first day has no prior day, and a day
   that starts partway through gets partial ranges.
 
+## Execution: sending the orders
+
+The same indicator can send the orders of its own signals. It is **off by default** (*Execute
+signals*), and when you switch it on it trades **on paper** (*Paper trading*, on by default): a
+simulator inside the indicator fills the orders and nothing leaves ATAS. Read the
+[backtest](#backtest-two-years-of-1-minute-nq) first: nothing tested was profitable after costs on
+real ticks, and sending the orders doesn't change that. Paper trading is there to check what the
+executor *does* - which signals it takes, where its orders go, how they end - before any of it is
+real.
+
+### What it does
+
+It decides nothing the chart has not:
+
+* **Which signals.** Only the ones the chart shows, in real time. The *Signal hours*, *One trade at
+  a time*, *Min TP probability* and *Min expected ticks* therefore apply to the orders exactly as they
+  do to the chart. Signals in the history loaded on the chart are never traded.
+* **The entry.** With *Entry: At the signal bar's close*, a market order as soon as the bar has
+  closed. With a limit entry, a limit order at the signal's own price; it is cancelled when the
+  chart's order expires (*Limit order valid*).
+* **The bracket.** Once filled, the signal's own stop and take profit, from whichever *Bracket size*
+  is on (fixed ticks, multiples of the ATR, or beyond the signal bar), the stop sent first, both in
+  one OCO group. When the trade reaches its break-even trigger, the stop moves to its break-even
+  price.
+* **The exit.** The stop or the take profit, or at market as soon as the chart's trade ends while
+  the position is still open: a take profit price only touched, *Max bars in trade*, *Close trades
+  at session end*. The position never outlives the chart's trade.
+* **One position at a time**, even with *One trade at a time* off: a signal that comes while a
+  position is open is logged as skipped.
+* **The size**: *Contracts per trade* (1).
+
+The executor follows its own copy of the signal's trade through the same prices and rules as the
+chart, so a recalculation (after a settings change, say) never changes what happens to a position
+that is already open. Switching *Execute signals* off stops new entries; an open position is still
+managed until it ends.
+
+### The daily loss limit
+
+*Daily loss limit ($)* stops new entries for the rest of the trading day once the day's closed
+trades have lost that much, commission included. The trading day turns at 18:00 New York time, like
+the key levels. *Skip trades that could breach the limit* (on) also skips a signal whose stop, with
+slippage and commission, could take the day past the limit, so a single trade can't blow through it.
+The day's result is read back from the log when ATAS restarts, so a restart doesn't reset it. Paper
+and live count apart.
+
+It counts the trades of this indicator on this chart only, not manual trades or other charts:
+your broker's or prop firm's own limit still applies. Run the executor on one chart per account.
+
+The result of each trade uses *Tick value* (5 for NQ, 0.5 for MNQ) and *Commission* (5.00 a contract
+a round trip, the backtest's one tick on NQ; set what you pay). When the trading connection reports
+another tick value, the larger one is used, so a wrong setting can only make the limit stricter.
+
+### Paper fills
+
+Market and stop orders fill *Slippage* ticks (1) worse than the price that reached them, and a stop
+that price gaps through fills at the gap's price. Limit orders fill at their own price once price
+trades a tick through them, as the chart's limit entries do. So a take profit that price only
+touches doesn't fill: the chart counts it, and the position closes at market with the chart's
+trade, usually a tick lower. Paper results are therefore a little worse than the chart's, as real
+fills usually are.
+
+### Going live
+
+With *Paper trading* off, orders go to ATAS's trading connection (the chart's account and
+instrument) only when all of these hold; otherwise each signal is logged as skipped, with the reason:
+
+* *Live account* is the account selected on the chart (type its ID; case and spaces don't matter);
+* a *Daily loss limit* is set;
+* the chart's instrument has the trading instrument's tick size;
+* the account holds no position in the instrument.
+
+The panel says *not armed* and why. Orders go without ATAS's confirmation dialog. If ATAS or the
+broker rejects the stop or the take profit, the position is closed at market and the executor
+**halts** (no new entries until *Execute signals* is switched off and on again); so does a stop
+that goes away without the executor asking (cancelled by hand, or expired at the broker), after a
+few seconds that leave room for a take profit filling at the same moment. A position that
+disappears from the account (closed by hand, say) halts it too, and so does a closing order that is
+rejected, which you then have to close yourself. Removing the indicator cancels an entry that is still waiting; an
+open position keeps its stop and take profit at the broker, but nothing moves or closes it any more.
+
+The live side has been tested against a simulated broker only (see [tests/README.md](tests/README.md)),
+not against ATAS's own connection. Before it trades a funded account, run it where mistakes are free:
+paper trading on a live chart, then ATAS's Market Replay or a simulated account with *Paper trading*
+off, and check its log against what the broker shows.
+
+### The log
+
+Every signal the executor sees, every order, fill, cancel and stop move, and every result goes to a
+CSV file: one per trading day, instrument and mode (`2026-09-25_NQ_paper.csv`), in *Log folder*,
+by default `ATAS/FvgExecution` in the application data folder (on a Mac
+`~/Library/Application Support/ATAS/FvgExecution`, on Windows `%APPDATA%\ATAS\FvgExecution`).
+Every row names the signal behind it - its time and side (`20260925-094900-BUY`, as its tooltip
+shows it), setup, patterns, confirmations and the odds on its label - so you can line it up with the
+chart and the scoreboard:
+
+| Event | When |
+|---|---|
+| `MODE` | the settings in use, at the start of each file and whenever they change |
+| `SIGNAL` / `SKIPPED` | a real-time signal was taken, or not, and why |
+| `ORDER`, `MODIFY`, `CANCEL`, `CANCELLED`, `REJECTED` | an order sent, moved (break-even) or resized, cancelled, refused |
+| `FILL` | an entry or exit fill, with its price and the position after it |
+| `EXIT` | closing at market, and why |
+| `CLOSED` | the position is flat: ticks a contract, $ after commission, the day's $ so far, and the chart's result for the same signal |
+| `CHART` | how the chart's trade for the signal ended, as its tooltip says it |
+| `BREAKER`, `HALT`, `WARN`, `RESTORE`, `NOFILL` | the daily loss limit reached, a halt, a warning, the day read back after a restart, an entry that never filled |
+
+With execution on, the panel adds a line for the executor (mode, size, the day's result against the
+limit), one for the open position and one for the last thing it did.
+
+### Limits of the executor
+
+* The chart's *Close trades at session end* acts on the first price of the next session, after
+  CME's daily break, so a position can be held through it. The executor has no clock of its own: to
+  be flat by a given time, end *Signal hours* early enough (a custom window) and watch the open
+  position.
+* A live limit entry can fill on a touch that the chart doesn't count as a fill. Unless price then
+  trades through it, the position closes at market when the chart's order expires.
+* The break-even price is the signal's, counted from the signal's entry, not from your fill.
+* Orders use the connection's default time in force. A stop that expires at the broker counts as
+  cancelled: the position is closed and the executor halts.
+
 ## Install
 
 ### Mac (ATAS X)
@@ -679,6 +803,17 @@ show while the chart is open.
 | | Show reaction labels | off | name the pattern next to each reaction marker (hovering one always does) |
 | | Statistics panel position, Label offset (px), Label font, Take profit / Stop loss / Break-even line | top right, 24, Arial 9 | |
 | Alerts | Alert on new signal / Alert on TP / SL / break-even / Alert sound file | off / off / alert1 | the second also fires when a stop moves to break-even; only in real time, never while history loads |
+| Execution | Execute signals | off | send the orders of the signals shown, in real time only |
+| | Paper trading (simulated fills) | on | off: real orders, only once armed (below) |
+| | Live account (must match the chart's) | empty | live orders only go to this account, while it is the chart's |
+| | Contracts per trade | 1 | |
+| | Daily loss limit ($, 0 = off) | 0 | no new entries for the rest of the trading day once the day's closed trades lost this much; live trading needs one |
+| | Skip trades that could breach the limit | on | also skip a signal whose stop could take the day past the limit |
+| | Tick value ($ per contract) | 5 | NQ; 0.5 for MNQ. The larger of this and the connection's is used |
+| | Commission ($ per contract, round trip) | 5.00 | taken off each trade's result |
+| | Slippage (ticks per market / stop fill) | 1 | paper fills, and the risk of a new trade |
+| | Alert on orders | on | an alert per fill and per closed position; halts, rejections and the loss limit always alert |
+| | Log folder | ATAS/FvgExecution in the application data folder | the CSV log |
 
 The signal arrows are regular data series (*Buy Signal*, *Short Signal*), so ATAS can also use
 them for alerts or automation. The reaction and sweep series (*FVG Bull Reaction*, *Liquidity
@@ -687,7 +822,13 @@ draws its own markers for them. The sweep series also mark sweeps of key levels.
 
 ## Changes in this version
 
-New in this version, all off by default, so the signals and their odds stay as they were:
+New in this version, off by default, so the chart, the signals and their odds stay as they were:
+
+* **execution**: the indicator can send the orders of its own signals, paper by default, with
+  position sizing, a daily loss limit, live orders only once armed for the chart's account, and a
+  CSV log of every order. See [Execution](#execution-sending-the-orders).
+
+New in the previous version, all off by default:
 
 * **signal filters**: a custom window for the signal hours, a minimum sweep depth and gap size in
   ATRs, and sweeps of confirmed swing highs / lows only;
@@ -700,7 +841,7 @@ New in this version, all off by default, so the signals and their odds stay as t
   and settles trades on real ticks (`--ticks`). See [Backtest](#backtest-two-years-of-1-minute-nq)
   for what two years of NQ said about all of this.
 
-New since the rewrite, in the previous version:
+New since the rewrite, in the version before:
 
 * **key levels**: the prior day's, the overnight and the opening range's highs / lows and equal
   highs / lows, swept or broken, with two new triggers, *Key sweep* and *Key sweep+FVG*;
@@ -746,6 +887,8 @@ The fixes made to the original file are all still in:
 
 `tests/` builds the indicator against stand-ins for the ATAS API and checks it on scripted and
 randomised markets, including a simulated order book — see [tests/README.md](tests/README.md).
+`tests/ExecutionTests` checks the execution side: paper orders and exits, the daily loss limit, the
+log, and the live order calls against a simulated broker.
 `tests/Backtest` replays a CSV of bars through the same code, for a backtest over any stretch of
 history outside ATAS, and `tests/PathCheck` measures how far a backtest on 1-minute bars is off
 for given settings. They are not part of the indicator build.

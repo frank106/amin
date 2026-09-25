@@ -7,16 +7,19 @@ without an ATAS install:
 * `AtasApiStubs` — the slice of the ATAS SDK the indicator uses (`Indicator`,
   `ValueDataSeries`, `IndicatorCandle`, `MarketDataArg`, `MarketDepthInfo`, `RenderContext`,
   `PenSettings`, ...), with the signatures the official
-  [AtasPlatform/Indicators](https://github.com/AtasPlatform/Indicators) sources use. It also
-  records draw calls and lets the harness feed bars, ticks, order-book updates and prints.
-  Never reference it from the real indicator build.
+  [AtasPlatform/Indicators](https://github.com/AtasPlatform/Indicators) sources use, and the
+  trading calls (`ITradingManager`, `Order`, `MyTrade`, `Position`) as ATAS X 8.0.15 has them. It
+  also records draw calls and lets the harness feed bars, ticks, order-book updates, prints and
+  the broker's answers to orders. Never reference it from the real indicator build.
 * `IndicatorTests` — a console runner (exit code 0 = everything passed).
+* `ExecutionTests` — the same for the execution side (see [below](#execution)).
 
 ```
 dotnet run -c Release --project tests/IndicatorTests
 ```
 
-Requires the .NET 8 SDK. What it checks:
+Requires the .NET 8 SDK. With only a newer .NET installed (the .NET 10 SDK that builds for ATAS X,
+say), let it run on that one: `DOTNET_ROLL_FORWARD=Major dotnet run ...`. What it checks:
 
 * **trade settlement**:
   * TP, SL, gaps through a level, the break-even trigger and stop, and all three rules for
@@ -111,6 +114,56 @@ WPF-like stand-in. Two switches cover the real models:
 dotnet run -c Release --project tests/IndicatorTests -p:CrossColor=true   # ATAS X model, runs all checks
 dotnet build -c Release tests/IndicatorTests -p:WpfColor=true              # real WPF type, compile only
 ```
+
+## Execution
+
+`ExecutionTests` checks what the indicator does with *Execute signals* on. It leaves the signal
+checks above alone, and it can't reach a real account: paper orders never leave the indicator, and
+the live checks use a fake broker that only records the order calls, each check playing the
+broker's answers itself.
+
+```
+dotnet run -c Release --project tests/ExecutionTests
+```
+
+What it checks:
+
+* **defaults**: off, paper on, one contract, and nothing at all while off (no log, no panel line,
+  no order call even when armed for live);
+* **paper trades**, tick by tick, word for word in the log: the market entry a tick of slippage
+  above the signal's close, the signal's own stop and take profit (the stop first), the stop moved
+  at the break-even trigger, and every ending - a take profit traded through, one only touched
+  (closed at market with the chart's trade), the break-even stop and the stop loss with slippage,
+  a SHORT, 3 contracts, limit entries filled a tick through or cancelled with the chart's order,
+  *Max bars in trade* and the session end;
+* **the daily loss limit**: the breaker trips on the losing close, the rest of the day's signals
+  are skipped, the next trading day (18:00 New York) starts from zero in a file of its own; a
+  trade whose stop could breach the limit is skipped; a restarted indicator reads the day back
+  from the log; paper and live count apart;
+* **what the chart decides**: no signal outside the signal hours, hidden signals skipped (*One
+  trade at a time*), one position at a time even when the chart shows overlapping signals, nothing
+  from history, and a recalculation that even removes the signal leaves the open position and
+  its orders to finish as they would have;
+* **the panel and alerts**: the executor's lines, and alerts on fills and results (or not);
+* **live orders** against the fake broker: not armed without the chart's account, a daily loss
+  limit, a connection or the right tick size, or when the account already holds a position; the
+  calls themselves (a market BUY for the chart's account, no confirmation dialog, the stop before
+  the take profit in one OCO group, ModifyOrderAsync to break-even, the leftover leg cancelled);
+  fills reported before or after the order's state, twice, or for someone else's order; partial
+  fills resizing the bracket; a take profit filling while the executor cancels it; a rejected stop
+  (closed at market, halted); a stop cancelled outside the indicator (closed and halted a few
+  seconds on, but not when its take profit's fill cancelled it); a position closed outside the
+  indicator (halted);
+* **random markets**, streamed tick by tick to one indicator executing and one not, under four
+  settings: the chart's trades and panel counts must come out identical, and the log must
+  reconcile with the chart - one decision row per real-time signal, orders only from shown
+  signals at their prices, one position at a time, each trade copy ending as the chart's trade did,
+  each day's results adding up, and the breaker tripping on the first close at or below the limit
+  and at no other time.
+
+Every one of 24 deliberate bugs put into the execution code (a hidden signal traded, the breaker
+late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes
+at least one check fail.
 
 ## Backtest
 

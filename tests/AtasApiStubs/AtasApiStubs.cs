@@ -235,8 +235,142 @@ namespace OFT.Rendering.Context
 	}
 }
 
+// The trading side of the API (ATAS.DataFeedsCore.dll): orders, fills, positions. Signatures
+// as in ATAS X 8.0.15; only what the indicator's execution uses.
+namespace ATAS.DataFeedsCore
+{
+	public enum OrderTypes
+	{
+		Limit,
+		Market,
+		Stop,
+		StopLimit,
+		Unknown
+	}
+
+	public enum OrderDirections
+	{
+		Buy,
+		Sell
+	}
+
+	public enum OrderStates
+	{
+		None,
+		Active,
+		Done,
+		Failed
+	}
+
+	public enum OrderStatus
+	{
+		None,
+		Placed,
+		Filled,
+		PartlyFilled,
+		Canceled
+	}
+
+	public class Security
+	{
+		public string Code { get; set; }
+		public string Instrument { get; set; }
+		public string SecurityId { get; set; }
+		public decimal TickSize { get; set; }
+		public decimal TickCost { get; set; }
+	}
+
+	public class Portfolio
+	{
+		public string AccountID { get; set; }
+	}
+
+	public class Position
+	{
+		public string AccountID { get; set; }
+		public Portfolio Portfolio { get; set; }
+		public Security Security { get; set; }
+		public decimal Volume { get; set; }
+		public decimal AveragePrice { get; set; }
+	}
+
+	public class Order
+	{
+		public string Id { get; set; }
+		public Portfolio Portfolio { get; set; }
+		public Security Security { get; set; }
+		public OrderDirections Direction { get; set; }
+		public OrderTypes Type { get; set; }
+		public decimal QuantityToFill { get; set; }
+		public decimal Unfilled { get; set; }
+		public decimal Price { get; set; }
+		public decimal TriggerPrice { get; set; }
+		public OrderStates State { get; set; }
+		public string Comment { get; set; }
+		public string OCOGroup { get; set; }
+		public DateTime Time { get; set; }
+
+		// harness: the real Canceled is read-only, worked out by ATAS
+		public bool Canceled { get; set; }
+
+		public Order Clone()
+		{
+			return (Order)MemberwiseClone();
+		}
+	}
+
+	public class MyTrade
+	{
+		public string Id { get; set; }
+		public Order Order { get; set; }
+		public string OrderId { get; set; }
+		public OrderDirections OrderDirection { get; set; }
+		public decimal Price { get; set; }
+		public decimal Volume { get; set; }
+		public DateTime Time { get; set; }
+		public Portfolio Portfolio { get; set; }
+		public Security Security { get; set; }
+	}
+
+	public static class Extensions
+	{
+		public static OrderStatus Status(this Order order)
+		{
+			switch (order.State)
+			{
+				case OrderStates.Active:
+					return order.Unfilled < order.QuantityToFill ? OrderStatus.PartlyFilled : OrderStatus.Placed;
+
+				case OrderStates.Done:
+					return order.Canceled || order.Unfilled > 0 ? OrderStatus.Canceled : OrderStatus.Filled;
+
+				default:
+					return OrderStatus.None;
+			}
+		}
+	}
+}
+
 namespace ATAS.Indicators
 {
+	using ATAS.DataFeedsCore;
+
+	// the chart's trading connection: the account and instrument selected on it, and the order calls
+	// (ATAS X 8 marks the synchronous OpenOrder / ModifyOrder / CancelOrder obsolete, so the stub
+	// only has the async ones)
+	public interface ITradingManager
+	{
+		Portfolio Portfolio { get; }
+		Security Security { get; }
+		Position Position { get; }
+
+		System.Threading.Tasks.Task OpenOrderAsync(Order order, bool setDefaultQuantity, bool askConfirmation = true, bool checkOrderStates = true);
+
+		System.Threading.Tasks.Task ModifyOrderAsync(Order order, Order newOrder, bool askConfirmation = true, bool checkOrderStates = true);
+
+		System.Threading.Tasks.Task CancelOrderAsync(Order order, bool askConfirmation = true, bool checkOrderStates = true);
+	}
+
 	public enum VisualMode
 	{
 		Line,
@@ -458,6 +592,8 @@ namespace ATAS.Indicators
 		public MouseLocationInfo MouseLocationInfo => ChartInfo?.MouseLocationInfo;
 		public IMarketDepthInfo MarketDepthInfo => Depth;
 		public DateTime MarketTime { get; set; }                      // harness setter
+		protected ITradingManager TradingManager => HarnessTradingManager;
+		public ITradingManager HarnessTradingManager { get; set; }    // harness
 
 		// harness
 		public List<IndicatorCandle> Candles { get; } = new List<IndicatorCandle>();
@@ -526,6 +662,30 @@ namespace ATAS.Indicators
 		{
 		}
 
+		protected virtual void OnNewMyTrade(ATAS.DataFeedsCore.MyTrade myTrade)
+		{
+		}
+
+		protected virtual void OnOrderChanged(ATAS.DataFeedsCore.Order order)
+		{
+		}
+
+		protected virtual void OnOrderRegisterFailed(ATAS.DataFeedsCore.Order order, string message)
+		{
+		}
+
+		protected virtual void OnOrderModifyFailed(ATAS.DataFeedsCore.Order order, ATAS.DataFeedsCore.Order newOrder, string error)
+		{
+		}
+
+		protected virtual void OnOrderCancelFailed(ATAS.DataFeedsCore.Order order, string message)
+		{
+		}
+
+		protected virtual void OnDispose()
+		{
+		}
+
 		// harness entry points (ATAS calls these internally)
 		public void HarnessRecalculate()
 		{
@@ -553,6 +713,36 @@ namespace ATAS.Indicators
 		public void HarnessTrade(MarketDataArg trade)
 		{
 			OnNewTrade(trade);
+		}
+
+		public void HarnessMyTrade(ATAS.DataFeedsCore.MyTrade myTrade)
+		{
+			OnNewMyTrade(myTrade);
+		}
+
+		public void HarnessOrderChanged(ATAS.DataFeedsCore.Order order)
+		{
+			OnOrderChanged(order);
+		}
+
+		public void HarnessOrderRegisterFailed(ATAS.DataFeedsCore.Order order, string message)
+		{
+			OnOrderRegisterFailed(order, message);
+		}
+
+		public void HarnessOrderModifyFailed(ATAS.DataFeedsCore.Order order, ATAS.DataFeedsCore.Order newOrder, string error)
+		{
+			OnOrderModifyFailed(order, newOrder, error);
+		}
+
+		public void HarnessOrderCancelFailed(ATAS.DataFeedsCore.Order order, string message)
+		{
+			OnOrderCancelFailed(order, message);
+		}
+
+		public void HarnessDispose()
+		{
+			OnDispose();
 		}
 	}
 }
