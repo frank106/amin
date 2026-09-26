@@ -1227,6 +1227,11 @@ namespace ATAS.Indicators.Technical
 		// position counts as closed outside the indicator (fills can arrive after the position update)
 		private static readonly TimeSpan AccountFlatGrace = TimeSpan.FromSeconds(3);
 
+		// Live trades, one per account at a time across the charts of this ATAS: the account's ID ->
+		// the indicator whose live position holds it, from its entry until the position is done
+		private static readonly Dictionary<string, FvgReactionLiquiditySweep> LiveAccountHolders =
+			new Dictionary<string, FvgReactionLiquiditySweep>(StringComparer.OrdinalIgnoreCase);
+
 		private readonly List<SignalTrade> _execCandidates = new List<SignalTrade>();   // real-time signals of the bar that just closed
 		private readonly List<ExecOrder> _paperBook = new List<ExecOrder>();            // paper orders resting in the simulator
 		private readonly HashSet<string> _execFillIds = new HashSet<string>();          // live fills already counted
@@ -4829,6 +4834,10 @@ namespace ATAS.Indicators.Technical
 					return $"its stop could lose {Money(worst)}, more than the {Money(room)} left before the daily loss limit";
 			}
 
+			// the last check, as passing it takes the account for this chart
+			if (!paper && !HoldLiveAccount(out var holder))
+				return $"another chart ({holder}) has a live trade on this account: one live trade per account at a time";
+
 			return null;
 		}
 
@@ -4859,6 +4868,36 @@ namespace ATAS.Indicators.Technical
 				return $"the instrument's tick size ({security.TickSize.ToString(CultureInfo.InvariantCulture)}) is not the chart's";
 
 			return null;
+		}
+
+		// Two charts armed for one account would each keep their own position and loss limit, so a
+		// live entry first takes the account; another chart's signal is skipped until this position
+		// is done, or this indicator is removed
+		private bool HoldLiveAccount(out string holder)
+		{
+			var account = TradingManager?.Portfolio?.AccountID?.Trim() ?? string.Empty;
+
+			lock (LiveAccountHolders)
+			{
+				if (LiveAccountHolders.TryGetValue(account, out var other) && !ReferenceEquals(other, this))
+				{
+					holder = string.IsNullOrWhiteSpace(other.InstrumentInfo?.Instrument) ? "another instrument" : other.InstrumentInfo.Instrument;
+					return false;
+				}
+
+				LiveAccountHolders[account] = this;
+				holder = null;
+				return true;
+			}
+		}
+
+		private void ReleaseLiveAccount()
+		{
+			lock (LiveAccountHolders)
+			{
+				foreach (var account in LiveAccountHolders.Where(h => ReferenceEquals(h.Value, this)).Select(h => h.Key).ToList())
+					LiveAccountHolders.Remove(account);
+			}
 		}
 
 		// what the trade loses if its stop is hit: from where it enters, with the slippage of a market
@@ -5134,6 +5173,9 @@ namespace ATAS.Indicators.Technical
 				return;
 
 			pos.Done = true;
+
+			if (!pos.Paper)
+				ReleaseLiveAccount();
 
 			if (pos.Entered == 0)
 			{
@@ -5523,6 +5565,9 @@ namespace ATAS.Indicators.Technical
 			ExecutionCallback(() =>
 			{
 				var pos = _execPosition;
+
+				// nothing here manages an account any more
+				ReleaseLiveAccount();
 
 				if (pos == null || pos.Done)
 					return;

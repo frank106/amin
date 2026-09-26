@@ -61,6 +61,7 @@ internal static class Program
 		Run("Live: a rejected stop closes the position and halts", LiveRejectedStop);
 		Run("Live: a position closed outside the indicator halts it", LiveClosedOutside);
 		Run("Live: a stop cancelled outside the indicator closes the position", LiveStopCancelledOutside);
+		Run("Live: one live trade per account across charts", LiveOneTradePerAccount);
 		Run("Random markets: the chart is unchanged, the log reconciles (market entries)", () => RandomMarkets(seed: 5, configure: null));
 		Run("Random markets: limit entries, expiry, overlapping signals", () => RandomMarkets(seed: 17, configure: i =>
 		{
@@ -682,7 +683,9 @@ internal static class Program
 		ind.HarnessMyTrade(new MyTrade { Id = "X1", Order = new Order { Id = "MANUAL-1" }, OrderId = "MANUAL-1", Price = 104, Volume = 1 });
 		Check(broker.Calls.Count == 3 && Rows(ind, "live").Count(r => r["event"] == "FILL") == 1, "a manual trade's fill is ignored");
 
-		// a partial fill reported twice must not grow the position
+		// a partial fill reported twice must not grow the position (on a new chart: the one above,
+		// still holding its position on the account, is removed first)
+		ind.HarnessDispose();
 		broker = new FakeBroker();
 		ind = Buy(Live(broker, i => i.Contracts = 2));
 		OpenBar(ind, 103.5m);
@@ -805,7 +808,9 @@ internal static class Program
 		Check(broker.Calls.Count == 5 && exit.Name == "open" && exit.Order.Type == OrderTypes.Market && exit.Order.Direction == OrderDirections.Sell,
 			"then it closes at market");
 
-		// the OCO partner: the take profit fills and the broker cancels the stop, reported first
+		// the OCO partner: the take profit fills and the broker cancels the stop, reported first (on a
+		// new chart: the one above still holds the account)
+		ind.HarnessDispose();
 		broker = new FakeBroker();
 		ind = Buy(Live(broker));
 		bar = OpenBar(ind, 103.5m);
@@ -822,6 +827,50 @@ internal static class Program
 		rows = Rows(ind, "live");
 		Check(!rows.Any(r => r["event"] == "HALT") && Only(rows, "CLOSED")["pnl_usd"] == "390.00" && broker.Calls.Count == 3,
 			$"closed on its take profit: no halt, no extra order ({Trail(rows)})");
+	}
+
+	private static void LiveOneTradePerAccount()
+	{
+		// two charts armed for the same account: the second one's signal waits for the first position
+		var first = new FakeBroker();
+		var a = Buy(Live(first));
+		OpenBar(a, 103.5m);
+		Check(first.Calls.Count == 1, "the first chart sends its entry");
+
+		var second = new FakeBroker();
+		var b = Buy(Live(second));
+		OpenBar(b, 103.5m);
+		Check(second.Calls.Count == 0, "the second chart sends nothing");
+		Check(Only(Rows(b, "live"), "SKIPPED")["note"] == "another chart (NQ) has a live trade on this account: one live trade per account at a time",
+			$"skipped: {Describe(Rows(b, "live"))}");
+
+		// paper doesn't touch the account, and another account is its own
+		var paper = Buy();
+		OpenBar(paper, 103.5m);
+		Check(Rows(paper).Any(r => r["event"] == "SIGNAL"), "a paper chart trades all the same");
+
+		var other = new FakeBroker { Portfolio = new Portfolio { AccountID = "SIM-2" } };
+		var c = Buy(Live(other, i => i.LiveAccount = "SIM-2"));
+		OpenBar(c, 103.5m);
+		Check(other.Calls.Count == 1, "a chart on another account trades");
+
+		// the first position ends: the account is free again
+		first.Fill(a, first.Calls[0].Order, 103.75m, 1, "F1");
+		first.Fill(a, first.Calls[2].Order, 123.5m, 1, "F2");
+		first.ConfirmCancel(a, first.Calls[1].Order);
+		Check(Rows(a, "live").Any(r => r["event"] == "CLOSED"), $"the first position closed: {Trail(Rows(a, "live"))}");
+
+		var third = new FakeBroker();
+		var d = Buy(Live(third));
+		OpenBar(d, 103.5m);
+		Check(third.Calls.Count == 1, "then another chart may trade the account");
+
+		// removing a chart gives its account back, even with its entry still working
+		d.HarnessDispose();
+		var fourth = new FakeBroker();
+		var e = Buy(Live(fourth));
+		OpenBar(e, 103.5m);
+		Check(fourth.Calls.Count == 1, "once the chart holding it is removed, the account is free");
 	}
 
 	private static Action<FvgReactionLiquiditySweep> Live(FakeBroker broker, Action<FvgReactionLiquiditySweep> more = null)
@@ -1411,6 +1460,12 @@ internal static class Program
 	private static void Run(string name, Action test)
 	{
 		var before = Failures.Count;
+
+		// each check starts as if ATAS had just started: no chart holds a live account
+		var holders = (IDictionary)IndicatorType.GetField("LiveAccountHolders", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+
+		lock (holders)
+			holders.Clear();
 
 		try
 		{
