@@ -271,6 +271,16 @@ namespace ATAS.DataFeedsCore
 		Canceled
 	}
 
+	public enum TimeInForce
+	{
+		None,
+		GoodTillCancel,
+		FillOrKill,
+		ImmediateOrCancel,
+		Day,
+		Default
+	}
+
 	public class Security
 	{
 		public string Code { get; set; }
@@ -307,6 +317,7 @@ namespace ATAS.DataFeedsCore
 		public decimal Price { get; set; }
 		public decimal TriggerPrice { get; set; }
 		public OrderStates State { get; set; }
+		public TimeInForce TimeInForce { get; set; }
 		public string Comment { get; set; }
 		public string OCOGroup { get; set; }
 		public DateTime Time { get; set; }

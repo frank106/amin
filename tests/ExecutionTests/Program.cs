@@ -64,6 +64,7 @@ internal static class Program
 		Run("Live: a stop cancelled outside the indicator closes the position", LiveStopCancelledOutside);
 		Run("Live: one live trade per account across charts", LiveOneTradePerAccount);
 		Run("Live: the account's closed P&L counts toward the daily loss limit", LiveAccountPnl);
+		Run("Live: time in force for the resting orders", LiveTimeInForce);
 		Run("Random markets: the chart is unchanged, the log reconciles (market entries)", () => RandomMarkets(seed: 5, configure: null));
 		Run("Random markets: limit entries, expiry, overlapping signals", () => RandomMarkets(seed: 17, configure: i =>
 		{
@@ -121,12 +122,13 @@ internal static class Program
 			"NQ's tick value, the backtest's costs, alerts, the default log folder");
 		Check(fresh.FlatByTime == TimeSpan.Zero && fresh.FlatByLastEntryMinutes == 10, "no flat-by time; with one, no entries in its last 10 minutes");
 		Check(fresh.CountAccountPnl, "live, the account's closed P&L counts toward the limit");
+		Check(fresh.LiveTimeInForce == FvgReactionLiquiditySweep.OrderLifetime.ConnectionDefault, "live orders at the connection's time in force");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 14, $"fourteen settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 15, $"fifteen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -941,6 +943,45 @@ internal static class Program
 		});
 		OpenBar(paper, 103.5m);
 		Check(Rows(paper).Any(r => r["event"] == "SIGNAL") && !Only(Rows(paper), "MODE")["note"].Contains("closed P&L"), "paper trades all the same");
+	}
+
+	private static void LiveTimeInForce()
+	{
+		// the connection's default: the executor sets none
+		var plain = new FakeBroker();
+		var ind = Buy(Live(plain));
+		OpenBar(ind, 103.5m);
+		plain.Fill(ind, plain.Calls[0].Order, 103.75m, 1, "F1");
+		Check(plain.Calls.Count == 3 && plain.Calls.All(c => c.Order.TimeInForce == TimeInForce.None), "left to the connection by default");
+		ind.HarnessDispose();
+
+		// good till cancelled: the stop and the take profit, not the market entry
+		var gtc = new FakeBroker();
+		ind = Buy(Live(gtc, i => i.LiveTimeInForce = FvgReactionLiquiditySweep.OrderLifetime.GoodTillCancel));
+		var bar = OpenBar(ind, 103.5m);
+		gtc.Fill(ind, gtc.Calls[0].Order, 103.75m, 1, "F1");
+		Check(gtc.Calls[0].Order.TimeInForce == TimeInForce.None && gtc.Calls[1].Order.TimeInForce == TimeInForce.GoodTillCancel
+			&& gtc.Calls[2].Order.TimeInForce == TimeInForce.GoodTillCancel, "the stop and the take profit are good till cancelled");
+
+		AddTick(ind, bar, 115);
+		Check(gtc.Calls.Single(c => c.Name == "modify").NewOrder.TimeInForce == TimeInForce.GoodTillCancel, "and stay so when the stop moves");
+		Check(Only(Rows(ind, "live"), "MODE")["note"].EndsWith(" · live orders good till cancelled", StringComparison.Ordinal), "the MODE row says so");
+		ind.HarnessDispose();
+
+		// a limit entry good for the day
+		var day = new FakeBroker();
+		ind = Buy(Live(day, i =>
+		{
+			i.LiveTimeInForce = FvgReactionLiquiditySweep.OrderLifetime.Day;
+			i.Entry = FvgReactionLiquiditySweep.EntryRule.LimitPullback;
+		}));
+		OpenBar(ind, 103.5m);
+		Check(day.Calls[0].Order.Type == OrderTypes.Limit && day.Calls[0].Order.TimeInForce == TimeInForce.Day, "a limit entry good for the day");
+
+		// paper orders never leave the indicator: nothing to set
+		var paper = Buy(i => i.LiveTimeInForce = FvgReactionLiquiditySweep.OrderLifetime.GoodTillCancel);
+		OpenBar(paper, 103.5m);
+		Check(!Only(Rows(paper), "MODE")["note"].Contains("good till"), "paper doesn't mention it");
 	}
 
 	private static void LiveOneTradePerAccount()

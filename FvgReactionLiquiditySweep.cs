@@ -182,6 +182,19 @@ namespace ATAS.Indicators.Technical
 			NearestExtremeFirst
 		}
 
+		// how long the executor's resting live orders stay at the broker
+		public enum OrderLifetime
+		{
+			[Display(Name = "The connection's default")]
+			ConnectionDefault,
+
+			[Display(Name = "Day")]
+			Day,
+
+			[Display(Name = "Good till cancelled")]
+			GoodTillCancel
+		}
+
 		public enum PanelCorner
 		{
 			[Display(Name = "Top left")]
@@ -1268,6 +1281,7 @@ namespace ATAS.Indicators.Technical
 		private bool _countAccountPnl = true;
 		private TimeSpan _flatByTime;
 		private int _flatByLastEntryMinutes = 10;
+		private OrderLifetime _liveTimeInForce;
 		private decimal _tickValue = 5m;
 		private decimal _commissionPerContract = 5m;
 		private int _slippageTicks = 1;
@@ -2191,6 +2205,14 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _flatByLastEntryMinutes;
 			set { _flatByLastEntryMinutes = Math.Min(600, Math.Max(0, value)); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Time in force (live orders)", GroupName = "Execution", Order = 511,
+			Description = "For the live stop, take profit and limit entry. The connection's default: as ATAS sends orders. Good till cancelled keeps the stop through the session break; some connections only take Day orders. A stop that expires or is refused closes the position and halts execution.")]
+		public OrderLifetime LiveTimeInForce
+		{
+			get => _liveTimeInForce;
+			set { _liveTimeInForce = value; _execConfigDirty = true; }
 		}
 
 		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 512,
@@ -5060,6 +5082,10 @@ namespace ATAS.Indicators.Technical
 			{
 				order.Portfolio = TradingManager?.Portfolio;
 				order.Security = TradingManager?.Security;
+
+				// resting orders only: a market order fills at once
+				if (type != OrderTypes.Market && LiveTimeInForce != OrderLifetime.ConnectionDefault)
+					order.TimeInForce = LiveTimeInForce == OrderLifetime.Day ? TimeInForce.Day : TimeInForce.GoodTillCancel;
 			}
 
 			var exec = new ExecOrder { Order = order, Role = role, IsBuy = isBuy, Quantity = quantity };
@@ -5848,6 +5874,9 @@ namespace ATAS.Indicators.Technical
 
 			if (FlatByOn)
 				parts.Add($"flat by {ClockTime(FlatByTime)} New York, last entry {ClockTime(LastEntryTime)}");
+
+			if (!PaperTrading && LiveTimeInForce != OrderLifetime.ConnectionDefault)
+				parts.Add(LiveTimeInForce == OrderLifetime.Day ? "live orders good for the day" : "live orders good till cancelled");
 
 			var config = string.Join(" · ", parts);
 
