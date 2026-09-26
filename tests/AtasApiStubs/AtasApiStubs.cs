@@ -283,6 +283,7 @@ namespace ATAS.DataFeedsCore
 	public class Portfolio
 	{
 		public string AccountID { get; set; }
+		public decimal ClosedPnL { get; set; }          // the session's closed P&L (TotalClosedPnL is all sessions')
 	}
 
 	public class Position

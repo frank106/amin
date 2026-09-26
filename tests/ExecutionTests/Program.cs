@@ -63,6 +63,7 @@ internal static class Program
 		Run("Live: a position closed outside the indicator halts it", LiveClosedOutside);
 		Run("Live: a stop cancelled outside the indicator closes the position", LiveStopCancelledOutside);
 		Run("Live: one live trade per account across charts", LiveOneTradePerAccount);
+		Run("Live: the account's closed P&L counts toward the daily loss limit", LiveAccountPnl);
 		Run("Random markets: the chart is unchanged, the log reconciles (market entries)", () => RandomMarkets(seed: 5, configure: null));
 		Run("Random markets: limit entries, expiry, overlapping signals", () => RandomMarkets(seed: 17, configure: i =>
 		{
@@ -119,12 +120,13 @@ internal static class Program
 		Check(fresh.TickValue == 5 && fresh.CommissionPerContract == 5 && fresh.SlippageTicks == 1 && fresh.AlertOnOrders && fresh.ExecutionLogFolder.Length == 0,
 			"NQ's tick value, the backtest's costs, alerts, the default log folder");
 		Check(fresh.FlatByTime == TimeSpan.Zero && fresh.FlatByLastEntryMinutes == 10, "no flat-by time; with one, no entries in its last 10 minutes");
+		Check(fresh.CountAccountPnl, "live, the account's closed P&L counts toward the limit");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 13, $"thirteen settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 14, $"fourteen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -894,6 +896,51 @@ internal static class Program
 		rows = Rows(ind, "live");
 		Check(!rows.Any(r => r["event"] == "HALT") && Only(rows, "CLOSED")["pnl_usd"] == "390.00" && broker.Calls.Count == 3,
 			$"closed on its take profit: no halt, no extra order ({Trail(rows)})");
+	}
+
+	private static void LiveAccountPnl()
+	{
+		// the scripted BUY on a live chart whose account closed `account` today; null: it was taken
+		string Skipped(decimal account, Action<FvgReactionLiquiditySweep> more = null)
+		{
+			var broker = new FakeBroker();
+			broker.Portfolio.ClosedPnL = account;
+			var ind = Buy(Live(broker, more));
+			OpenBar(ind, 103.5m);
+			var note = broker.Calls.Count > 0 ? null : Rows(ind, "live").FirstOrDefault(r => r["event"] == "SKIPPED")?["note"] ?? "no row";
+			ind.HarnessDispose();
+			return note;
+		}
+
+		// the account lost $1,000 today (by hand, or on another chart): the $1,000 limit is reached
+		var reached = Skipped(-1000);
+		Check(reached == "the account's closed P&L for the session (-$1,000.00, from the trading connection) has reached the daily loss limit (-$1,000.00)",
+			$"skipped: {reached}");
+
+		// $700 down: the trade's $415 of risk no longer fits in what is left
+		var room = Skipped(-700);
+		Check(room == "its stop could lose $415.00, more than the $300.00 left before the daily loss limit", $"skipped for its risk: {room}");
+
+		// a profit elsewhere doesn't loosen the limit; switched off, only the executor's own trades count
+		Check(Skipped(500) == null, "taken with the account up");
+		Check(Skipped(-1000, i => i.CountAccountPnl = false) == null, "taken with the setting off");
+
+		// the panel says why
+		var down = new FakeBroker();
+		down.Portfolio.ClosedPnL = -1200;
+		var ind = Buy(Live(down));
+		Check(Panel(ind).Contains("Execution LIVE stopped for today: the account's closed P&L -$1,200.00 reached the -$1,000.00 limit"),
+			$"the panel: {string.Join(" | ", Panel(ind).Where(s => s.StartsWith("Exec", StringComparison.Ordinal)))}");
+		Check(Only(Rows(ind, "live"), "MODE")["note"].Contains("the account's closed P&L counts toward the limit"), "the MODE row says it counts");
+
+		// paper trading goes by its own trades only
+		var paper = Buy(i =>
+		{
+			i.DailyLossLimit = 1000;
+			i.HarnessTradingManager = down;
+		});
+		OpenBar(paper, 103.5m);
+		Check(Rows(paper).Any(r => r["event"] == "SIGNAL") && !Only(Rows(paper), "MODE")["note"].Contains("closed P&L"), "paper trades all the same");
 	}
 
 	private static void LiveOneTradePerAccount()

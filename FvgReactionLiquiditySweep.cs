@@ -1265,6 +1265,7 @@ namespace ATAS.Indicators.Technical
 		private int _contracts = 1;
 		private decimal _dailyLossLimit;
 		private bool _skipTradesBeyondLimit = true;
+		private bool _countAccountPnl = true;
 		private TimeSpan _flatByTime;
 		private int _flatByLastEntryMinutes = 10;
 		private decimal _tickValue = 5m;
@@ -2165,6 +2166,14 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _skipTradesBeyondLimit;
 			set { _skipTradesBeyondLimit = value; _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Count the account's closed P&L (live)", GroupName = "Execution", Order = 506,
+			Description = "Live: the daily loss limit also goes by the account's closed P&L for the session as the trading connection reports it, so trades by hand and on other charts count too. It can only make the limit stricter.")]
+		public bool CountAccountPnl
+		{
+			get => _countAccountPnl;
+			set { _countAccountPnl = value; _execConfigDirty = true; RedrawChart(); }
 		}
 
 		[Display(Name = "Flat by (New York, 00:00 = off)", GroupName = "Execution", Order = 507,
@@ -4840,9 +4849,13 @@ namespace ATAS.Indicators.Technical
 				return "no tick value: set Tick value";
 
 			var day = CurrentDay(paper);
+			var dayPnl = LimitPnl(day.Pnl, paper);
 
 			if (DailyLossLimit > 0 && day.Pnl <= -DailyLossLimit)
 				return $"the daily loss limit is reached ({Money(day.Pnl)} today, limit {Money(-DailyLossLimit)})";
+
+			if (DailyLossLimit > 0 && dayPnl <= -DailyLossLimit)
+				return $"the account's closed P&L for the session ({Money(dayPnl)}, from the trading connection) has reached the daily loss limit ({Money(-DailyLossLimit)})";
 
 			var price = _execPrice;
 			var direction = trade.IsLong ? 1 : -1;
@@ -4853,7 +4866,7 @@ namespace ATAS.Indicators.Technical
 			if (DailyLossLimit > 0 && SkipTradesBeyondLimit)
 			{
 				var worst = WorstLoss(trade, price, tickValue);
-				var room = DailyLossLimit + day.Pnl;
+				var room = DailyLossLimit + dayPnl;
 
 				if (worst > room)
 					return $"its stop could lose {Money(worst)}, more than the {Money(room)} left before the daily loss limit";
@@ -4933,6 +4946,15 @@ namespace ATAS.Indicators.Technical
 			var entry = !trade.LimitEntry ? price : trade.IsLong ? Math.Min(price, trade.EntryPrice) : Math.Max(price, trade.EntryPrice);
 			var ticks = (entry - trade.StopLossPrice) * direction / TickSize + (trade.LimitEntry ? 1 : 2) * SlippageTicks;
 			return (ticks * tickValue + CommissionPerContract) * Contracts;
+		}
+
+		// The day's result the daily loss limit goes by: the executor's own closed trades, or live,
+		// the account's closed P&L for the session as the connection reports it when that is worse
+		// (trades by hand, other charts) - it can only make the limit stricter
+		private decimal LimitPnl(decimal own, bool paper)
+		{
+			decimal? account = paper || !CountAccountPnl ? null : TradingManager?.Portfolio?.ClosedPnL;
+			return account.HasValue && account.Value < own ? account.Value : own;
 		}
 
 		// $ per tick and contract: the setting, or what the trading connection says when that is more,
@@ -5821,6 +5843,9 @@ namespace ATAS.Indicators.Technical
 			};
 
 			// the executor's own safety settings, named only when they are on
+			if (!PaperTrading && CountAccountPnl)
+				parts.Add("the account's closed P&L counts toward the limit");
+
 			if (FlatByOn)
 				parts.Add($"flat by {ClockTime(FlatByTime)} New York, last entry {ClockTime(LastEntryTime)}");
 
@@ -6043,6 +6068,8 @@ namespace ATAS.Indicators.Technical
 				head = ($"Execution HALTED: {_execHaltReason}", BearColor);
 			else if (ExecuteSignals && DailyLossLimit > 0 && today <= -DailyLossLimit)
 				head = ($"Execution {mode} stopped for today: {Money(today)} reached the {Money(-DailyLossLimit)} limit", BearColor);
+			else if (ExecuteSignals && DailyLossLimit > 0 && LimitPnl(today, paper) <= -DailyLossLimit)
+				head = ($"Execution {mode} stopped for today: the account's closed P&L {Money(LimitPnl(today, paper))} reached the {Money(-DailyLossLimit)} limit", BearColor);
 			else if (ExecuteSignals && !paper && LiveBlocker() is string blocked)
 				head = ($"Execution LIVE not armed: {blocked}", BearColor);
 
