@@ -22,8 +22,8 @@ A custom indicator for the [ATAS](https://atas.net) platform that:
 8. keeps a **scoreboard** of how each setup and each candlestick pattern has done on your chart,
    and checks whether the odds it showed held up;
 9. can **send the orders of its own signals**, off by default: paper (simulated) unless you arm it
-   for a live account, one position at a time, with a daily loss limit and a log of every order
-   (see [Execution](#execution-sending-the-orders)).
+   for a live account, one position at a time and one live trade per account, with a daily loss
+   limit, an optional flat-by time and a log of every order (see [Execution](#execution-sending-the-orders)).
 
 ![Layout preview](docs/preview.png)
 
@@ -571,19 +571,30 @@ It decides nothing the chart has not:
 
 * **Which signals.** Only the ones the chart shows, in real time. The *Signal hours*, *One trade at
   a time*, *Min TP probability* and *Min expected ticks* therefore apply to the orders exactly as they
-  do to the chart. Signals in the history loaded on the chart are never traded.
+  do to the chart. Signals in the history loaded on the chart are never traded. With *Filter trades by
+  worst-case odds* on, a signal is only taken when its odds settled with the worst case inside each
+  bar pass those two filters as well (see [below](#worst-case-odds)).
 * **The entry.** With *Entry: At the signal bar's close*, a market order as soon as the bar has
   closed. With a limit entry, a limit order at the signal's own price; it is cancelled when the
   chart's order expires (*Limit order valid*).
 * **The bracket.** Once filled, the signal's own stop and take profit, from whichever *Bracket size*
   is on (fixed ticks, multiples of the ATR, or beyond the signal bar), the stop sent first, both in
   one OCO group. When the trade reaches its break-even trigger, the stop moves to its break-even
-  price.
+  price - or, with *Break-even stop from the fill* on, to the same profit counted from the
+  position's average fill, so slippage on the entry doesn't come off it.
 * **The exit.** The stop or the take profit, or at market as soon as the chart's trade ends while
   the position is still open: a take profit price only touched, *Max bars in trade*, *Close trades
   at session end*. The position never outlives the chart's trade.
+* **The flat-by time** (off): with *Flat by (New York)* set, e.g. 15:55, the position closes at market
+  and a waiting entry is cancelled at that time each trading day, whatever the chart's trade does
+  next, and no new entry goes in during the last *No new entries in the last (minutes)* (10) before it,
+  until the trading day turns at 18:00. A position still open when the day turns (a flat-by time in
+  CME's 17:00-18:00 break, when nothing trades) closes at the new day's first price.
 * **One position at a time**, even with *One trade at a time* off: a signal that comes while a
   position is open is logged as skipped.
+* **One live trade per account**, across the charts of one ATAS: a live entry first takes the account,
+  and another chart's signal on the same account is skipped until that position is done, or the
+  indicator holding it is removed. Paper trading doesn't touch an account and is never held back.
 * **The size**: *Contracts per trade* (1).
 
 The executor follows its own copy of the signal's trade through the same prices and rules as the
@@ -600,8 +611,28 @@ slippage and commission, could take the day past the limit, so a single trade ca
 The day's result is read back from the log when ATAS restarts, so a restart doesn't reset it. Paper
 and live count apart.
 
-It counts the trades of this indicator on this chart only, not manual trades or other charts:
-your broker's or prop firm's own limit still applies. Run the executor on one chart per account.
+Live, it also goes by the account's closed P&L for the session as the trading connection reports it
+(*Count the account's closed P&L (live)*, on), whichever is worse, so trades by hand and on other
+charts count too - for the limit itself and for skipping trades that could breach it. That can only
+make the limit stricter. Where the session is cut is the connection's business, usually the same
+18:00 New York for CME futures. Paper trading counts its own trades only. Your broker's or prop
+firm's own limit still applies, and each computer only reads its own log: run the executor on one
+computer at a time.
+
+### Worst-case odds
+
+On historical bars the order of a bar's high and low is unknown, and with a break-even step inside a
+bar the chart's default rule (the nearer extreme first) settles trades optimistically: by about 2.6
+ticks a trade for the default bracket on the backtest's real ticks. The labels' odds come from that
+history, and so do *Min TP probability* and *Min expected ticks*, which pick the signals the executor
+takes.
+
+So every trade is also settled, on a copy, with the worst case inside each bar (the stop first
+whenever the order would decide it), into odds of their own; the labels keep theirs. With *Filter
+trades by worst-case odds* on, the executor only takes a signal whose worst-case odds pass *Min TP
+probability* and *Min expected ticks* too (with both filters off it changes nothing). The worst case
+errs the other way - 4-7 ticks a trade too low on the backtest's ticks - so a signal that passes it
+has a margin. Every log row that names a signal carries both EVs (`ev_ticks`, `ev_worst_ticks`).
 
 The result of each trade uses *Tick value* (5 for NQ, 0.5 for MNQ) and *Commission* (5.00 a contract
 a round trip, the backtest's one tick on NQ; set what you pay). When the trading connection reports
@@ -635,10 +666,36 @@ disappears from the account (closed by hand, say) halts it too, and so does a cl
 rejected, which you then have to close yourself. Removing the indicator cancels an entry that is still waiting; an
 open position keeps its stop and take profit at the broker, but nothing moves or closes it any more.
 
+A signal is also skipped while another chart holds a live trade on the same account (one live trade
+per account at a time).
+
+*Time in force (live orders)* sets how long the stop, the take profit and a limit entry stay at the
+broker: the connection's default (as ATAS sends orders), Day, or Good till cancelled; market orders
+are left alone. A stop that expires counts as cancelled - the position is closed and execution halts -
+so a position that may be held through the session break wants Good till cancelled, or a *Flat by*
+time before the break. Some connections only take Day orders, and a refused stop also closes the
+position and halts: try the setting on a simulated account first.
+
 The live side has been tested against a simulated broker only (see [tests/README.md](tests/README.md)),
 not against ATAS's own connection. Before it trades a funded account, run it where mistakes are free:
-paper trading on a live chart, then ATAS's Market Replay or a simulated account with *Paper trading*
-off, and check its log against what the broker shows.
+
+1. **Paper trading on a live chart**, for weeks. Then sum the log up with the
+   [log report](tests/README.md#logreport): the trades by setup and confirmation, and the labels'
+   odds against what happened. The backtest's bars have no footprint, so this is the only test the
+   fill, delta and order-flow signals get.
+2. **ATAS's Market Replay, or a simulated account, with *Paper trading* off**: the real order calls,
+   through ATAS's own connection. Check the log against what the broker shows, fill for fill.
+3. On that simulated account, **break things on purpose**: close the position by hand, cancel its
+   stop, disconnect the feed and reconnect, restart ATAS with a position open. Each should end as
+   described above - a halt, or the position left with its stop and take profit at the broker.
+   Check that no position is ever left without a stop.
+4. **Live settings**: a *Daily loss limit* that fits the account, a *Flat by* time if the position
+   mustn't be held into the evening, the *Time in force* the connection takes, and one contract to
+   start.
+5. **The same ATAS version on every computer** that builds the indicator, and the executor on one
+   computer at a time. It was written against ATAS X 8.0.15; classic ATAS 8.0.14 builds it too (see
+   [Install](#windows-classic-atas-platform)), but only the steps above show that its trading
+   connection behaves the same.
 
 ### The log
 
@@ -664,17 +721,26 @@ chart and the scoreboard:
 With execution on, the panel adds a line for the executor (mode, size, the day's result against the
 limit), one for the open position and one for the last thing it did.
 
+A day's file started by an earlier version keeps its own columns, so after an update a restart still
+reads the day back. To sum the logs up - the trades by setup, confirmations, hour and the odds on
+their labels, next to what the chart's own trades made - run
+`dotnet run -c Release --project tests/LogReport` (see [tests/README.md](tests/README.md#logreport)).
+
 ### Limits of the executor
 
 * The chart's *Close trades at session end* acts on the first price of the next session, after
-  CME's daily break, so a position can be held through it. The executor has no clock of its own: to
-  be flat by a given time, end *Signal hours* early enough (a custom window) and watch the open
-  position.
+  CME's daily break, so a position can be held through it. To be flat by a given time, set *Flat by*;
+  the executor still has no clock of its own, and acts on the first price at or after that time.
 * A live limit entry can fill on a touch that the chart doesn't count as a fill. Unless price then
-  trades through it, the position closes at market when the chart's order expires.
-* The break-even price is the signal's, counted from the signal's entry, not from your fill.
-* Orders use the connection's default time in force. A stop that expires at the broker counts as
-  cancelled: the position is closed and the executor halts.
+  trades through it, the position closes at market when the chart's order expires. That keeps the
+  executor to trades the chart counts: holding such a position on with its bracket would trade what
+  the statistics never saw, for no expected gain.
+* The break-even trigger is the chart trade's; *Break-even stop from the fill* only changes where the
+  stop moves to.
+* A stop that expires at the broker counts as cancelled: the position is closed and the executor
+  halts. *Time in force* sets how long the orders stay.
+* One live trade per account holds across the charts of one ATAS, not across computers or other
+  programs; the account's closed P&L in the daily loss limit covers those, once their trades close.
 
 ## Install
 
@@ -716,9 +782,13 @@ tools, then copy one file into ATAS X.
    ```
 
    If ATAS is not in `C:\Program Files (x86)\ATAS Platform`, add `-p:ATAS_BASE="D:\path\to\ATAS Platform"`.
-   Or drop `FvgReactionLiquiditySweep.cs` into an indicator project you already have.
+   The build reads that ATAS: it makes the DLL for the .NET it runs on (`-p:TargetFrameworks=net8.0-windows`
+   makes another one), and uses the chart time zone it has - `TimeZoneOffset`, or on older versions
+   such as 8.0.14 `TimeZone` in hours.
+   Or drop `FvgReactionLiquiditySweep.cs` into an indicator project you already have (on ATAS 8.0.14
+   and older, define `ATAS_TIMEZONE_HOURS` there).
 2. Copy `bin\Release\net10.0-windows\FvgReactionLiquiditySweep.dll` into `%APPDATA%\ATAS\Indicators`
-   (or `Documents\ATAS\Indicators`). ATAS builds that still run on .NET 8 need the DLL from
+   (or `Documents\ATAS\Indicators`). ATAS builds that still run on .NET 8 get the DLL in
    `bin\Release\net8.0-windows` instead.
 3. Restart ATAS and add **FVG Reaction + Liquidity Sweep** from the *My Indicators* group.
 
@@ -809,6 +879,12 @@ show while the chart is open.
 | | Contracts per trade | 1 | |
 | | Daily loss limit ($, 0 = off) | 0 | no new entries for the rest of the trading day once the day's closed trades lost this much; live trading needs one |
 | | Skip trades that could breach the limit | on | also skip a signal whose stop could take the day past the limit |
+| | Count the account's closed P&L (live) | on | the limit also goes by the account's closed P&L for the session, when that is worse |
+| | Flat by (New York, 00:00 = off) | off | close the position and cancel a waiting entry at this time each trading day |
+| | No new entries in the last (minutes) | 10 | with a flat-by time: no entries this long before it, until the day turns at 18:00 |
+| | Filter trades by worst-case odds | off | a signal's worst-case odds must pass Min TP probability and Min expected ticks too |
+| | Break-even stop from the fill | off | the break-even stop keeps its profit from the average fill, not from the signal's price |
+| | Time in force (live orders) | the connection's default | or Day, or Good till cancelled, for the stop, the take profit and a limit entry |
 | | Tick value ($ per contract) | 5 | NQ; 0.5 for MNQ. The larger of this and the connection's is used |
 | | Commission ($ per contract, round trip) | 5.00 | taken off each trade's result |
 | | Slippage (ticks per market / stop fill) | 1 | paper fills, and the risk of a new trade |
@@ -826,7 +902,15 @@ New in this version, off by default, so the chart, the signals and their odds st
 
 * **execution**: the indicator can send the orders of its own signals, paper by default, with
   position sizing, a daily loss limit, live orders only once armed for the chart's account, and a
-  CSV log of every order. See [Execution](#execution-sending-the-orders).
+  CSV log of every order. See [Execution](#execution-sending-the-orders). Since then:
+  * **safety**: one live trade per account across charts; live, the account's closed P&L counts
+    toward the daily loss limit (on); an optional flat-by time; time in force for live orders; an
+    optional break-even stop counted from the fill;
+  * **worst-case odds**: every trade is also settled with the worst case inside each bar, the log
+    carries that EV next to the label's, and the executor can filter on it;
+  * **the log report** (`tests/LogReport`) sums the executor's logs up;
+  * **Windows**: the build makes the DLL for the installed ATAS only, and reads which chart time
+    zone property that ATAS version has, so classic ATAS 8.0.14 builds it.
 
 New in the previous version, all off by default:
 
@@ -890,5 +974,6 @@ randomised markets, including a simulated order book — see [tests/README.md](t
 `tests/ExecutionTests` checks the execution side: paper orders and exits, the daily loss limit, the
 log, and the live order calls against a simulated broker.
 `tests/Backtest` replays a CSV of bars through the same code, for a backtest over any stretch of
-history outside ATAS, and `tests/PathCheck` measures how far a backtest on 1-minute bars is off
-for given settings. They are not part of the indicator build.
+history outside ATAS, `tests/PathCheck` measures how far a backtest on 1-minute bars is off
+for given settings, and `tests/LogReport` sums the executor's logs up. They are not part of the
+indicator build.

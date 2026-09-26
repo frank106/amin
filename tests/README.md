@@ -13,6 +13,7 @@ without an ATAS install:
   the broker's answers to orders. Never reference it from the real indicator build.
 * `IndicatorTests` — a console runner (exit code 0 = everything passed).
 * `ExecutionTests` — the same for the execution side (see [below](#execution)).
+* `LogReport` — sums the executor's logs up (see [below](#logreport)).
 
 ```
 dotnet run -c Release --project tests/IndicatorTests
@@ -115,6 +116,15 @@ dotnet run -c Release --project tests/IndicatorTests -p:CrossColor=true   # ATAS
 dotnet build -c Release tests/IndicatorTests -p:WpfColor=true              # real WPF type, compile only
 ```
 
+Older ATAS versions (classic 8.0.14) give the chart's time zone as `InstrumentInfo.TimeZone`, in
+whole hours, instead of `TimeZoneOffset`; the real build reads which one the installed ATAS has. To
+run every check on that version of the code:
+
+```
+dotnet run -c Release --project tests/IndicatorTests -p:TimeZoneHours=true
+dotnet run -c Release --project tests/ExecutionTests -p:TimeZoneHours=true
+```
+
 ## Execution
 
 `ExecutionTests` checks what the indicator does with *Execute signals* on. It leaves the signal
@@ -154,16 +164,50 @@ What it checks:
   (closed at market, halted); a stop cancelled outside the indicator (closed and halted a few
   seconds on, but not when its take profit's fill cancelled it); a position closed outside the
   indicator (halted);
-* **random markets**, streamed tick by tick to one indicator executing and one not, under four
+* **the safety settings**: one live trade per account across charts, given back when the position is
+  done or its chart removed, and never holding paper back; live, the account's closed P&L reaching
+  the limit or leaving too little room for a trade's stop, and not with the setting off or on
+  paper; the flat-by time closing a position at market (the chart's trade carrying on), cancelling a
+  waiting entry, skipping later signals until 18:00, and closing at the new day's first price when
+  it falls in the daily break; time in force on the live stop, take profit and limit entry only,
+  kept when the stop moves; the break-even stop counted from the average fill, on the tick grid;
+* **the log**: a day's file an earlier version started keeps its columns and is still read back;
+  a new one has every column; the log report sums a scripted day up;
+* **random markets**, streamed tick by tick to one indicator executing and one not, under five
   settings: the chart's trades and panel counts must come out identical, and the log must
-  reconcile with the chart - one decision row per real-time signal, orders only from shown
-  signals at their prices, one position at a time, each trade copy ending as the chart's trade did,
-  each day's results adding up, and the breaker tripping on the first close at or below the limit
-  and at no other time.
+  reconcile with the chart - one decision row per real-time signal, each with its label's and its
+  worst-case EV, orders only from shown signals at their prices, one position at a time, each trade
+  copy ending as the chart's trade did, each day's results adding up, the breaker tripping on the
+  first close at or below the limit and at no other time, and the log report adding up to the log,
+  table by table. With *Filter trades by worst-case odds* on, every trade taken passes on both odds
+  and the signals only the worst case failed are skipped.
 
-Every one of 24 deliberate bugs put into the execution code (a hidden signal traded, the breaker
+`IndicatorTests` checks the worst-case odds themselves: with the chart settling the worst case too,
+they equal the labels' trade by trade; with the default rule they differ and lean lower.
+
+Every one of 24 deliberate bugs put into the execution code as first written (a hidden signal traded, the breaker
 late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes
 at least one check fail.
+
+## LogReport
+
+`LogReport` sums up the executor's CSV logs - weeks of paper trading, or the live account's:
+
+```
+dotnet run -c Release --project tests/LogReport
+dotnet run -c Release --project tests/LogReport -- D:\logs --mode live --from 2026-10-01 --to 2026-10-31
+```
+
+Without a folder it reads the indicator's default one (`%APPDATA%\ATAS\FvgExecution` on Windows,
+`~/Library/Application Support/ATAS/FvgExecution` on a Mac), paper logs unless `--mode live` or `all`.
+It reports the closed trades - all, buys and shorts, then by setup, number of confirmations, each
+confirmation (trend, delta, order flow, pattern), the EV on the label and the New York hour - each
+with its TP / BE / SL and other endings, ticks a trade, dollars after commission, the label's and the
+worst case's average EV, and what the executor made against the chart's own trades (slippage, exits
+at market). It says how many standard errors the average is from zero, and why signals were skipped.
+
+The backtest's bars have no footprint, so this is where the Fill signals and the delta and order-flow
+confirmations get judged. A row with a handful of trades is noise: wait for a few dozen.
 
 ## Backtest
 

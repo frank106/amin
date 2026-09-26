@@ -1,8 +1,8 @@
 // Sums up the executor's CSV logs - see ExecutionLogReport.cs and tests/README.md:
 //   dotnet run -c Release --project tests/LogReport
 //   dotnet run -c Release --project tests/LogReport -- D:\logs --mode live --from 2026-10-01 --to 2026-10-31
-// Without a folder it reads ATAS/FvgExecution in the application data folder, where the indicator
-// logs by default (%APPDATA%\ATAS\FvgExecution on Windows). Paper trading unless --mode says.
+// Without a folder it reads the indicator's default one: %APPDATA%\ATAS\FvgExecution on Windows,
+// ~/Library/Application Support/ATAS/FvgExecution on a Mac. Paper trading unless --mode says.
 
 using System;
 using System.Collections.Generic;
@@ -62,8 +62,14 @@ internal static class Program
 			return 2;
 		}
 
+		// where the indicator logs by default: ATAS X on a Mac keeps it under Library/Application
+		// Support, which a plain .NET program there doesn't call its application data folder
 		if (paths.Count == 0)
-			paths.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ATAS", "FvgExecution"));
+		{
+			paths.Add(OperatingSystem.IsMacOS()
+				? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library", "Application Support", "ATAS", "FvgExecution")
+				: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ATAS", "FvgExecution"));
+		}
 
 		// one file per trading day, instrument and mode: 2026-09-25_NQ_paper.csv
 		bool Wanted(string file)
