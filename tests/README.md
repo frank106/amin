@@ -171,19 +171,30 @@ What it checks:
   waiting entry, skipping later signals until 18:00, and closing at the new day's first price when
   it falls in the daily break; time in force on the live stop, take profit and limit entry only,
   kept when the stop moves; the break-even stop counted from the average fill, on the tick grid;
+* **the daily profit target**: made on the close that reaches it (a `TARGET` row, an alert, the
+  panel), the rest of the day's signals skipped, still made after a restart, and the next day from
+  zero;
+* **the instrument's costs**: an MNQ chart's $0.50 a tick and $1.50 commission, in a trade's
+  result and in its risk; the product under every feed's name; the settings with it off, on an
+  instrument the executor doesn't know, or when the tick size isn't the contract's;
+* **the day's trend** as the executor sees it: the scripted BUY on a day going up is taken, the
+  scripted SHORT on a day with no clear trend is no signal, and the panel says which way the day goes;
 * **the log**: a day's file an earlier version started keeps its columns and is still read back;
   a new one has every column; the log report sums a scripted day up;
-* **random markets**, streamed tick by tick to one indicator executing and one not, under five
+* **random markets**, streamed tick by tick to one indicator executing and one not, under six
   settings: the chart's trades and panel counts must come out identical, and the log must
   reconcile with the chart - one decision row per real-time signal, each with its label's and its
   worst-case EV, orders only from shown signals at their prices, one position at a time, each trade
   copy ending as the chart's trade did, each day's results adding up, the breaker tripping on the
-  first close at or below the limit and at no other time, and the log report adding up to the log,
-  table by table. With *Filter trades by worst-case odds* on, every trade taken passes on both odds
-  and the signals only the worst case failed are skipped.
+  first close at or below the limit and the profit target on the first close that makes it, and at
+  no other time, and the log report adding up to the log, table by table. With *Filter trades by
+  worst-case odds* on, every trade taken passes on both odds and the signals only the worst case
+  failed are skipped.
 
 `IndicatorTests` checks the worst-case odds themselves: with the chart settling the worst case too,
-they equal the labels' trade by trade; with the default rule they differ and lean lower.
+they equal the labels' trade by trade; with the default rule they differ and lean lower. It also
+checks the day's trend on a random market with volume: with *Only trade with the day's trend* on,
+every signal goes the day's way, worked out bar by bar with the system's own New York clock.
 
 Every one of 24 deliberate bugs put into the execution code as first written (a hidden signal traded, the breaker
 late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes

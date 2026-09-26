@@ -55,6 +55,9 @@ internal static class Program
 		Run("Time exits: Max bars in trade and the session end close at market", TimeExits);
 		Run("Flat by: closed at market at a set time, no entries before it, the next day again", FlatBy);
 		Run("Break-even stop from the fill: the locked profit counted from the average fill", BreakEvenFromTheFill);
+		Run("Daily profit target: done for the day once the closed trades make it", DailyProfitTarget);
+		Run("Costs from the instrument: MNQ's tick value and commission, the settings otherwise", CostsByInstrument);
+		Run("Day's trend: the bot trades its way only", DayTrend);
 		Run("History never trades", HistoryNeverTrades);
 		Run("Recalculating the chart keeps the open position and its orders", RecalculationKeepsThePosition);
 		Run("Panel lines and alerts", PanelAndAlerts);
@@ -95,6 +98,10 @@ internal static class Program
 			Check(dropped.Count > 0 && dropped.All(r => Int(r["ev_ticks"]) >= 1 && Int(r["ev_worst_ticks"]) < 1),
 				$"signals the chart showed but the worst case failed are skipped: {dropped.Count}");
 		}));
+		Run("Random markets: the profit target ends each day", () => RandomMarkets(seed: 43, configure: i => i.DailyProfitTargetTicks = 30,
+			expect: rows => Check(rows.Any(r => r["event"] == "TARGET")
+				&& rows.Any(r => r["event"] == "SKIPPED" && r["note"].StartsWith("the daily profit target is reached", StringComparison.Ordinal)),
+				$"the target was made and signals were skipped after it: {rows.Count(r => r["event"] == "TARGET")} targets")));
 		Run("Random markets: the loss limit trips and stops each day", () => RandomMarkets(seed: 31, configure: i =>
 		{
 			i.DailyLossLimit = 150;
@@ -140,12 +147,14 @@ internal static class Program
 		Check(fresh.LiveTimeInForce == FvgReactionLiquiditySweep.OrderLifetime.ConnectionDefault, "live orders at the connection's time in force");
 		Check(!fresh.BreakEvenFromFill, "the break-even stop at the signal's price, as on the chart");
 		Check(!fresh.FilterByWorstCase, "the signals the chart shows, by its own odds");
+		Check(fresh.DailyProfitTargetTicks == 140 && fresh.CostsFromInstrument && fresh.OnlyWithDayTrend,
+			"a +140t daily profit target, the instrument's own costs, signals with the day's trend");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 17, $"seventeen settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 19, $"nineteen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -173,8 +182,8 @@ internal static class Program
 		var ind = Buy();
 		var rows = Rows(ind);
 		Check(rows.Count == 1 && rows[0]["event"] == "MODE"
-			&& rows[0]["note"] == "paper · 1 contract · no daily loss limit · tick value $5.00 · commission $5.00 · slippage 1t · "
-			+ "TP 80t · SL 80t · BE +40t → +20t · entry at the close · signals all hours · one trade at a time",
+			&& rows[0]["note"] == "paper · 1 contract · no daily loss limit · daily profit target +140t · tick value $5.00 · commission $5.00 · slippage 1t · "
+			+ "TP 80t · SL 80t · BE +40t → +20t · entry at the close · signals all hours · one trade at a time · NQ's tick value and commission",
 			$"a MODE row once real time starts: {Describe(rows)}");
 
 		StreamBar(ind, new[] { 103.5m, 104, 110, 109 });                      // 20: its first tick closes bar 19 -> BUY
@@ -542,6 +551,116 @@ internal static class Program
 			$"closed at the next session's first price: {Describe(rows)}");
 	}
 
+	private static void DailyProfitTarget()
+	{
+		// a +70t target: the TP at +79t reaches it
+		var ind = Buy(i =>
+		{
+			i.DailyProfitTargetTicks = 70;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly;
+			i.EnableShortSignals = false;
+		});
+		StreamBar(ind, new[] { 103.5m, 104, 110, 109 });
+		StreamBar(ind, new[] { 109m, 115, 124 });                             // TP: +79t
+
+		var rows = Rows(ind);
+		var target = Only(rows, "TARGET");
+		Check(rows.IndexOf(target) == rows.IndexOf(Only(rows, "CLOSED")) + 1
+			&& target["note"] == "daily profit target reached: +79t today, target +70t; no new entries until the next trading day",
+			$"the target right after the close that reached it: {target["note"]}");
+		Check(ind.Alerts.Contains("Daily profit target reached (+79t today): no new paper entries until the next trading day"), "an alert says so");
+		Check(Panel(ind).Contains("Execution PAPER done for today: +79t reached the +70t profit target"), "and the panel");
+
+		// the same day, another BUY: skipped
+		StreamPattern(ind, 130);
+		var skipped = Only(Rows(ind), "SKIPPED");
+		Check(skipped["note"] == "the daily profit target is reached (+79t today, target +70t)", $"skipped: {skipped["note"]}");
+
+		// a restart the same day reads the day's ticks back
+		var restarted = Buy(i => i.DailyProfitTargetTicks = 70, ind.ExecutionLogFolder);
+		OpenBar(restarted, 103.5m);
+		Check(Rows(restarted).Last(r => r["event"] == "SKIPPED")["note"] == "the daily profit target is reached (+79t today, target +70t)",
+			"still reached after a restart");
+
+		// the next trading day starts from zero
+		StreamPattern(ind, 40, Start.Date.AddHours(23).AddMinutes(5));
+		Check(Rows(ind).Count(r => r["event"] == "SIGNAL") == 2, $"the next day's BUY is taken: {Trail(Rows(ind))}");
+	}
+
+	private static void CostsByInstrument()
+	{
+		// the product in the names data feeds give their contracts
+		var productOf = IndicatorType.GetMethod("ProductOf", BindingFlags.NonPublic | BindingFlags.Static);
+		string Product(string symbol) => (string)productOf.Invoke(null, new object[] { symbol });
+		Check(Product("NQZ6") == "NQ" && Product("MNQZ26") == "MNQ" && Product("NQ 12-26") == "NQ" && Product("NQZ6.CME@RITHMIC") == "NQ"
+			&& Product("F.US.ENQZ26") == "NQ" && Product("mesh7") == "MES" && Product("M2KZ6") == "M2K" && Product("NQ") == "NQ",
+			"NQ, MNQ, MES and M2K, whatever the feed calls them");
+		Check(Product("6EZ6") == null && Product("XYZ") == null && Product("") == null && Product(null) == null, "and nothing it doesn't know");
+
+		void Mnq(FvgReactionLiquiditySweep i) => i.InstrumentInfo = new InstrumentInfo { TickSize = Tick, Instrument = "MNQZ6" };
+
+		// an MNQ chart: $0.50 a tick and $1.50 a round trip, whatever the two settings say
+		var mnq = Buy(Mnq);
+		StreamBar(mnq, new[] { 103.5m, 104, 110, 109 });
+		StreamBar(mnq, new[] { 109m, 115, 124 });                             // TP: +79t
+		var rows = Rows(mnq);
+		var mode = Only(rows, "MODE")["note"];
+		Check(Only(rows, "CLOSED")["pnl_usd"] == "38.00", $"+79t x $0.50 - $1.50 = $38.00: {Only(rows, "CLOSED")["pnl_usd"]}");
+		Check(mode.Contains(" · tick value $0.50 · commission $1.50 · ") && mode.EndsWith(" · MNQ's tick value and commission", StringComparison.Ordinal),
+			$"the MODE row: {mode}");
+
+		// the risk of a trade in MNQ dollars: 82 ticks x $0.50 + $1.50
+		var tight = Buy(i =>
+		{
+			Mnq(i);
+			i.DailyLossLimit = 40;
+		});
+		OpenBar(tight, 103.5m);
+		Check(Only(Rows(tight), "SKIPPED")["note"] == "its stop could lose $42.50, more than the $40.00 left before the daily loss limit",
+			$"skipped for its MNQ risk: {Describe(Rows(tight))}");
+
+		// switched off: the two settings
+		var off = Buy(i =>
+		{
+			Mnq(i);
+			i.CostsFromInstrument = false;
+			i.TickValue = 0.5m;
+			i.CommissionPerContract = 1.24m;
+		});
+		StreamBar(off, new[] { 103.5m, 104, 110, 109 });
+		StreamBar(off, new[] { 109m, 115, 124 });
+		Check(Only(Rows(off), "CLOSED")["pnl_usd"] == "38.26" && !Only(Rows(off), "MODE")["note"].Contains("MNQ's"), "the settings when switched off");
+
+		// an instrument it doesn't know, or one whose tick size isn't the contract's: the settings, and the MODE row says why
+		var unknown = Buy(i => i.InstrumentInfo = new InstrumentInfo { TickSize = Tick, Instrument = "ABCZ6" });
+		Check(Only(Rows(unknown), "MODE")["note"].EndsWith(" · tick value and commission from the settings: ABCZ6 is not a contract the executor knows", StringComparison.Ordinal),
+			$"an unknown instrument: {Only(Rows(unknown), "MODE")["note"]}");
+
+		var odd = NewIndicator(i => i.InstrumentInfo = new InstrumentInfo { TickSize = 0.5m, Instrument = "MNQZ6" });
+		Check(IndicatorType.GetMethod("EffectiveCommission", Private).Invoke(odd, null) is decimal c && c == 5,
+			"MNQ with a 0.50 tick is not trusted to be MNQ");
+	}
+
+	private static void DayTrend()
+	{
+		// the scripted BUY at 103.50 comes with the day going up: above its 09:30 open (100) and VWAP
+		var buy = Buy(i => i.OnlyWithDayTrend = true);
+		OpenBar(buy, 103.5m);
+		Check(Rows(buy).Any(r => r["event"] == "SIGNAL"), "the BUY is taken");
+		Check(Panel(buy).Any(s => s.StartsWith("Day trend up (above the open and VWAP): buys only · open 100.00 · VWAP ", StringComparison.Ordinal)),
+			$"the panel: {string.Join(" | ", Panel(buy).Where(s => s.Contains("trend")))}");
+
+		// the scripted SHORT closes at 100.25: under the VWAP, but still over the day's open - no
+		// clear trend, so no SHORT
+		var shortSide = LiveIndicator(FvgSetup(), i => i.OnlyWithDayTrend = true);
+		StreamBar(shortSide, new[] { 102.75m, 103.25m, 102, 103 });           // 19
+		StreamBar(shortSide, new[] { 103m, 103.25m, 100, 100.25m }, delta: -30); // 20
+		OpenBar(shortSide, 100.25m);
+		Check(Trades(shortSide).Count == 0 && !Rows(shortSide).Any(r => r["event"] == "SIGNAL" || r["event"] == "SKIPPED"),
+			"no SHORT on a day that isn't going down");
+		Check(Panel(shortSide).Any(s => s.StartsWith("No clear day trend (between the open and VWAP): no signals", StringComparison.Ordinal)), "the panel says why");
+	}
+
 	private static void BreakEvenFromTheFill()
 	{
 		// filled at 103.75, a tick above the signal's 103.50: the stop moves to 108.75, +20t from the fill
@@ -557,7 +676,7 @@ internal static class Program
 
 		var closed = Only(rows, "CLOSED");
 		Check(closed["pnl_ticks"] == "19" && closed["pnl_usd"] == "90.00", $"+19t, where the signal's break-even price made +18t: {closed["pnl_ticks"]}");
-		Check(Only(rows, "MODE")["note"].EndsWith(" · break-even counted from the fill", StringComparison.Ordinal), "the MODE row says so");
+		Check(Only(rows, "MODE")["note"].Contains(" · break-even counted from the fill · "), "the MODE row says so");
 
 		// live, two contracts filled at 103.75 and 104.00: +20t from their 103.875 average, up to the
 		// next tick, is 109.00
@@ -589,7 +708,7 @@ internal static class Program
 			i.EnableShortSignals = false;
 		});
 		var mode = Only(Rows(ind), "MODE")["note"];
-		Check(mode.EndsWith(" · overlapping signals on the chart · flat by 09:52 New York, last entry 09:51", StringComparison.Ordinal), $"the MODE row names it: {mode}");
+		Check(mode.Contains(" · overlapping signals on the chart · flat by 09:52 New York, last entry 09:51 · "), $"the MODE row names it: {mode}");
 
 		StreamBar(ind, new[] { 103.5m, 104, 106, 105 });                      // 20 (09:50): in at 103.75
 		StreamBar(ind, new[] { 105m, 106, 104, 105.5m });                     // 21 (09:51)
@@ -1065,7 +1184,7 @@ internal static class Program
 
 		AddTick(ind, bar, 115);
 		Check(gtc.Calls.Single(c => c.Name == "modify").NewOrder.TimeInForce == TimeInForce.GoodTillCancel, "and stay so when the stop moves");
-		Check(Only(Rows(ind, "live"), "MODE")["note"].EndsWith(" · live orders good till cancelled", StringComparison.Ordinal), "the MODE row says so");
+		Check(Only(Rows(ind, "live"), "MODE")["note"].Contains(" · live orders good till cancelled · "), "the MODE row says so");
 		ind.HarnessDispose();
 
 		// a limit entry good for the day
@@ -1214,6 +1333,7 @@ internal static class Program
 				i.StopLossTicks = 24;
 				i.BreakEvenTriggerTicks = 12;
 				i.BreakEvenStopTicks = 6;
+				i.DailyProfitTargetTicks = 0;
 				configure?.Invoke(i);
 				i.ExecuteSignals = execute;
 			});
@@ -1315,6 +1435,32 @@ internal static class Program
 
 			Check(breakers.Count == 1 && dayRows.IndexOf(breakers[0]) == dayRows.IndexOf(trip) + 1, $"day {day.Key}: the breaker right after the close that reached the limit");
 			Check(!dayRows.Skip(dayRows.IndexOf(trip)).Any(r => r["event"] == "SIGNAL"), $"day {day.Key}: nothing taken after the breaker");
+		}
+
+		// the profit target ends the day on the first close that makes it, and at no other time
+		foreach (var day in rows.GroupBy(r => r["trading_day"]))
+		{
+			var dayRows = day.ToList();
+			var targets = dayRows.Where(r => r["event"] == "TARGET").ToList();
+			var made = 0m;
+			var reached = (Dictionary<string, string>)null;
+
+			foreach (var row in dayRows.Where(r => r["event"] == "CLOSED"))
+			{
+				made += Dec(row["pnl_ticks"]);
+
+				if (reached == null && executing.DailyProfitTargetTicks > 0 && made >= executing.DailyProfitTargetTicks)
+					reached = row;
+			}
+
+			if (reached == null)
+			{
+				Check(targets.Count == 0, $"day {day.Key}: no target without making it");
+				continue;
+			}
+
+			Check(targets.Count == 1 && dayRows.IndexOf(targets[0]) == dayRows.IndexOf(reached) + 1, $"day {day.Key}: the target right after the close that made it");
+			Check(!dayRows.Skip(dayRows.IndexOf(reached)).Any(r => r["event"] == "SIGNAL"), $"day {day.Key}: nothing taken after the target");
 		}
 
 		foreach (var row in closed)
@@ -1461,6 +1607,7 @@ internal static class Program
 			LevelOvernight = false,
 			LevelOpeningRange = false,
 			LevelEqual = false,
+			OnlyWithDayTrend = false,
 			ExecuteSignals = true,
 			ExecutionLogFolder = folder ?? NewFolder()
 		};

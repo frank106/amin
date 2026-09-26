@@ -7,6 +7,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 using ATAS.DataFeedsCore;
@@ -683,6 +684,9 @@ namespace ATAS.Indicators.Technical
 			public decimal FillThreshold;      // what a big fill takes now (0 = not known yet)
 			public decimal RestingThreshold;   // what a resting order takes now
 			public DateTime LastBarTime;       // for the New York clock
+			public int DayTrend;               // the day's trend at the last closed bar: 1 up, -1 down, 0 none
+			public decimal DayOpen;            // what it is measured against (0: not known yet)
+			public decimal DayVwap;
 			public Scoreboard Board;
 			public List<(string Text, Color Color)> Execution;   // null while execution is off
 		}
@@ -795,6 +799,7 @@ namespace ATAS.Indicators.Technical
 			public bool IsLong;
 			public decimal Contracts;
 			public decimal TickValue;        // $ per tick and contract, fixed at the entry
+			public decimal Commission;       // $ a contract a round trip, fixed at the entry
 			public string Account;
 			public decimal Entered;          // contracts filled on the entry
 			public decimal Open;             // contracts held now
@@ -825,8 +830,10 @@ namespace ATAS.Indicators.Technical
 		{
 			public DateTime Day = DateTime.MinValue;
 			public decimal Pnl;
+			public decimal Ticks;            // made a contract, summed over the closed trades
 			public int Trades;
 			public bool Tripped;             // the daily loss limit was reached (logged once)
+			public bool TargetReached;       // the daily profit target was reached (logged once)
 		}
 
 		private enum LiveAction
@@ -971,6 +978,14 @@ namespace ATAS.Indicators.Technical
 		// the trading day being built (New York time, from 18:00): its regular-hours, overnight
 		// and opening ranges so far, and the last regular session that ended
 		private DateTime _tradingDay;
+
+		// The day's trend: where it is counted from (the regular session's first bar once it has
+		// opened, the trading day's first before), that bar's open, and the VWAP since
+		private DateTime _trendDay;
+		private bool _trendFromRegular;
+		private decimal _trendOpen;
+		private decimal _trendPriceVolume;
+		private decimal _trendVolume;
 		private bool _hasRth;
 		private decimal _rthHigh;
 		private decimal _rthLow;
@@ -1199,6 +1214,7 @@ namespace ATAS.Indicators.Technical
 		private int _confluenceBars = 10;
 		private int _trendEmaPeriod = 50;
 		private bool _onlyWithTrend;
+		private bool _onlyWithDayTrend = true;
 		private bool _requireDeltaConfirmation;
 		private bool _requireFillConfirmation;
 		private bool _requireCandlePattern;
@@ -1290,12 +1306,14 @@ namespace ATAS.Indicators.Technical
 		private int _contracts = 1;
 		private decimal _dailyLossLimit;
 		private bool _skipTradesBeyondLimit = true;
+		private int _dailyProfitTargetTicks = 140;
 		private bool _countAccountPnl = true;
 		private TimeSpan _flatByTime;
 		private int _flatByLastEntryMinutes = 10;
 		private bool _filterByWorstCase;
 		private bool _breakEvenFromFill;
 		private OrderLifetime _liveTimeInForce;
+		private bool _costsFromInstrument = true;
 		private decimal _tickValue = 5m;
 		private decimal _commissionPerContract = 5m;
 		private int _slippageTicks = 1;
@@ -1675,7 +1693,15 @@ namespace ATAS.Indicators.Technical
 			set { _onlyWithTrend = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Require delta confirmation", GroupName = "Signals", Order = 106,
+		[Display(Name = "Only trade with the day's trend", GroupName = "Signals", Order = 106,
+			Description = "Buys only while the day trends up, shorts only while it trends down: the signal bar closes above both the regular session's open and its VWAP since then (below both: down). Before the session opens, counted from 18:00 New York. Between the two there is no clear trend, and no signal.")]
+		public bool OnlyWithDayTrend
+		{
+			get => _onlyWithDayTrend;
+			set { _onlyWithDayTrend = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Require delta confirmation", GroupName = "Signals", Order = 107,
 			Description = "Buys need a positive bar delta, shorts a negative one.")]
 		public bool RequireDeltaConfirmation
 		{
@@ -1683,7 +1709,7 @@ namespace ATAS.Indicators.Technical
 			set { _requireDeltaConfirmation = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Require order-flow confirmation", GroupName = "Signals", Order = 107,
+		[Display(Name = "Require order-flow confirmation", GroupName = "Signals", Order = 108,
 			Description = "Buys need a big fill of resting bids near the low of the signal bar (or the bar before), shorts a big fill of resting offers near the high.")]
 		public bool RequireFillConfirmation
 		{
@@ -1691,7 +1717,7 @@ namespace ATAS.Indicators.Technical
 			set { _requireFillConfirmation = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Require candlestick pattern", GroupName = "Signals", Order = 108,
+		[Display(Name = "Require candlestick pattern", GroupName = "Signals", Order = 109,
 			Description = "Only signal when the signal bar completes a candlestick pattern pointing the signal's way. FVG and fill reactions always have one; this filters sweeps.")]
 		public bool RequireCandlePattern
 		{
@@ -1699,7 +1725,7 @@ namespace ATAS.Indicators.Technical
 			set { _requireCandlePattern = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Cooldown between signals (bars)", GroupName = "Signals", Order = 109,
+		[Display(Name = "Cooldown between signals (bars)", GroupName = "Signals", Order = 110,
 			Description = "Minimum bars before another signal in the same direction, so one move isn't counted several times.")]
 		[Range(0, 1000)]
 		public int SignalCooldownBars
@@ -1708,7 +1734,7 @@ namespace ATAS.Indicators.Technical
 			set { _signalCooldownBars = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "One trade at a time", GroupName = "Signals", Order = 110,
+		[Display(Name = "One trade at a time", GroupName = "Signals", Order = 111,
 			Description = "While a shown signal's trade is still open, new signals are not shown (they are still tracked for the statistics).")]
 		public bool OneTradeAtATime
 		{
@@ -1716,7 +1742,7 @@ namespace ATAS.Indicators.Technical
 			set { _oneTradeAtATime = value; RecalculateValues(); }
 		}
 
-		[Display(Name = "Min TP probability to show (%)", GroupName = "Signals", Order = 111,
+		[Display(Name = "Min TP probability to show (%)", GroupName = "Signals", Order = 112,
 			Description = "Hide signals whose estimated take-profit probability is below this. Hidden signals are still tracked so the statistics keep learning.")]
 		[Range(0, 100)]
 		public int MinProbabilityPercent
@@ -1725,7 +1751,7 @@ namespace ATAS.Indicators.Technical
 			set { _minProbabilityPercent = Math.Min(100, Math.Max(0, value)); RecalculateValues(); }
 		}
 
-		[Display(Name = "Min expected ticks to show (0 = off)", GroupName = "Signals", Order = 112,
+		[Display(Name = "Min expected ticks to show (0 = off)", GroupName = "Signals", Order = 113,
 			Description = "Hide signals whose expected result - the TP, break-even and SL ticks weighted by their odds - is below this. Hidden signals are still tracked.")]
 		[Range(0, 100000)]
 		public int MinExpectedTicks
@@ -1734,7 +1760,7 @@ namespace ATAS.Indicators.Technical
 			set { _minExpectedTicks = Math.Max(0, value); RecalculateValues(); }
 		}
 
-		[Display(Name = "Volatility (ATR) period (bars)", GroupName = "Signals", Order = 113,
+		[Display(Name = "Volatility (ATR) period (bars)", GroupName = "Signals", Order = 114,
 			Description = "Bars in the average true range that the volatility-based settings measure against: sweep depth, gap size, ATR brackets and the volatility of the odds.")]
 		[Range(1, 10000)]
 		public int AtrPeriod
@@ -2196,7 +2222,16 @@ namespace ATAS.Indicators.Technical
 			set { _skipTradesBeyondLimit = value; _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Count the account's closed P&L (live)", GroupName = "Execution", Order = 506,
+		[Display(Name = "Daily profit target (ticks, 0 = off)", GroupName = "Execution", Order = 506,
+			Description = "Once the day's closed trades have made this many ticks - a contract, slippage included - no new entries until the next trading day (18:00 New York). Paper and live count apart.")]
+		[Range(0, 100000)]
+		public int DailyProfitTargetTicks
+		{
+			get => _dailyProfitTargetTicks;
+			set { _dailyProfitTargetTicks = Math.Max(0, value); _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "Count the account's closed P&L (live)", GroupName = "Execution", Order = 507,
 			Description = "Live: the daily loss limit also goes by the account's closed P&L for the session as the trading connection reports it, so trades by hand and on other charts count too. It can only make the limit stricter.")]
 		public bool CountAccountPnl
 		{
@@ -2204,7 +2239,7 @@ namespace ATAS.Indicators.Technical
 			set { _countAccountPnl = value; _execConfigDirty = true; RedrawChart(); }
 		}
 
-		[Display(Name = "Flat by (New York, 00:00 = off)", GroupName = "Execution", Order = 507,
+		[Display(Name = "Flat by (New York, 00:00 = off)", GroupName = "Execution", Order = 508,
 			Description = "Each trading day at this New York time the position is closed at market and a waiting entry is cancelled; the chart's trade carries on without it. 00:00: off.")]
 		public TimeSpan FlatByTime
 		{
@@ -2212,7 +2247,7 @@ namespace ATAS.Indicators.Technical
 			set { _flatByTime = WithinDay(value); _execConfigDirty = true; RedrawChart(); }
 		}
 
-		[Display(Name = "No new entries in the last (minutes)", GroupName = "Execution", Order = 508,
+		[Display(Name = "No new entries in the last (minutes)", GroupName = "Execution", Order = 509,
 			Description = "With a flat-by time: no new entries from this many minutes before it until the trading day turns at 18:00 New York.")]
 		[Range(0, 600)]
 		public int FlatByLastEntryMinutes
@@ -2221,7 +2256,7 @@ namespace ATAS.Indicators.Technical
 			set { _flatByLastEntryMinutes = Math.Min(600, Math.Max(0, value)); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Filter trades by worst-case odds", GroupName = "Execution", Order = 509,
+		[Display(Name = "Filter trades by worst-case odds", GroupName = "Execution", Order = 510,
 			Description = "Off: the executor takes the signals the chart shows. On: only those whose odds, settled with the worst case inside each bar, also pass Min TP probability and Min expected ticks. With a break-even step inside a bar the labels' odds lean optimistic (see the README). The log has both EVs either way.")]
 		public bool FilterByWorstCase
 		{
@@ -2229,7 +2264,7 @@ namespace ATAS.Indicators.Technical
 			set { _filterByWorstCase = value; _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Break-even stop from the fill", GroupName = "Execution", Order = 510,
+		[Display(Name = "Break-even stop from the fill", GroupName = "Execution", Order = 511,
 			Description = "Off: the stop moves to the signal's break-even price, as on the chart. On: to the same profit counted from the position's average fill, so slippage on the entry doesn't eat into it. It still moves when the chart's trade reaches its trigger.")]
 		public bool BreakEvenFromFill
 		{
@@ -2237,7 +2272,7 @@ namespace ATAS.Indicators.Technical
 			set { _breakEvenFromFill = value; _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Time in force (live orders)", GroupName = "Execution", Order = 511,
+		[Display(Name = "Time in force (live orders)", GroupName = "Execution", Order = 512,
 			Description = "For the live stop, take profit and limit entry. The connection's default: as ATAS sends orders. Good till cancelled keeps the stop through the session break; some connections only take Day orders. A stop that expires or is refused closes the position and halts execution.")]
 		public OrderLifetime LiveTimeInForce
 		{
@@ -2245,8 +2280,16 @@ namespace ATAS.Indicators.Technical
 			set { _liveTimeInForce = value; _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 512,
-			Description = "5 for NQ, 0.5 for MNQ. When the trading connection reports a different one, the larger is used, so a wrong setting can only make the loss limit stricter.")]
+		[Display(Name = "Tick value and commission from the instrument", GroupName = "Execution", Order = 513,
+			Description = "On: NQ, MNQ, ES, MES, YM, MYM, RTY, M2K, CL, MCL, GC and MGC charts get their own $ a tick and a typical all-in commission a round trip ($5.00 for the full-size contracts, $1.50 for the micros), whatever the two settings below say. Other instruments, or this off, use the settings.")]
+		public bool CostsFromInstrument
+		{
+			get => _costsFromInstrument;
+			set { _costsFromInstrument = value; _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 514,
+			Description = "5 for NQ, 0.5 for MNQ - for instruments the executor doesn't know, or with Tick value and commission from the instrument off. When the trading connection reports a larger one, that is used, so a wrong setting can only make the loss limit stricter.")]
 		[Range(0.0, 100000.0)]
 		public decimal TickValue
 		{
@@ -2254,8 +2297,8 @@ namespace ATAS.Indicators.Technical
 			set { _tickValue = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Commission ($ per contract, round trip)", GroupName = "Execution", Order = 513,
-			Description = "Taken off every closed trade, for the daily loss limit and the log. 5.00 is the backtest's one tick on NQ; set what your broker charges.")]
+		[Display(Name = "Commission ($ per contract, round trip)", GroupName = "Execution", Order = 515,
+			Description = "Taken off every closed trade, for the daily loss limit and the log - for instruments the executor doesn't know, or with Tick value and commission from the instrument off. 5.00 is the backtest's one tick on NQ; set what your broker charges.")]
 		[Range(0.0, 100000.0)]
 		public decimal CommissionPerContract
 		{
@@ -2263,7 +2306,7 @@ namespace ATAS.Indicators.Technical
 			set { _commissionPerContract = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Slippage (ticks per market / stop fill)", GroupName = "Execution", Order = 514,
+		[Display(Name = "Slippage (ticks per market / stop fill)", GroupName = "Execution", Order = 516,
 			Description = "Paper market and stop orders fill this many ticks worse than the price that reached them. Both modes count it in a new trade's risk.")]
 		[Range(0, 1000)]
 		public int SlippageTicks
@@ -2272,7 +2315,7 @@ namespace ATAS.Indicators.Technical
 			set { _slippageTicks = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Alert on orders", GroupName = "Execution", Order = 515,
+		[Display(Name = "Alert on orders", GroupName = "Execution", Order = 517,
 			Description = "An ATAS alert on each fill and each closed position. A halt, a rejected order and the daily loss limit always alert.")]
 		public bool AlertOnOrders
 		{
@@ -2280,7 +2323,7 @@ namespace ATAS.Indicators.Technical
 			set => _alertOnOrders = value;
 		}
 
-		[Display(Name = "Log folder (empty = ATAS's data folder)", GroupName = "Execution", Order = 516,
+		[Display(Name = "Log folder (empty = ATAS's data folder)", GroupName = "Execution", Order = 518,
 			Description = "Where the CSV log of every signal, order, fill and result goes: one file per trading day, instrument and mode. Empty: ATAS/FvgExecution in the application data folder.")]
 		public string ExecutionLogFolder
 		{
@@ -2403,6 +2446,11 @@ namespace ATAS.Indicators.Technical
 			_swingHighs.Clear();
 			_swingLows.Clear();
 			_tradingDay = DateTime.MinValue;
+			_trendDay = DateTime.MinValue;
+			_trendFromRegular = false;
+			_trendOpen = 0;
+			_trendPriceVolume = 0;
+			_trendVolume = 0;
 			_hasRth = false;
 			_hasPriorRth = false;
 			_hasOvernight = false;
@@ -2484,6 +2532,7 @@ namespace ATAS.Indicators.Technical
 
 			// every bar belongs to a trading day, warm-up included
 			var (keyLow, keyHigh) = UpdateKeyLevels(bar, candle);
+			UpdateDayTrend(candle);
 
 			if (bar < SwingLookback + 3)
 				return;
@@ -2864,6 +2913,43 @@ namespace ATAS.Indicators.Technical
 		private bool IsRegularHours(TimeSpan time)
 		{
 			return time >= RegularHoursStart && time < RegularHoursEnd;
+		}
+
+		// Follows the day's trend through a closed bar. It is counted from the trading day's first bar
+		// (18:00 New York) until the regular session opens, then from the session's first bar: that
+		// bar's open, and the volume-weighted average of the bars' typical price since (a bar without
+		// volume counts once).
+		private void UpdateDayTrend(IndicatorCandle candle)
+		{
+			var newYork = NewYorkTime(candle.Time);
+			var day = TradingDayOf(newYork);
+			var time = newYork.TimeOfDay;
+			var fromRegular = time >= RegularHoursStart && time < TradingDayStart;
+
+			if (day != _trendDay || (fromRegular && !_trendFromRegular))
+			{
+				_trendDay = day;
+				_trendFromRegular = fromRegular;
+				_trendOpen = candle.Open;
+				_trendPriceVolume = 0;
+				_trendVolume = 0;
+			}
+
+			var weight = candle.Volume > 0 ? candle.Volume : 1;
+			_trendPriceVolume += (candle.High + candle.Low + candle.Close) / 3 * weight;
+			_trendVolume += weight;
+		}
+
+		private decimal DayVwap => _trendVolume > 0 ? _trendPriceVolume / _trendVolume : 0;
+
+		// the day's trend at a close: 1 up (above the open and the VWAP), -1 down (below both), 0 none
+		private int DayTrend(decimal close)
+		{
+			if (_trendVolume <= 0)
+				return 0;
+
+			var vwap = DayVwap;
+			return close > _trendOpen && close > vwap ? 1 : close < _trendOpen && close < vwap ? -1 : 0;
 		}
 
 		// whether a bar (by its open time) may give a signal
@@ -4030,6 +4116,7 @@ namespace ATAS.Indicators.Technical
 			var hasPattern = patterns != CandlePattern.None;
 
 			if ((OnlyWithTrend && !withTrend)
+				|| (OnlyWithDayTrend && DayTrend(candle.Close) != (isLong ? 1 : -1))
 				|| (RequireDeltaConfirmation && !deltaConfirms)
 				|| (RequireFillConfirmation && !fillConfirms)
 				|| (RequireCandlePattern && !hasPattern))
@@ -4894,6 +4981,7 @@ namespace ATAS.Indicators.Technical
 				IsLong = trade.IsLong,
 				Contracts = Contracts,
 				TickValue = EffectiveTickValue(),
+				Commission = EffectiveCommission(),
 				Account = paper ? "paper" : TradingManager.Portfolio.AccountID,
 				StopPrice = trade.StopLossPrice,
 				FlatSince = DateTime.MinValue,
@@ -4957,6 +5045,9 @@ namespace ATAS.Indicators.Technical
 
 			if (DailyLossLimit > 0 && dayPnl <= -DailyLossLimit)
 				return $"the account's closed P&L for the session ({Money(dayPnl)}, from the trading connection) has reached the daily loss limit ({Money(-DailyLossLimit)})";
+
+			if (DailyProfitTargetTicks > 0 && day.Ticks >= DailyProfitTargetTicks)
+				return $"the daily profit target is reached ({TicksText(day.Ticks)} today, target +{DailyProfitTargetTicks}t)";
 
 			var price = _execPrice;
 			var direction = trade.IsLong ? 1 : -1;
@@ -5068,7 +5159,7 @@ namespace ATAS.Indicators.Technical
 			var direction = trade.IsLong ? 1 : -1;
 			var entry = !trade.LimitEntry ? price : trade.IsLong ? Math.Min(price, trade.EntryPrice) : Math.Max(price, trade.EntryPrice);
 			var ticks = (entry - trade.StopLossPrice) * direction / TickSize + (trade.LimitEntry ? 1 : 2) * SlippageTicks;
-			return (ticks * tickValue + CommissionPerContract) * Contracts;
+			return (ticks * tickValue + EffectiveCommission()) * Contracts;
 		}
 
 		// The day's result the daily loss limit goes by: the executor's own closed trades, or live,
@@ -5080,11 +5171,91 @@ namespace ATAS.Indicators.Technical
 			return account.HasValue && account.Value < own ? account.Value : own;
 		}
 
-		// $ per tick and contract: the setting, or what the trading connection says when that is more,
-		// so a wrong setting can only make the loss limit stricter
+		// $ per tick and contract: the instrument's when the executor knows it, else the setting - or
+		// what the trading connection says when that is more, so a wrong value can only make the loss
+		// limit stricter
 		private decimal EffectiveTickValue()
 		{
-			return Math.Max(TickValue, TradingManager?.Security?.TickCost ?? 0m);
+			return Math.Max(KnownContract()?.TickValue ?? TickValue, TradingManager?.Security?.TickCost ?? 0m);
+		}
+
+		// $ a contract a round trip: the instrument's typical commission when the executor knows it,
+		// else the setting
+		private decimal EffectiveCommission()
+		{
+			return KnownContract()?.Commission ?? CommissionPerContract;
+		}
+
+		// CME futures the executor knows by name: tick size, $ a tick, and a typical all-in commission
+		// a round trip (broker, exchange and clearing fees). Brokers charge differently: with yours
+		// far off, switch Tick value and commission from the instrument off and set the two by hand.
+		private static readonly Dictionary<string, (decimal TickSize, decimal TickValue, decimal Commission)> KnownContracts =
+			new Dictionary<string, (decimal, decimal, decimal)>(StringComparer.OrdinalIgnoreCase)
+			{
+				["NQ"] = (0.25m, 5m, 5m),
+				["MNQ"] = (0.25m, 0.5m, 1.5m),
+				["ES"] = (0.25m, 12.5m, 5m),
+				["MES"] = (0.25m, 1.25m, 1.5m),
+				["YM"] = (1m, 5m, 5m),
+				["MYM"] = (1m, 0.5m, 1.5m),
+				["RTY"] = (0.1m, 5m, 5m),
+				["M2K"] = (0.1m, 0.5m, 1.5m),
+				["CL"] = (0.01m, 10m, 5m),
+				["MCL"] = (0.01m, 1m, 1.5m),
+				["GC"] = (0.1m, 10m, 5m),
+				["MGC"] = (0.1m, 1m, 1.5m)
+			};
+
+		// the same products under the names other data feeds give them (CQG)
+		private static readonly Dictionary<string, string> ProductAliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+		{
+			["ENQ"] = "NQ",
+			["EP"] = "ES"
+		};
+
+		// The product a symbol names, when the executor knows it: "NQZ6", "MNQZ26", "NQ 12-26",
+		// "NQZ6.CME@RITHMIC" and "F.US.ENQZ26" are NQ, MNQ, NQ, NQ and NQ
+		private static string ProductOf(string symbol)
+		{
+			if (string.IsNullOrWhiteSpace(symbol))
+				return null;
+
+			var at = symbol.IndexOf('@');
+			var tokens = (at >= 0 ? symbol.Substring(0, at) : symbol).Split(new[] { '.', ' ', '-', '_', ':', '/' }, StringSplitOptions.RemoveEmptyEntries);
+
+			foreach (var token in tokens)
+			{
+				// a contract month (a month code and the year) after the product
+				var month = Regex.Match(token, "^(.+?)[FGHJKMNQUVXZ][0-9]{1,4}$", RegexOptions.IgnoreCase);
+
+				foreach (var name in month.Success ? new[] { token, month.Groups[1].Value } : new[] { token })
+				{
+					var product = ProductAliases.TryGetValue(name, out var alias) ? alias : name.ToUpperInvariant();
+
+					if (KnownContracts.ContainsKey(product))
+						return product;
+				}
+			}
+
+			return null;
+		}
+
+		// the contract on the chart, when the executor knows it and its tick size is the chart's; null
+		// with Tick value and commission from the instrument off
+		private (string Product, decimal TickValue, decimal Commission)? KnownContract()
+		{
+			if (!CostsFromInstrument)
+				return null;
+
+			foreach (var symbol in new[] { TradingManager?.Security?.Instrument, TradingManager?.Security?.Code, InstrumentInfo?.Instrument })
+			{
+				var product = ProductOf(symbol);
+
+				if (product != null && KnownContracts[product].TickSize == TickSize)
+					return (product, KnownContracts[product].TickValue, KnownContracts[product].Commission);
+			}
+
+			return null;
 		}
 
 		// The flat-by time is measured into the trading day, which starts at 18:00 New York, so an
@@ -5437,9 +5608,10 @@ namespace ATAS.Indicators.Technical
 			}
 
 			var ticks = pos.ExitTicks / pos.Entered;
-			var dollars = pos.ExitTicks * pos.TickValue - CommissionPerContract * pos.Entered;
+			var dollars = pos.ExitTicks * pos.TickValue - pos.Commission * pos.Entered;
 			var day = CurrentDay(pos.Paper);
 			day.Pnl += dollars;
+			day.Ticks += ticks;
 			day.Trades++;
 
 			var row = LogRow("CLOSED", pos, null, pos.Paper);
@@ -5448,7 +5620,7 @@ namespace ATAS.Indicators.Technical
 			row["day_pnl_usd"] = Cents(day.Pnl);
 			row["chart_outcome"] = OutcomeBadge(pos.Trade.Outcome);
 			row["chart_ticks"] = pos.Trade.Outcome == TradeOutcome.Open || pos.Trade.Outcome == TradeOutcome.Missed ? string.Empty : Number(ResultTicks(pos.Trade));
-			row["note"] = $"{Qty(pos.Entered)} contract{(pos.Entered == 1 ? string.Empty : "s")}, average entry {Number(pos.AverageEntry)}, tick value {Cents(pos.TickValue)}, commission {Cents(CommissionPerContract)} each";
+			row["note"] = $"{Qty(pos.Entered)} contract{(pos.Entered == 1 ? string.Empty : "s")}, average entry {Number(pos.AverageEntry)}, tick value {Cents(pos.TickValue)}, commission {Cents(pos.Commission)} each";
 			WriteLog(row, pos.Paper);
 
 			var color = dollars > 0 ? BullColor : dollars < 0 ? BearColor : NeutralColor;
@@ -5460,6 +5632,19 @@ namespace ATAS.Indicators.Technical
 				Log("BREAKER", pos, $"daily loss limit reached: {Money(day.Pnl)} today, limit {Money(-DailyLossLimit)}; no new entries until the next trading day");
 				Notify($"Daily loss limit reached ({Money(day.Pnl)} today): no new {(pos.Paper ? "paper" : "live")} entries until the next trading day", BearColor, true);
 			}
+
+			if (DailyProfitTargetTicks > 0 && day.Ticks >= DailyProfitTargetTicks && !day.TargetReached)
+			{
+				day.TargetReached = true;
+				Log("TARGET", pos, $"daily profit target reached: {TicksText(day.Ticks)} today, target +{DailyProfitTargetTicks}t; no new entries until the next trading day");
+				Notify($"Daily profit target reached ({TicksText(day.Ticks)} today): no new {(pos.Paper ? "paper" : "live")} entries until the next trading day", BullColor, true);
+			}
+		}
+
+		// "+142.5t"
+		private static string TicksText(decimal ticks)
+		{
+			return ticks.ToString("+0.#;-0.#;0", CultureInfo.InvariantCulture) + "t";
 		}
 
 		// Live: the account has to hold what the executor holds. When it shows no position for a few
@@ -5964,10 +6149,12 @@ namespace ATAS.Indicators.Technical
 		// limits, and the chart settings that shape its trades
 		private void LogConfiguration()
 		{
+			var contract = KnownContract();
+			var ownValue = contract?.TickValue ?? TickValue;
 			var platform = TradingManager?.Security?.TickCost ?? 0m;
-			var tickValue = platform > 0 && platform != TickValue
-				? $"tick value {Money(TickValue)} (the connection says {Money(platform)}; using {Money(EffectiveTickValue())})"
-				: $"tick value {Money(TickValue)}";
+			var tickValue = platform > 0 && platform != ownValue
+				? $"tick value {Money(ownValue)} (the connection says {Money(platform)}; using {Money(EffectiveTickValue())})"
+				: $"tick value {Money(ownValue)}";
 
 			var parts = new List<string>
 			{
@@ -5977,13 +6164,16 @@ namespace ATAS.Indicators.Technical
 					? $"daily loss limit {Money(DailyLossLimit)}{(SkipTradesBeyondLimit ? ", skipping trades that could breach it" : string.Empty)}"
 					: "no daily loss limit",
 				tickValue,
-				$"commission {Money(CommissionPerContract)}",
+				$"commission {Money(EffectiveCommission())}",
 				$"slippage {SlippageTicks}t",
 				BracketText(),
 				Entry == EntryRule.LimitPullback ? $"limit entry {PullbackPercent}% back, valid {LimitValidBars} bars" : "entry at the close",
 				$"signals {HoursText()}",
 				OneTradeAtATime ? "one trade at a time" : "overlapping signals on the chart"
 			};
+
+			if (DailyProfitTargetTicks > 0)
+				parts.Insert(3, $"daily profit target +{DailyProfitTargetTicks}t");
 
 			// the executor's own safety settings, named only when they are on
 			if (!PaperTrading && CountAccountPnl)
@@ -6000,6 +6190,13 @@ namespace ATAS.Indicators.Technical
 
 			if (!PaperTrading && LiveTimeInForce != OrderLifetime.ConnectionDefault)
 				parts.Add(LiveTimeInForce == OrderLifetime.Day ? "live orders good for the day" : "live orders good till cancelled");
+
+			if (CostsFromInstrument)
+			{
+				parts.Add(contract.HasValue
+					? $"{contract.Value.Product}'s tick value and commission"
+					: $"tick value and commission from the settings: {InstrumentInfo?.Instrument ?? "the chart's instrument"} is not a contract the executor knows");
+			}
 
 			var config = string.Join(" · ", parts);
 
@@ -6025,8 +6222,10 @@ namespace ATAS.Indicators.Technical
 			{
 				day.Day = today;
 				day.Pnl = 0;
+				day.Ticks = 0;
 				day.Trades = 0;
 				day.Tripped = false;
+				day.TargetReached = false;
 				RestoreDay(day, paper);
 
 				// each day's file starts with the settings
@@ -6054,6 +6253,7 @@ namespace ATAS.Indicators.Technical
 				var header = lines.Length > 0 ? SplitCsv(lines[0]) : Array.Empty<string>();
 				var eventColumn = Array.IndexOf(header, "event");
 				var dayColumn = Array.IndexOf(header, "day_pnl_usd");
+				var ticksColumn = Array.IndexOf(header, "pnl_ticks");
 
 				if (eventColumn < 0 || dayColumn < 0)
 					return;
@@ -6067,6 +6267,10 @@ namespace ATAS.Indicators.Technical
 					{
 						day.Pnl = pnl;
 						day.Trades++;
+
+						if (ticksColumn >= 0 && cells.Length > ticksColumn
+							&& decimal.TryParse(cells[ticksColumn], NumberStyles.Number, CultureInfo.InvariantCulture, out var ticks))
+							day.Ticks += ticks;
 					}
 				}
 			}
@@ -6080,6 +6284,7 @@ namespace ATAS.Indicators.Technical
 				return;
 
 			day.Tripped = DailyLossLimit > 0 && day.Pnl <= -DailyLossLimit;
+			day.TargetReached = DailyProfitTargetTicks > 0 && day.Ticks >= DailyProfitTargetTicks;
 			Log("RESTORE", null, $"{day.Trades} closed trade{(day.Trades == 1 ? string.Empty : "s")} today, {Money(day.Pnl)}: read back from this log", paper);
 		}
 
@@ -6224,7 +6429,9 @@ namespace ATAS.Indicators.Technical
 
 			var paper = PaperTrading;
 			var day = paper ? _paperDay : _liveDay;
-			var today = _execNow.Year > 1 && day.Day == TradingDayOf(NewYorkTime(_execNow)) ? day.Pnl : 0m;
+			var isToday = _execNow.Year > 1 && day.Day == TradingDayOf(NewYorkTime(_execNow));
+			var today = isToday ? day.Pnl : 0m;
+			var todayTicks = isToday ? day.Ticks : 0m;
 			var mode = !ExecuteSignals ? "off" : paper ? "PAPER" : "LIVE";
 			var limit = DailyLossLimit > 0 ? $" of {Money(-DailyLossLimit)}" : " (no loss limit)";
 			var head = ($"Execution {mode} · {Contracts} contract{(Contracts == 1 ? string.Empty : "s")} · today {Money(today)}{limit}", DimTextColor);
@@ -6235,6 +6442,8 @@ namespace ATAS.Indicators.Technical
 				head = ($"Execution {mode} stopped for today: {Money(today)} reached the {Money(-DailyLossLimit)} limit", BearColor);
 			else if (ExecuteSignals && DailyLossLimit > 0 && LimitPnl(today, paper) <= -DailyLossLimit)
 				head = ($"Execution {mode} stopped for today: the account's closed P&L {Money(LimitPnl(today, paper))} reached the {Money(-DailyLossLimit)} limit", BearColor);
+			else if (ExecuteSignals && DailyProfitTargetTicks > 0 && todayTicks >= DailyProfitTargetTicks)
+				head = ($"Execution {mode} done for today: {TicksText(todayTicks)} reached the +{DailyProfitTargetTicks}t profit target", BullColor);
 			else if (ExecuteSignals && !paper && LiveBlocker() is string blocked)
 				head = ($"Execution LIVE not armed: {blocked}", BearColor);
 
@@ -6516,6 +6725,9 @@ namespace ATAS.Indicators.Technical
 				FillThreshold = FillSize == FillSizeRule.FixedContracts ? FillMinVolume : _fillThreshold,
 				RestingThreshold = RestingMinimum(),
 				LastBarTime = CurrentBar > 0 ? GetCandle(CurrentBar - 1).Time : DateTime.MinValue,
+				DayTrend = _lastClosedBar >= 0 && _lastClosedBar < CurrentBar ? DayTrend(GetCandle(_lastClosedBar).Close) : 0,
+				DayOpen = _trendVolume > 0 ? _trendOpen : 0,
+				DayVwap = DayVwap,
 				Board = withScoreboard ? BuildScoreboard() : null,
 				Execution = ExecutionPanelLines()
 			};
@@ -7071,6 +7283,16 @@ namespace ATAS.Indicators.Technical
 				hours += $" · last bar {NewYorkTime(stats.LastBarTime).ToString("HH:mm", CultureInfo.InvariantCulture)} New York";
 
 			footer.Insert(1, (hours, DimTextColor));
+
+			// with the day's trend filter: which way signals may go now
+			if (OnlyWithDayTrend && stats.DayOpen > 0)
+			{
+				var trend = stats.DayTrend > 0 ? "Day trend up (above the open and VWAP): buys only"
+					: stats.DayTrend < 0 ? "Day trend down (below the open and VWAP): shorts only"
+					: "No clear day trend (between the open and VWAP): no signals";
+
+				footer.Insert(2, ($"{trend} · open {FormatPrice(stats.DayOpen)} · VWAP {FormatPrice(stats.DayVwap)}", DimTextColor));
+			}
 
 			var restingSize = RestingSize == RestingSizeRule.FixedContracts
 				? $"≥{RestingOrderMin}"

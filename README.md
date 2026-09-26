@@ -330,6 +330,21 @@ other choices:
 
 The panel shows which one is on, with the New York time of the last bar to check it against.
 
+### The day's trend
+
+With *Only trade with the day's trend* (on), signals only go the day's way:
+
+* **up**, BUYs only: the signal bar closes above both the day's open and its VWAP;
+* **down**, SHORTs only: it closes below both;
+* **no clear trend**, no signal: it closes between the two.
+
+The day is the regular session from its first bar (09:30 New York), with the open of that bar and
+the VWAP - the volume-weighted average of the bars' typical price, (high + low + close) / 3 - since.
+Before the session opens, the day counts from 18:00, when the trading day starts. A signal against
+the day's trend is not taken at all, as with the other filters, so the chart, its statistics, the
+backtest and the executor all see the same signals. The panel shows the day's trend, its open and its
+VWAP.
+
 ### Where the probability comes from
 
 Every signal on the chart is followed forward until it ends: at the TP, at the break-even stop
@@ -514,6 +529,10 @@ want the chart's odds to reflect what really happened, *Bracket size: Multiples 
 the bracket that history on bars settles almost exactly. Judge any change on ticks (`--ticks`),
 live, or at least next to the runner's worst-case row.
 
+These runs came before *Only trade with the day's trend*, which is now on by default:
+`--set OnlyWithDayTrend=false` gives the signals they had. The day's trend itself hasn't been
+through the backtest yet - run it with and without, on ticks, before trusting it.
+
 ## Honest limits
 
 * The probability is a frequency from the history loaded on the chart, not a guarantee. Markets
@@ -619,6 +638,36 @@ make the limit stricter. Where the session is cut is the connection's business, 
 firm's own limit still applies, and each computer only reads its own log: run the executor on one
 computer at a time.
 
+### The daily profit target
+
+*Daily profit target (ticks)* (140) ends the trading day the other way: once the day's closed trades
+have made that many ticks - a contract, slippage included - no new entries until the trading day
+turns at 18:00 New York. A `TARGET` row and an alert say so, the panel says *done for today*, and a
+restart reads the day's ticks back from the log. Paper and live count apart; 0 switches it off.
+
+### Tick value and commission
+
+The dollars of each trade - for the log, the daily loss limit and a new trade's risk - come from the
+contract on the chart. With *Tick value and commission from the instrument* (on), the executor knows:
+
+| Contracts | Tick | $ a tick | Commission a round trip |
+|---|---|---|---|
+| NQ / MNQ | 0.25 | 5.00 / 0.50 | 5.00 / 1.50 |
+| ES / MES | 0.25 | 12.50 / 1.25 | 5.00 / 1.50 |
+| YM / MYM | 1 | 5.00 / 0.50 | 5.00 / 1.50 |
+| RTY / M2K | 0.10 | 5.00 / 0.50 | 5.00 / 1.50 |
+| CL / MCL | 0.01 | 10.00 / 1.00 | 5.00 / 1.50 |
+| GC / MGC | 0.10 | 10.00 / 1.00 | 5.00 / 1.50 |
+
+It reads the product from the chart's instrument whatever the feed calls it (`NQZ6`, `MNQZ26`,
+`NQZ6.CME@RITHMIC`, CQG's `F.US.ENQZ26`), and only trusts it when the chart's tick size is the
+contract's. The commissions are typical all-in round trips (broker, exchange and clearing fees);
+brokers differ, so with yours far off, switch the setting off and set *Tick value* and *Commission*
+by hand - as for any other instrument. When the trading connection reports a larger tick value, that
+is used, so a wrong value can only make the limit stricter. The MODE row says whose costs are in use.
+The brackets are in ticks, and NQ and MNQ share their price scale: the same settings trade both the
+same way, for a tenth of the dollars on MNQ.
+
 ### Worst-case odds
 
 On historical bars the order of a bar's high and low is unknown, and with a break-even step inside a
@@ -633,10 +682,6 @@ trades by worst-case odds* on, the executor only takes a signal whose worst-case
 probability* and *Min expected ticks* too (with both filters off it changes nothing). The worst case
 errs the other way - 4-7 ticks a trade too low on the backtest's ticks - so a signal that passes it
 has a margin. Every log row that names a signal carries both EVs (`ev_ticks`, `ev_worst_ticks`).
-
-The result of each trade uses *Tick value* (5 for NQ, 0.5 for MNQ) and *Commission* (5.00 a contract
-a round trip, the backtest's one tick on NQ; set what you pay). When the trading connection reports
-another tick value, the larger one is used, so a wrong setting can only make the limit stricter.
 
 ### Paper fills
 
@@ -716,7 +761,7 @@ chart and the scoreboard:
 | `EXIT` | closing at market, and why |
 | `CLOSED` | the position is flat: ticks a contract, $ after commission, the day's $ so far, and the chart's result for the same signal |
 | `CHART` | how the chart's trade for the signal ended, as its tooltip says it |
-| `BREAKER`, `HALT`, `WARN`, `RESTORE`, `NOFILL` | the daily loss limit reached, a halt, a warning, the day read back after a restart, an entry that never filled |
+| `BREAKER`, `TARGET`, `HALT`, `WARN`, `RESTORE`, `NOFILL` | the daily loss limit reached, the daily profit target made, a halt, a warning, the day read back after a restart, an entry that never filled |
 
 With execution on, the panel adds a line for the executor (mode, size, the day's result against the
 limit), one for the open position and one for the last thing it did.
@@ -841,6 +886,7 @@ show while the chart is open.
 | | Sweep -> FVG window (bars) | 10 | |
 | | Trend EMA period (0 = off) | 50 | |
 | | Only trade with the trend / Require delta / Require order-flow confirmation / Require candlestick pattern | off | |
+| | Only trade with the day's trend | on | BUYs only above the day's open and VWAP, SHORTs only below both, none in between |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
@@ -879,14 +925,16 @@ show while the chart is open.
 | | Contracts per trade | 1 | |
 | | Daily loss limit ($, 0 = off) | 0 | no new entries for the rest of the trading day once the day's closed trades lost this much; live trading needs one |
 | | Skip trades that could breach the limit | on | also skip a signal whose stop could take the day past the limit |
+| | Daily profit target (ticks, 0 = off) | 140 | no new entries for the rest of the trading day once the day's closed trades made this many ticks a contract |
 | | Count the account's closed P&L (live) | on | the limit also goes by the account's closed P&L for the session, when that is worse |
 | | Flat by (New York, 00:00 = off) | off | close the position and cancel a waiting entry at this time each trading day |
 | | No new entries in the last (minutes) | 10 | with a flat-by time: no entries this long before it, until the day turns at 18:00 |
 | | Filter trades by worst-case odds | off | a signal's worst-case odds must pass Min TP probability and Min expected ticks too |
 | | Break-even stop from the fill | off | the break-even stop keeps its profit from the average fill, not from the signal's price |
 | | Time in force (live orders) | the connection's default | or Day, or Good till cancelled, for the stop, the take profit and a limit entry |
-| | Tick value ($ per contract) | 5 | NQ; 0.5 for MNQ. The larger of this and the connection's is used |
-| | Commission ($ per contract, round trip) | 5.00 | taken off each trade's result |
+| | Tick value and commission from the instrument | on | NQ, MNQ, ES, MES and the other contracts [above](#tick-value-and-commission) get their own |
+| | Tick value ($ per contract) | 5 | other instruments, or the setting above off: NQ 5, MNQ 0.5. The larger of this and the connection's is used |
+| | Commission ($ per contract, round trip) | 5.00 | other instruments, or the setting above off: taken off each trade's result |
 | | Slippage (ticks per market / stop fill) | 1 | paper fills, and the risk of a new trade |
 | | Alert on orders | on | an alert per fill and per closed position; halts, rejections and the loss limit always alert |
 | | Log folder | ATAS/FvgExecution in the application data folder | the CSV log |
@@ -898,7 +946,8 @@ draws its own markers for them. The sweep series also mark sweeps of key levels.
 
 ## Changes in this version
 
-New in this version, off by default, so the chart, the signals and their odds stay as they were:
+New in this version. The execution is off by default; of what came with it, the day's trend changes
+the chart's signals (switch *Only trade with the day's trend* off for the ones before it):
 
 * **execution**: the indicator can send the orders of its own signals, paper by default, with
   position sizing, a daily loss limit, live orders only once armed for the chart's account, and a
@@ -910,7 +959,12 @@ New in this version, off by default, so the chart, the signals and their odds st
     carries that EV next to the label's, and the executor can filter on it;
   * **the log report** (`tests/LogReport`) sums the executor's logs up;
   * **Windows**: the build makes the DLL for the installed ATAS only, and reads which chart time
-    zone property that ATAS version has, so classic ATAS 8.0.14 builds it.
+    zone property that ATAS version has, so classic ATAS 8.0.14 builds it;
+  * **the day's trend** (on): signals only go the day's way - above the day's open and VWAP for
+    BUYs, below both for SHORTs;
+  * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
+  * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
+    tick value and a typical commission.
 
 New in the previous version, all off by default:
 

@@ -226,6 +226,7 @@ internal static class Program
 		}, seed: 83));
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
 		Run("Worst-case odds: the labels' with the worst case on the chart, lower otherwise", WorstCaseOdds);
+		Run("Day's trend: every signal goes the day's way", DayTrendFilter);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
 		Console.WriteLine();
@@ -1435,6 +1436,7 @@ internal static class Program
 		Check(fresh.RestingSize == FvgReactionLiquiditySweep.RestingSizeRule.FixedContracts && fresh.RestingOrderMin == 70 && fresh.RestingMultiplier == 5.0,
 			"resting orders of 70 contracts");
 		Check(!fresh.ShowScoreboard, "the scoreboard opens on hover");
+		Check(fresh.OnlyWithDayTrend, "signals only with the day's trend");
 
 		// every setting has its own place in the settings window
 		var orders = IndicatorType.GetProperties()
@@ -4463,7 +4465,8 @@ internal static class Program
 			LevelPriorDay = false,
 			LevelOvernight = false,
 			LevelOpeningRange = false,
-			LevelEqual = false
+			LevelEqual = false,
+			OnlyWithDayTrend = false
 		};
 
 		configure?.Invoke(ind);
@@ -4807,6 +4810,56 @@ internal static class Program
 		var worstEv = nearest.Average(t => OddsOf(t, "WorstEstimate").Ev);
 		Check(differ > nearest.Count / 4, $"the worst-case odds differ on {differ} of {nearest.Count} trades");
 		Check(worstEv < labelEv, $"and lean lower: EV {worstEv:0.00}t on average against the labels' {labelEv:0.00}t");
+	}
+
+	// Only trade with the day's trend: every signal goes the day's way - its bar closing above the
+	// day's open and VWAP for a buy, below both for a short, the day counted from 18:00 New York and
+	// from 09:30 once the regular session has opened - worked out here with the system's clock
+	private static void DayTrendFilter()
+	{
+		var market = Generate(6000, 13);
+
+		// bars with their volume, so the VWAP is weighted
+		foreach (var candle in market.Candles)
+			candle.Volume = candle.Levels.Sum(l => l.Volume);
+
+		var all = Trades(RunHistorical(market.Candles, null, market.SessionStarts));
+		var trades = Trades(RunHistorical(market.Candles, i => i.OnlyWithDayTrend = true, market.SessionStarts));
+		Check(trades.Count(t => t.IsLong) > 5 && trades.Count(t => !t.IsLong) > 5 && trades.Count < all.Count,
+			$"buys and shorts, fewer than without the filter: {trades.Count} of {all.Count}");
+
+		var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+		var trend = new int[market.Candles.Count];
+		var day = DateTime.MinValue;
+		var fromRegular = false;
+		decimal open = 0, priceVolume = 0, volume = 0;
+
+		for (var b = 0; b < market.Candles.Count; b++)
+		{
+			var c = market.Candles[b];
+			var ny = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(c.Time, DateTimeKind.Utc), newYork);
+			var tradingDay = ny.Hour >= 18 ? ny.Date.AddDays(1) : ny.Date;
+			var regular = ny.TimeOfDay >= new TimeSpan(9, 30, 0) && ny.Hour < 18;
+
+			if (tradingDay != day || (regular && !fromRegular))
+			{
+				day = tradingDay;
+				fromRegular = regular;
+				open = c.Open;
+				priceVolume = 0;
+				volume = 0;
+			}
+
+			var weight = c.Volume > 0 ? c.Volume : 1;
+			priceVolume += (c.High + c.Low + c.Close) / 3 * weight;
+			volume += weight;
+			var vwap = priceVolume / volume;
+			trend[b] = c.Close > open && c.Close > vwap ? 1 : c.Close < open && c.Close < vwap ? -1 : 0;
+		}
+
+		var against = trades.Where(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)).ToList();
+		Check(against.Count == 0, $"every signal goes the day's way: {against.Count} don't (first on bar {against.FirstOrDefault()?.EntryBar})");
+		Check(all.Any(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)), "and without the filter some wouldn't");
 	}
 
 	private static List<object> TradesRaw(FvgReactionLiquiditySweep ind)
