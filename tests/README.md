@@ -198,6 +198,10 @@ every signal goes the day's way, worked out bar by bar with the system's own New
 with *Buy in discount, short in premium* on, every BUY closes below the middle of the last swing
 range and every SHORT above it, the swings worked out bar by bar from the bars alone, each counted
 only once the bars after it have closed; flipping the filter's sides makes 824 signals fail it.
+With *Max ADX* at 25, every signal comes while Wilder's 14-bar ADX, worked out bar by bar, is below
+it (flipped, 1,310 fail); with *Only outside yesterday's value area*, every BUY closes below the
+last finished regular session's value area low and every SHORT above its high, the value area
+worked out from the bars' footprints (flipped, 570 fail).
 
 Every one of 24 deliberate bugs put into the execution code as first written (a hidden signal traded, the breaker
 late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes

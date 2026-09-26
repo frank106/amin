@@ -363,8 +363,25 @@ says which half the last close is in, and the range.
 
 On 50 days of MNQ settled on the real 1-second path, it was the one idea from that package that
 helped: FVG reactions (*Signal source: FVG reaction only*) went from losing to about break-even a
-trade, and with the executor's daily rules they came out ahead in both halves of the test. See
-[On ATAS's own data](#on-atass-own-data).
+trade, and with the executor's daily rules they came out ahead in both halves of the test. On 15
+months it still cut the losses on the months it was never tuned on (−$845 against −$2,423 without
+it), but it didn't make them profitable. See [On ATAS's own data](#on-atass-own-data).
+
+### ADX and yesterday's value area
+
+Two more filters, off by default, that both cut the losses on months the setup was never tuned on,
+without making them profitable:
+
+* *Max ADX* (0 = off): signals only while Wilder's 14-bar ADX is below it - a quiet, ranging
+  market. At 20 it improved each trade in both unseen stretches of the 15-month test (from −4.7 to
+  −3.0 ticks and from −3.5 to −0.4); 15 and 25 did not, so the level matters and may be partly luck.
+* *Only outside yesterday's value area*: BUYs only below the value area low of the last regular
+  session to finish, SHORTs only above its value area high. The value area is the prices around
+  the session's busiest one that held 70% of its volume, from the footprint (a bar without one
+  counts its volume spread evenly over its range). It cut the losses mostly by trading less; on
+  top of premium and discount it hardly changed each trade, and with Max ADX 20 it did worse.
+
+The panel shows the ADX and yesterday's value area while either is on.
 
 ### Where the probability comes from
 
@@ -626,6 +643,53 @@ did. Discount and premium made them better at 10 bars and up, in both halves and
 too (+$763), and made every other signal set tried a little less bad - but only the FVG reactions came out ahead,
 and at under 1 standard error from zero that is not proof yet. The built-in filter gives the same
 results as this test did.
+
+**15 months on 10-second bars.** A 10-second export (19 June 2025 – 25 September 2026, 329 trading
+days, footprint off) gives both the 1-minute bars, built from it, and the path inside them: on the
+50 days above it settled trades about a tick a trade better than the 1-second path did (+$830
+against +$613 for the setup below), a small, known optimism. The months before 19 July 2026 were
+never used to tune anything:
+
+| FVG reactions with a pattern, discount / premium, 09:30–12:30, executor | 15 months | Jun 2025 – Jul 18, 2026 (unseen) | Jul 19 – Sep 25, 2026 (tuned on) |
+|---|---|---|---|
+| as set up | −$15 | −$845 | +$830 |
+| without discount / premium | −$2,670 | −$2,423 | −$248 |
+| every kind of signal | −$1,458 | −$578 | −$880 |
+
+The 50 days it was tuned on were its best stretch in 15 months; 7 of 16 months were up. Swing
+lengths of 30, 75 and 100 bars all lost on the unseen months too.
+
+**Confluence filters**, judged on June 2025 – January 2026 and checked once on February – mid-July
+2026, on top of the setup above (executor, one MNQ contract):
+
+| Added | Signals | Net a trade, design / holdout | Executor, design / holdout |
+|---|---|---|---|
+| nothing | 1,496 | −4.7 / −3.5 | −$360 / −$485 |
+| ADX under 20 | 611 | −3.0 / −0.1 | −$113 / −$215 |
+| outside yesterday's value area | 826 | −4.6 / −3.2 | −$15 / −$323 |
+| close in the far half of yesterday's range | 969 | −4.3 / −4.9 | +$235 / −$390 |
+| 1 SD past the session VWAP | 474 | −7.4 / +1.4 | −$758 / +$140 |
+| RSI(14) 35 / 65 | 60 | −21.8 / +8.3 | −$288 / +$88 |
+| Bollinger band touch | 207 | −11.1 / −0.1 | −$580 / −$35 |
+| skip overnights over 1.5× their 20-day range | 1,261 | −4.2 / −5.5 | −$518 / −$645 |
+
+Only ADX under 20 made each trade clearly better in both (the value area by a few tenths of a
+tick); both are built in (see [ADX and yesterday's value area](#adx-and-yesterdays-value-area)),
+and the built-in filters come out nearly the same: −3.0 / −0.4 ticks a trade with ADX under 20,
+−4.1 / −3.3 outside yesterday's value area (its profile spread over 1-minute bars here, where the
+test spread 10-second ones).
+
+**Higher time frames.** The same FVG reactions on 5- and 15-minute bars, with 80-tick, 160-tick
+and ATR-sized brackets (daily rules scaled to the stop): several 15-minute versions came out ahead
+across June 2025 – September 2026, the ATR-sized one in every stretch (+$1,047). On the eight
+months before that (27 October 2024 – 18 June 2025, 1-minute bars from ATAS as the path), which
+played no part in choosing anything, they didn't hold: −$75 (ATR), −$583 (80 ticks), +$363 (160
+ticks, where the 1-minute path flatters the break-even by several ticks a trade) and −$1,245 on
+5-minute bars.
+
+So on 23 months of MNQ no version of these signals has shown an edge that lasts beyond the data it
+was chosen on. Buying and selling where price is stretched loses less; trading with a trend, and
+judging on 1-minute bars, mislead.
 
 ## Honest limits
 
@@ -983,6 +1047,8 @@ show while the chart is open.
 | | Only trade with the day's trend | off | BUYs only above the day's open and VWAP, SHORTs only below both, none in between |
 | | Buy in discount, short in premium | off | BUYs only below the middle of the last swing range, SHORTs only above it |
 | | Premium / discount swing length (bars) | 50 | a swing high has no higher high within this many bars either side; it counts once they have closed |
+| | Max ADX (0 = off) | 0 | signals only while Wilder's 14-bar ADX is below it |
+| | Only outside yesterday's value area | off | BUYs only below the last regular session's value area low, SHORTs only above its high |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
@@ -1062,6 +1128,9 @@ chart's signals unless you switch it on:
   * **premium and discount** (off): BUYs only in the lower half of the last swing range, SHORTs
     only in the upper half, after joshyattridge/smart-money-concepts - the one idea from it that
     helped on 50 days of MNQ, see [Premium and discount](#premium-and-discount);
+  * **Max ADX and yesterday's value area** (off): signals only in a quiet market, or only outside
+    the last regular session's value area - the two confluences that cut the losses on months the
+    setup was never tuned on, see [ADX and yesterday's value area](#adx-and-yesterdays-value-area);
   * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
   * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
     tick value and a typical commission;

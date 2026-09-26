@@ -230,6 +230,8 @@ internal static class Program
 		Run("Worst-case odds: the labels' with the worst case on the chart, lower otherwise", WorstCaseOdds);
 		Run("Day's trend: every signal goes the day's way", DayTrendFilter);
 		Run("Premium / discount: buys in discount, shorts in premium", PremiumDiscountFilter);
+		Run("Max ADX: signals only while the ADX is below it", AdxFilter);
+		Run("Yesterday's value area: buys below it, shorts above", PriorValueFilter);
 		Run("Bar export: the chart's bars and footprint, as the backtest reads them", BarExport);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
@@ -1442,6 +1444,7 @@ internal static class Program
 		Check(!fresh.ShowScoreboard, "the scoreboard opens on hover");
 		Check(!fresh.OnlyWithDayTrend, "signals whatever the day's trend");
 		Check(!fresh.OnlyInDiscountOrPremium && fresh.PremiumDiscountSwingBars == 50, "signals in premium and discount alike; 50-bar swings when that is on");
+		Check(fresh.MaxAdx == 0 && !fresh.OnlyOutsidePriorValue, "signals whatever the ADX, inside yesterday's value area or out");
 
 		// every setting has its own place in the settings window
 		var orders = IndicatorType.GetProperties()
@@ -4924,6 +4927,111 @@ internal static class Program
 		var against = trades.Where(t => zone[t.EntryBar] != (t.IsLong ? -1 : 1)).ToList();
 		Check(against.Count == 0, $"every buy closes in discount, every short in premium: {against.Count} don't (first on bar {against.FirstOrDefault()?.EntryBar})");
 		Check(all.Any(t => zone[t.EntryBar] != (t.IsLong ? -1 : 1)), "and without the filter some wouldn't");
+	}
+
+	// With Max ADX: every signal comes while Wilder's 14-bar ADX, counted from the first bar, is
+	// below it - worked out here bar by bar
+	private static void AdxFilter()
+	{
+		const int max = 25;
+		var market = Generate(6000, 13);
+		var bars = market.Candles;
+		var all = Trades(RunHistorical(bars, null, market.SessionStarts));
+		var trades = Trades(RunHistorical(bars, i => i.MaxAdx = max, market.SessionStarts));
+		Check(trades.Count > 10 && trades.Count < all.Count, $"fewer signals than without the filter: {trades.Count} of {all.Count}");
+
+		var adx = new decimal[bars.Count];
+		decimal range = 0, plus = 0, minus = 0, value = 0;
+
+		for (var b = 1; b < bars.Count; b++)
+		{
+			var c = bars[b];
+			var p = bars[b - 1];
+			var up = c.High - p.High;
+			var down = p.Low - c.Low;
+			range = range * 13 / 14 + (Math.Max(c.High, p.Close) - Math.Min(c.Low, p.Close));
+			plus = plus * 13 / 14 + (up > down && up > 0 ? up : 0);
+			minus = minus * 13 / 14 + (down > up && down > 0 ? down : 0);
+			var plusDi = range > 0 ? 100 * plus / range : 0;
+			var minusDi = range > 0 ? 100 * minus / range : 0;
+			var dx = plusDi + minusDi > 0 ? 100 * Math.Abs(plusDi - minusDi) / (plusDi + minusDi) : 0;
+			value = (value * 13 + dx) / 14;
+			adx[b] = value;
+		}
+
+		var against = trades.Where(t => adx[t.EntryBar] >= max).ToList();
+		Check(against.Count == 0, $"every signal while the ADX is below {max}: {against.Count} aren't (first on bar {against.FirstOrDefault()?.EntryBar})");
+		Check(all.Any(t => adx[t.EntryBar] >= max), "and without the filter some wouldn't be");
+	}
+
+	// With Only outside yesterday's value area: every buy closes below the value area low of the last
+	// regular session to finish, every short above its high - the session's volume at each price
+	// from its footprint, its busiest price widened toward the busier side to 70% of the volume -
+	// worked out here from the bars' footprints and the system's New York clock
+	private static void PriorValueFilter()
+	{
+		var market = Generate(6000, 13);
+		var bars = market.Candles;
+		var all = Trades(RunHistorical(bars, null, market.SessionStarts));
+		var trades = Trades(RunHistorical(bars, i => i.OnlyOutsidePriorValue = true, market.SessionStarts));
+		Check(trades.Count(t => t.IsLong) > 0 && trades.Count(t => !t.IsLong) > 0 && trades.Count < all.Count,
+			$"buys and shorts, fewer than without the filter: {trades.Count} of {all.Count}");
+
+		var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+		var low = new decimal[bars.Count];
+		var high = new decimal[bars.Count];
+		var profile = new Dictionary<long, decimal>();
+		var day = DateTime.MinValue;
+		decimal val = 0, vah = 0;
+
+		for (var b = 0; b < bars.Count; b++)
+		{
+			var c = bars[b];
+			var ny = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(c.Time, DateTimeKind.Utc), newYork);
+
+			if (ny.TimeOfDay >= new TimeSpan(9, 30, 0) && ny.TimeOfDay < new TimeSpan(16, 0, 0))
+			{
+				if (ny.Date != day)
+				{
+					if (profile.Count > 0)
+					{
+						var prices = profile.Keys.OrderBy(x => x).ToList();
+						var poc = prices.IndexOf(prices.First(x => profile[x] == profile.Values.Max()));
+						int lo = poc, hi = poc;
+						var inside = profile[prices[poc]];
+
+						while (inside < profile.Values.Sum() * 0.7m && (lo > 0 || hi < prices.Count - 1))
+						{
+							var below = lo > 0 ? profile[prices[lo - 1]] : -1;
+							var above = hi < prices.Count - 1 ? profile[prices[hi + 1]] : -1;
+
+							if (above >= below)
+								inside += profile[prices[++hi]];
+							else
+								inside += profile[prices[--lo]];
+						}
+
+						(val, vah) = (prices[lo] * Tick, prices[hi] * Tick);
+					}
+
+					profile.Clear();
+					day = ny.Date;
+				}
+
+				foreach (var level in c.GetAllPriceLevels().Where(x => x.Volume > 0))
+				{
+					var price = (long)Math.Round(level.Price / Tick);
+					profile[price] = (profile.TryGetValue(price, out var had) ? had : 0) + level.Volume;
+				}
+			}
+
+			(low[b], high[b]) = (val, vah);
+		}
+
+		bool Outside(TradeView t) => low[t.EntryBar] > 0 && (t.IsLong ? bars[t.EntryBar].Close < low[t.EntryBar] : bars[t.EntryBar].Close > high[t.EntryBar]);
+		var against = trades.Where(t => !Outside(t)).ToList();
+		Check(against.Count == 0, $"every buy below yesterday's value area, every short above: {against.Count} aren't (first on bar {against.FirstOrDefault()?.EntryBar})");
+		Check(all.Any(t => !Outside(t)), "and without the filter some wouldn't be");
 	}
 
 	// FVG Bar Export writes the chart's closed bars and their footprint, as the backtest runner reads them

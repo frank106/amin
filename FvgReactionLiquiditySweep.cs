@@ -690,6 +690,10 @@ namespace ATAS.Indicators.Technical
 			public int Zone;                   // premium / discount at the last closed bar: -1 discount, 1 premium, 0 neither
 			public decimal RangeHigh;          // the swing range it is measured in (0: not known yet)
 			public decimal RangeLow;
+			public decimal Adx;                // the ADX at the last closed bar
+			public decimal PriorPoc;           // yesterday's value area (0: no session finished yet)
+			public decimal PriorVah;
+			public decimal PriorVal;
 			public Scoreboard Board;
 			public List<(string Text, Color Color)> Execution;   // null while execution is off
 		}
@@ -996,6 +1000,21 @@ namespace ATAS.Indicators.Technical
 		private decimal _rangeHigh;
 		private decimal _rangeLow;
 		private int _rangeLastSwing;
+
+		// Max ADX: Wilder's 14-bar ADX - the smoothed true range and directional movements, and the
+		// smoothed DX - from the chart's first bar
+		private decimal _adxRange;
+		private decimal _adxPlus;
+		private decimal _adxMinus;
+		private decimal _adx;
+
+		// Yesterday's value area: the volume at each price (in ticks) of the regular session being
+		// built and its day, and the last finished session's busiest price and value area
+		private readonly Dictionary<long, decimal> _sessionVolume = new Dictionary<long, decimal>();
+		private DateTime _sessionVolumeDay;
+		private decimal _priorPoc;
+		private decimal _priorVah;
+		private decimal _priorVal;
 		private bool _hasRth;
 		private decimal _rthHigh;
 		private decimal _rthLow;
@@ -1227,6 +1246,8 @@ namespace ATAS.Indicators.Technical
 		private bool _onlyWithDayTrend;
 		private bool _onlyInDiscountOrPremium;
 		private int _premiumDiscountSwingBars = 50;
+		private int _maxAdx;
+		private bool _onlyOutsidePriorValue;
 		private bool _requireDeltaConfirmation;
 		private bool _requireFillConfirmation;
 		private bool _requireCandlePattern;
@@ -1728,6 +1749,23 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _premiumDiscountSwingBars;
 			set { _premiumDiscountSwingBars = Math.Min(500, Math.Max(2, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Max ADX (0 = off)", GroupName = "Signals", Order = 117,
+			Description = "Signals only while the 14-bar ADX is below this: a quiet, ranging market rather than a trending one.")]
+		[Range(0, 100)]
+		public int MaxAdx
+		{
+			get => _maxAdx;
+			set { _maxAdx = Math.Min(100, Math.Max(0, value)); RecalculateValues(); }
+		}
+
+		[Display(Name = "Only outside yesterday's value area", GroupName = "Signals", Order = 118,
+			Description = "Buys only below the value area low of the last regular session - the prices around its busiest one that held 70% of its volume - and shorts only above its value area high.")]
+		public bool OnlyOutsidePriorValue
+		{
+			get => _onlyOutsidePriorValue;
+			set { _onlyOutsidePriorValue = value; RecalculateValues(); }
 		}
 
 		[Display(Name = "Require delta confirmation", GroupName = "Signals", Order = 107,
@@ -2483,6 +2521,15 @@ namespace ATAS.Indicators.Technical
 			_rangeHigh = 0;
 			_rangeLow = 0;
 			_rangeLastSwing = 0;
+			_adxRange = 0;
+			_adxPlus = 0;
+			_adxMinus = 0;
+			_adx = 0;
+			_sessionVolume.Clear();
+			_sessionVolumeDay = DateTime.MinValue;
+			_priorPoc = 0;
+			_priorVah = 0;
+			_priorVal = 0;
 			_hasRth = false;
 			_hasPriorRth = false;
 			_hasOvernight = false;
@@ -2568,6 +2615,11 @@ namespace ATAS.Indicators.Technical
 
 			if (OnlyInDiscountOrPremium)
 				UpdateSwingRange(bar);
+
+			UpdateAdx(bar, candle);
+
+			if (OnlyOutsidePriorValue)
+				UpdateValueArea(candle);
 
 			if (bar < SwingLookback + 3)
 				return;
@@ -3046,6 +3098,112 @@ namespace ATAS.Indicators.Technical
 
 			var middle = (_rangeHigh + _rangeLow) / 2;
 			return close < middle ? -1 : close > middle ? 1 : 0;
+		}
+
+		// Wilder's 14-bar ADX through a closed bar, counted from the chart's first bar
+		private void UpdateAdx(int bar, IndicatorCandle candle)
+		{
+			if (bar == 0)
+				return;
+
+			var prior = GetCandle(bar - 1);
+			var up = candle.High - prior.High;
+			var down = prior.Low - candle.Low;
+			_adxRange = _adxRange * 13 / 14 + (Math.Max(candle.High, prior.Close) - Math.Min(candle.Low, prior.Close));
+			_adxPlus = _adxPlus * 13 / 14 + (up > down && up > 0 ? up : 0);
+			_adxMinus = _adxMinus * 13 / 14 + (down > up && down > 0 ? down : 0);
+			var plus = _adxRange > 0 ? 100 * _adxPlus / _adxRange : 0;
+			var minus = _adxRange > 0 ? 100 * _adxMinus / _adxRange : 0;
+			var dx = plus + minus > 0 ? 100 * Math.Abs(plus - minus) / (plus + minus) : 0;
+			_adx = (_adx * 13 + dx) / 14;
+		}
+
+		// Adds a closed regular-hours bar's volume to its session's profile - at each price of its
+		// footprint, or spread evenly over its range when it has none - and when the next session
+		// opens, turns the finished one into yesterday's value area
+		private void UpdateValueArea(IndicatorCandle candle)
+		{
+			var newYork = NewYorkTime(candle.Time);
+
+			if (!IsRegularHours(newYork.TimeOfDay))
+				return;
+
+			if (newYork.Date != _sessionVolumeDay)
+			{
+				if (_sessionVolume.Count > 0)
+					SetPriorValueArea();
+
+				_sessionVolume.Clear();
+				_sessionVolumeDay = newYork.Date;
+			}
+
+			var tick = TickSize;
+			var levels = candle.GetAllPriceLevels()?.Where(x => x.Volume > 0).ToList();
+
+			void AddAt(long price, decimal volume)
+			{
+				_sessionVolume[price] = (_sessionVolume.TryGetValue(price, out var had) ? had : 0) + volume;
+			}
+
+			if (levels != null && levels.Count > 0)
+			{
+				foreach (var level in levels)
+					AddAt((long)Math.Round(level.Price / tick), level.Volume);
+
+				return;
+			}
+
+			var low = (long)Math.Round(candle.Low / tick);
+			var high = (long)Math.Round(candle.High / tick);
+			var each = Math.Max(candle.Volume, 0) / (high - low + 1);
+
+			for (var price = low; price <= high; price++)
+				AddAt(price, each);
+		}
+
+		// The value area of the session just finished: its busiest price (the lowest of equals), widened
+		// a price at a time toward the busier neighbour until it holds 70% of the session's volume
+		private void SetPriorValueArea()
+		{
+			var prices = _sessionVolume.Keys.OrderBy(x => x).ToList();
+			var total = _sessionVolume.Values.Sum();
+			var poc = 0;
+
+			for (var i = 1; i < prices.Count; i++)
+			{
+				if (_sessionVolume[prices[i]] > _sessionVolume[prices[poc]])
+					poc = i;
+			}
+
+			var low = poc;
+			var high = poc;
+			var inside = _sessionVolume[prices[poc]];
+
+			while (inside < total * 0.7m && (low > 0 || high < prices.Count - 1))
+			{
+				var below = low > 0 ? _sessionVolume[prices[low - 1]] : -1;
+				var above = high < prices.Count - 1 ? _sessionVolume[prices[high + 1]] : -1;
+
+				if (above >= below)
+					inside += _sessionVolume[prices[++high]];
+				else
+					inside += _sessionVolume[prices[--low]];
+			}
+
+			var tick = TickSize;
+			_priorPoc = prices[poc] * tick;
+			_priorVah = prices[high] * tick;
+			_priorVal = prices[low] * tick;
+		}
+
+		// whether a close is past yesterday's value area on the signal's side: below its low for a
+		// buy, above its high for a short (false until a session has finished)
+		private bool OutsidePriorValue(decimal close, bool isLong)
+		{
+			if (_priorVal <= 0 || _priorVah <= 0)
+				return false;
+
+			return isLong ? close < _priorVal : close > _priorVah;
 		}
 
 		// whether a bar (by its open time) may give a signal
@@ -4214,6 +4372,8 @@ namespace ATAS.Indicators.Technical
 			if ((OnlyWithTrend && !withTrend)
 				|| (OnlyWithDayTrend && DayTrend(candle.Close) != (isLong ? 1 : -1))
 				|| (OnlyInDiscountOrPremium && PremiumDiscount(candle.Close) != (isLong ? -1 : 1))
+				|| (MaxAdx > 0 && _adx >= MaxAdx)
+				|| (OnlyOutsidePriorValue && !OutsidePriorValue(candle.Close, isLong))
 				|| (RequireDeltaConfirmation && !deltaConfirms)
 				|| (RequireFillConfirmation && !fillConfirms)
 				|| (RequireCandlePattern && !hasPattern))
@@ -6828,6 +6988,10 @@ namespace ATAS.Indicators.Technical
 				Zone = _lastClosedBar >= 0 && _lastClosedBar < CurrentBar ? PremiumDiscount(GetCandle(_lastClosedBar).Close) : 0,
 				RangeHigh = _rangeHigh,
 				RangeLow = _rangeLow,
+				Adx = _adx,
+				PriorPoc = _priorPoc,
+				PriorVah = _priorVah,
+				PriorVal = _priorVal,
 				Board = withScoreboard ? BuildScoreboard() : null,
 				Execution = ExecutionPanelLines()
 			};
@@ -7407,6 +7571,23 @@ namespace ATAS.Indicators.Technical
 					zone += $" · range {FormatPrice(stats.RangeLow)} – {FormatPrice(stats.RangeHigh)}";
 
 				footer.Insert(OnlyWithDayTrend && stats.DayOpen > 0 ? 3 : 2, (zone, DimTextColor));
+			}
+
+			// with Max ADX and yesterday's value area: whether the market is quiet enough now, and where
+			// signals may come from
+			var filterLine = Math.Min(footer.Count, 2 + (OnlyWithDayTrend && stats.DayOpen > 0 ? 1 : 0) + (OnlyInDiscountOrPremium ? 1 : 0));
+
+			if (MaxAdx > 0)
+			{
+				var adx = stats.Adx.ToString("0.0", CultureInfo.InvariantCulture);
+				footer.Insert(filterLine++, (stats.Adx < MaxAdx ? $"ADX {adx}, below {MaxAdx}: signals on" : $"ADX {adx}, {MaxAdx} or more: no signals", DimTextColor));
+			}
+
+			if (OnlyOutsidePriorValue)
+			{
+				footer.Insert(Math.Min(footer.Count, filterLine), (stats.PriorVah > 0
+					? $"Yesterday's value area {FormatPrice(stats.PriorVal)} – {FormatPrice(stats.PriorVah)} (POC {FormatPrice(stats.PriorPoc)}): buys below it, shorts above"
+					: "Yesterday's value area: waiting for a regular session to finish", DimTextColor));
 			}
 
 			var restingSize = RestingSize == RestingSizeRule.FixedContracts
