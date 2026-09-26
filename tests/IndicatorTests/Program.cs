@@ -232,6 +232,7 @@ internal static class Program
 		Run("Premium / discount: buys in discount, shorts in premium", PremiumDiscountFilter);
 		Run("Max ADX: signals only while the ADX is below it", AdxFilter);
 		Run("Yesterday's value area: buys below it, shorts above", PriorValueFilter);
+		Run("Skip the day after a quiet one: no signals after a narrow session", QuietDayFilter);
 		Run("Bar export: the chart's bars and footprint, as the backtest reads them", BarExport);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
@@ -1445,6 +1446,7 @@ internal static class Program
 		Check(!fresh.OnlyWithDayTrend, "signals whatever the day's trend");
 		Check(!fresh.OnlyInDiscountOrPremium && fresh.PremiumDiscountSwingBars == 50, "signals in premium and discount alike; 50-bar swings when that is on");
 		Check(fresh.MaxAdx == 0 && !fresh.OnlyOutsidePriorValue, "signals whatever the ADX, inside yesterday's value area or out");
+		Check(fresh.SkipAfterQuietDayPercent == 0, "signals after quiet sessions too");
 
 		// every setting has its own place in the settings window
 		var orders = IndicatorType.GetProperties()
@@ -5032,6 +5034,57 @@ internal static class Program
 		var against = trades.Where(t => !Outside(t)).ToList();
 		Check(against.Count == 0, $"every buy below yesterday's value area, every short above: {against.Count} aren't (first on bar {against.FirstOrDefault()?.EntryBar})");
 		Check(all.Any(t => !Outside(t)), "and without the filter some wouldn't be");
+	}
+
+	// With Skip the day after a quiet one: no signal while the last finished regular session's range
+	// was under the share of the average of the 20 before it - sessions followed by the system's New
+	// York clock, each finished by the first bar after it - worked out here bar by bar
+	private static void QuietDayFilter()
+	{
+		const int percent = 90;
+		var market = Generate(34000, 17);
+		var bars = market.Candles;
+		var all = Trades(RunHistorical(bars, null, market.SessionStarts));
+		var trades = Trades(RunHistorical(bars, i => i.SkipAfterQuietDayPercent = percent, market.SessionStarts));
+		Check(trades.Count > 10 && trades.Count < all.Count, $"fewer signals than without the filter: {trades.Count} of {all.Count}");
+
+		var newYork = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
+		var quiet = new bool[bars.Count];
+		var ranges = new List<decimal>();
+		var day = DateTime.MinValue;
+		decimal high = 0, low = 0;
+
+		for (var b = 0; b < bars.Count; b++)
+		{
+			var c = bars[b];
+			var ny = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(c.Time, DateTimeKind.Utc), newYork);
+			var regular = ny.TimeOfDay >= new TimeSpan(9, 30, 0) && ny.TimeOfDay < new TimeSpan(16, 0, 0);
+
+			if (day != DateTime.MinValue && (!regular || ny.Date != day))
+			{
+				ranges.Add(high - low);
+				day = DateTime.MinValue;
+			}
+
+			if (regular)
+			{
+				if (day == DateTime.MinValue)
+					(day, high, low) = (ny.Date, c.High, c.Low);
+				else
+					(high, low) = (Math.Max(high, c.High), Math.Min(low, c.Low));
+			}
+
+			if (ranges.Count >= 21)
+			{
+				var average = ranges.Skip(ranges.Count - 21).Take(20).Average();
+				quiet[b] = average > 0 && ranges[^1] / average * 100 < percent;
+			}
+		}
+
+		Check(ranges.Count >= 22, $"enough sessions to judge: {ranges.Count}");
+		var against = trades.Where(t => quiet[t.EntryBar]).ToList();
+		Check(against.Count == 0, $"no signal after a quiet session: {against.Count} are (first on bar {against.FirstOrDefault()?.EntryBar})");
+		Check(all.Any(t => quiet[t.EntryBar]), "and without the filter some are");
 	}
 
 	// FVG Bar Export writes the chart's closed bars and their footprint, as the backtest runner reads them

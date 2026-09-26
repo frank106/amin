@@ -201,7 +201,10 @@ only once the bars after it have closed; flipping the filter's sides makes 824 s
 With *Max ADX* at 25, every signal comes while Wilder's 14-bar ADX, worked out bar by bar, is below
 it (flipped, 1,310 fail); with *Only outside yesterday's value area*, every BUY closes below the
 last finished regular session's value area low and every SHORT above its high, the value area
-worked out from the bars' footprints (flipped, 570 fail).
+worked out from the bars' footprints (flipped, 570 fail); with *Skip the day after a quiet one* at
+90%, no signal comes while the last finished regular session's range was under 90% of the average of
+the 20 before it, the sessions followed bar by bar on 34,000 bars of a random market (flipped, 345
+fail).
 
 Every one of 24 deliberate bugs put into the execution code as first written (a hidden signal traded, the breaker
 late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes

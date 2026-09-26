@@ -383,6 +383,25 @@ without making them profitable:
 
 The panel shows the ADX and yesterday's value area while either is on.
 
+### Quiet days and news days
+
+With *Skip the day after a quiet one* set (a share of the usual range, 0 = off), there are no signals
+on a day that follows a regular session whose range was under that share of the average of the 20
+sessions before it. It needs 21 finished sessions on the chart, so load 30 days. At 70%, on top of
+the setup in [On ATAS's own data](#on-atass-own-data) with *Max ADX* 20, it improved both unseen
+stretches of the 15-month test - the executor's −$113 → +$15 and −$258 → −$48, each trade −3.0 →
+−1.9 and −0.4 → +0.8 ticks - and 60% did too, but 80% and 90% did not, so the level matters and may
+be partly luck. The panel says how the last session's range compared.
+
+Two related ideas didn't help, so they aren't built in:
+
+* skipping FOMC statement days and CPI release days (from the Federal Reserve's and the BLS's
+  calendars; 8 and 13 of the 252 days with signals) helped the design months and hurt the holdout.
+  Signals from 09:30 to 12:30 come after CPI's 08:30 release and before FOMC's 14:00 statement;
+* skipping days that turned out to trade in a narrow range - which a live bot can't know until the
+  day is over - made each remaining trade worse even with that hindsight (−3.0 → −4.1 ticks in the
+  design months): the losses aren't on the choppy days.
+
 ### Where the probability comes from
 
 Every signal on the chart is followed forward until it ends: at the TP, at the break-even stop
@@ -1049,6 +1068,7 @@ show while the chart is open.
 | | Premium / discount swing length (bars) | 50 | a swing high has no higher high within this many bars either side; it counts once they have closed |
 | | Max ADX (0 = off) | 0 | signals only while Wilder's 14-bar ADX is below it |
 | | Only outside yesterday's value area | off | BUYs only below the last regular session's value area low, SHORTs only above its high |
+| | Skip the day after a quiet one (% of usual range, 0 = off) | 0 | no signals on a day after a regular session under this share of the average of the 20 before it |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
@@ -1131,6 +1151,9 @@ chart's signals unless you switch it on:
   * **Max ADX and yesterday's value area** (off): signals only in a quiet market, or only outside
     the last regular session's value area - the two confluences that cut the losses on months the
     setup was never tuned on, see [ADX and yesterday's value area](#adx-and-yesterdays-value-area);
+  * **skip the day after a quiet one** (off): no signals after a regular session with an unusually
+    narrow range; FOMC and CPI days, and choppy days, were tested too - see
+    [Quiet days and news days](#quiet-days-and-news-days);
   * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
   * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
     tick value and a typical commission;

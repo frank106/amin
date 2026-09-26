@@ -694,6 +694,7 @@ namespace ATAS.Indicators.Technical
 			public decimal PriorPoc;           // yesterday's value area (0: no session finished yet)
 			public decimal PriorVah;
 			public decimal PriorVal;
+			public decimal QuietRatio;         // the last session's range against the 20 before it (0: not known yet)
 			public Scoreboard Board;
 			public List<(string Text, Color Color)> Execution;   // null while execution is off
 		}
@@ -1015,6 +1016,13 @@ namespace ATAS.Indicators.Technical
 		private decimal _priorPoc;
 		private decimal _priorVah;
 		private decimal _priorVal;
+
+		// Skip the day after a quiet one: the regular session being followed (its New York date, high
+		// and low; no date = none) and the ranges of the sessions that have finished, oldest first
+		private DateTime _quietSessionDay;
+		private decimal _quietSessionHigh;
+		private decimal _quietSessionLow;
+		private readonly List<decimal> _sessionRanges = new List<decimal>();
 		private bool _hasRth;
 		private decimal _rthHigh;
 		private decimal _rthLow;
@@ -1248,6 +1256,7 @@ namespace ATAS.Indicators.Technical
 		private int _premiumDiscountSwingBars = 50;
 		private int _maxAdx;
 		private bool _onlyOutsidePriorValue;
+		private int _skipAfterQuietDayPercent;
 		private bool _requireDeltaConfirmation;
 		private bool _requireFillConfirmation;
 		private bool _requireCandlePattern;
@@ -1766,6 +1775,15 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _onlyOutsidePriorValue;
 			set { _onlyOutsidePriorValue = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Skip the day after a quiet one (% of usual range, 0 = off)", GroupName = "Signals", Order = 119,
+			Description = "No signals on a day that follows a regular session whose range was under this share of the average of the 20 sessions before it. Needs 21 finished sessions on the chart.")]
+		[Range(0, 100)]
+		public int SkipAfterQuietDayPercent
+		{
+			get => _skipAfterQuietDayPercent;
+			set { _skipAfterQuietDayPercent = Math.Min(100, Math.Max(0, value)); RecalculateValues(); }
 		}
 
 		[Display(Name = "Require delta confirmation", GroupName = "Signals", Order = 107,
@@ -2530,6 +2548,10 @@ namespace ATAS.Indicators.Technical
 			_priorPoc = 0;
 			_priorVah = 0;
 			_priorVal = 0;
+			_quietSessionDay = DateTime.MinValue;
+			_quietSessionHigh = 0;
+			_quietSessionLow = 0;
+			_sessionRanges.Clear();
 			_hasRth = false;
 			_hasPriorRth = false;
 			_hasOvernight = false;
@@ -2620,6 +2642,9 @@ namespace ATAS.Indicators.Technical
 
 			if (OnlyOutsidePriorValue)
 				UpdateValueArea(candle);
+
+			if (SkipAfterQuietDayPercent > 0)
+				UpdateSessionRanges(candle);
 
 			if (bar < SwingLookback + 3)
 				return;
@@ -3204,6 +3229,54 @@ namespace ATAS.Indicators.Technical
 				return false;
 
 			return isLong ? close < _priorVal : close > _priorVah;
+		}
+
+		// Follows the regular session through a closed bar: its range grows while it lasts, and goes to
+		// the finished sessions with the first bar after it (after 16:00, or the next day's first)
+		private void UpdateSessionRanges(IndicatorCandle candle)
+		{
+			var newYork = NewYorkTime(candle.Time);
+			var regular = IsRegularHours(newYork.TimeOfDay);
+
+			if (_quietSessionDay != DateTime.MinValue && (!regular || newYork.Date != _quietSessionDay))
+			{
+				_sessionRanges.Add(_quietSessionHigh - _quietSessionLow);
+				_quietSessionDay = DateTime.MinValue;
+			}
+
+			if (!regular)
+				return;
+
+			if (_quietSessionDay == DateTime.MinValue)
+			{
+				_quietSessionDay = newYork.Date;
+				_quietSessionHigh = candle.High;
+				_quietSessionLow = candle.Low;
+				return;
+			}
+
+			_quietSessionHigh = Math.Max(_quietSessionHigh, candle.High);
+			_quietSessionLow = Math.Min(_quietSessionLow, candle.Low);
+		}
+
+		// the last finished regular session's range against the average of the 20 before it (0 until
+		// 21 have finished)
+		private decimal QuietRatio()
+		{
+			var count = _sessionRanges.Count;
+
+			if (count < 21)
+				return 0;
+
+			var average = _sessionRanges.Skip(count - 21).Take(20).Average();
+			return average > 0 ? _sessionRanges[count - 1] / average : 0;
+		}
+
+		// whether the last finished session was quiet enough for Skip the day after a quiet one
+		private bool AfterQuietDay()
+		{
+			var ratio = QuietRatio();
+			return ratio > 0 && ratio * 100 < SkipAfterQuietDayPercent;
 		}
 
 		// whether a bar (by its open time) may give a signal
@@ -4374,6 +4447,7 @@ namespace ATAS.Indicators.Technical
 				|| (OnlyInDiscountOrPremium && PremiumDiscount(candle.Close) != (isLong ? -1 : 1))
 				|| (MaxAdx > 0 && _adx >= MaxAdx)
 				|| (OnlyOutsidePriorValue && !OutsidePriorValue(candle.Close, isLong))
+				|| (SkipAfterQuietDayPercent > 0 && AfterQuietDay())
 				|| (RequireDeltaConfirmation && !deltaConfirms)
 				|| (RequireFillConfirmation && !fillConfirms)
 				|| (RequireCandlePattern && !hasPattern))
@@ -6992,6 +7066,7 @@ namespace ATAS.Indicators.Technical
 				PriorPoc = _priorPoc,
 				PriorVah = _priorVah,
 				PriorVal = _priorVal,
+				QuietRatio = QuietRatio(),
 				Board = withScoreboard ? BuildScoreboard() : null,
 				Execution = ExecutionPanelLines()
 			};
@@ -7585,9 +7660,19 @@ namespace ATAS.Indicators.Technical
 
 			if (OnlyOutsidePriorValue)
 			{
-				footer.Insert(Math.Min(footer.Count, filterLine), (stats.PriorVah > 0
+				footer.Insert(Math.Min(footer.Count, filterLine++), (stats.PriorVah > 0
 					? $"Yesterday's value area {FormatPrice(stats.PriorVal)} – {FormatPrice(stats.PriorVah)} (POC {FormatPrice(stats.PriorPoc)}): buys below it, shorts above"
 					: "Yesterday's value area: waiting for a regular session to finish", DimTextColor));
+			}
+
+			if (SkipAfterQuietDayPercent > 0)
+			{
+				var share = (stats.QuietRatio * 100).ToString("0", CultureInfo.InvariantCulture);
+				footer.Insert(Math.Min(footer.Count, filterLine), (stats.QuietRatio <= 0
+					? "Skip the day after a quiet one: needs 21 finished regular sessions on the chart"
+					: stats.QuietRatio * 100 < SkipAfterQuietDayPercent
+						? $"The last session's range was {share}% of usual, under {SkipAfterQuietDayPercent}%: no signals until the next one"
+						: $"The last session's range was {share}% of usual: signals on", DimTextColor));
 			}
 
 			var restingSize = RestingSize == RestingSizeRule.FixedContracts
