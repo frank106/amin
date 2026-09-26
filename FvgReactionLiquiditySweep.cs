@@ -1281,6 +1281,7 @@ namespace ATAS.Indicators.Technical
 		private bool _countAccountPnl = true;
 		private TimeSpan _flatByTime;
 		private int _flatByLastEntryMinutes = 10;
+		private bool _breakEvenFromFill;
 		private OrderLifetime _liveTimeInForce;
 		private decimal _tickValue = 5m;
 		private decimal _commissionPerContract = 5m;
@@ -2205,6 +2206,14 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _flatByLastEntryMinutes;
 			set { _flatByLastEntryMinutes = Math.Min(600, Math.Max(0, value)); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Break-even stop from the fill", GroupName = "Execution", Order = 510,
+			Description = "Off: the stop moves to the signal's break-even price, as on the chart. On: to the same profit counted from the position's average fill, so slippage on the entry doesn't eat into it. It still moves when the chart's trade reaches its trigger.")]
+		public bool BreakEvenFromFill
+		{
+			get => _breakEvenFromFill;
+			set { _breakEvenFromFill = value; _execConfigDirty = true; }
 		}
 
 		[Display(Name = "Time in force (live orders)", GroupName = "Execution", Order = 511,
@@ -5215,7 +5224,7 @@ namespace ATAS.Indicators.Technical
 				return;
 			}
 
-			var stop = pos.StopMoved ? trade.BreakEvenPrice : trade.StopLossPrice;
+			var stop = pos.StopMoved ? BreakEvenStop(pos) : trade.StopLossPrice;
 
 			// price has reached the stop by the time the entry filled: no stop order could rest there
 			if (pos.IsLong ? _execPrice <= stop : _execPrice >= stop)
@@ -5254,11 +5263,26 @@ namespace ATAS.Indicators.Technical
 			}
 		}
 
+		// Where the stop moves at break-even: the signal's break-even price, or with Break-even stop
+		// from the fill the same profit counted from the position's average fill - on the tick grid,
+		// keeping at least that profit
+		private decimal BreakEvenStop(ExecPosition pos)
+		{
+			var trade = pos.Trade;
+
+			if (!BreakEvenFromFill || pos.Entered == 0)
+				return trade.BreakEvenPrice;
+
+			var tick = TickSize;
+			var ticks = (pos.AverageEntry + (pos.IsLong ? 1 : -1) * trade.LockedTicks * tick) / tick;
+			return (pos.IsLong ? Math.Ceiling(ticks) : Math.Floor(ticks)) * tick;
+		}
+
 		// The chart's trade reached its break-even trigger: the stop moves to its break-even price
 		private void MoveStopToBreakEven(ExecPosition pos)
 		{
 			var trade = pos.Trade;
-			var price = trade.BreakEvenPrice;
+			var price = BreakEvenStop(pos);
 			pos.StopMoved = true;
 
 			if (pos.IsLong ? _execPrice <= price : _execPrice >= price)
@@ -5270,7 +5294,8 @@ namespace ATAS.Indicators.Technical
 			pos.StopPrice = price;
 
 			if (pos.Stop != null && pos.Stop.Working && !pos.Stop.CancelSent)
-				ModifyExecOrder(pos, pos.Stop, price, pos.Stop.Quantity, $"break-even: +{trade.TriggerTicks}t reached, the stop moves to +{trade.LockedTicks}t");
+				ModifyExecOrder(pos, pos.Stop, price, pos.Stop.Quantity,
+					$"break-even: +{trade.TriggerTicks}t reached, the stop moves to +{trade.LockedTicks}t{(BreakEvenFromFill ? " from the fill" : string.Empty)}");
 		}
 
 		// Closes the position at market: cancels the stop and the take profit first, and sends the
@@ -5874,6 +5899,9 @@ namespace ATAS.Indicators.Technical
 
 			if (FlatByOn)
 				parts.Add($"flat by {ClockTime(FlatByTime)} New York, last entry {ClockTime(LastEntryTime)}");
+
+			if (BreakEvenFromFill)
+				parts.Add("break-even counted from the fill");
 
 			if (!PaperTrading && LiveTimeInForce != OrderLifetime.ConnectionDefault)
 				parts.Add(LiveTimeInForce == OrderLifetime.Day ? "live orders good for the day" : "live orders good till cancelled");

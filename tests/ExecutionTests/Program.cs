@@ -52,6 +52,7 @@ internal static class Program
 		Run("One trade at a time: hidden signals and overlapping ones are skipped", OneTradeAtATime);
 		Run("Time exits: Max bars in trade and the session end close at market", TimeExits);
 		Run("Flat by: closed at market at a set time, no entries before it, the next day again", FlatBy);
+		Run("Break-even stop from the fill: the locked profit counted from the average fill", BreakEvenFromTheFill);
 		Run("History never trades", HistoryNeverTrades);
 		Run("Recalculating the chart keeps the open position and its orders", RecalculationKeepsThePosition);
 		Run("Panel lines and alerts", PanelAndAlerts);
@@ -123,12 +124,13 @@ internal static class Program
 		Check(fresh.FlatByTime == TimeSpan.Zero && fresh.FlatByLastEntryMinutes == 10, "no flat-by time; with one, no entries in its last 10 minutes");
 		Check(fresh.CountAccountPnl, "live, the account's closed P&L counts toward the limit");
 		Check(fresh.LiveTimeInForce == FvgReactionLiquiditySweep.OrderLifetime.ConnectionDefault, "live orders at the connection's time in force");
+		Check(!fresh.BreakEvenFromFill, "the break-even stop at the signal's price, as on the chart");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 15, $"fifteen settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 16, $"sixteen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -475,6 +477,41 @@ internal static class Program
 		rows = Rows(session);
 		Check(Only(rows, "CHART")["chart_outcome"] == "EXP" && Only(rows, "FILL", "exit")["price"] == "105.75",
 			$"closed at the next session's first price: {Describe(rows)}");
+	}
+
+	private static void BreakEvenFromTheFill()
+	{
+		// filled at 103.75, a tick above the signal's 103.50: the stop moves to 108.75, +20t from the fill
+		var ind = Buy(i => i.BreakEvenFromFill = true);
+		StreamBar(ind, new[] { 103.5m, 104, 110, 109 });                      // 20: in at 103.75
+		StreamBar(ind, new[] { 109m, 115, 110, 108.75m, 108.5m });            // 21: +46t, then back down
+
+		var rows = Rows(ind);
+		var modify = Only(rows, "MODIFY", "stop");
+		Check(modify["price"] == "108.75" && modify["note"] == "break-even: +40t reached, the stop moves to +20t from the fill",
+			$"the stop moves to 108.75: {modify["price"]} ({modify["note"]})");
+		Check(Only(rows, "FILL", "stop")["price"] == "108.5", "and fills a tick worse, at 108.50");
+
+		var closed = Only(rows, "CLOSED");
+		Check(closed["pnl_ticks"] == "19" && closed["pnl_usd"] == "90.00", $"+19t, where the signal's break-even price made +18t: {closed["pnl_ticks"]}");
+		Check(Only(rows, "MODE")["note"].EndsWith(" · break-even counted from the fill", StringComparison.Ordinal), "the MODE row says so");
+
+		// live, two contracts filled at 103.75 and 104.00: +20t from their 103.875 average, up to the
+		// next tick, is 109.00
+		var broker = new FakeBroker();
+		var live = Buy(Live(broker, i =>
+		{
+			i.Contracts = 2;
+			i.BreakEvenFromFill = true;
+		}));
+		var bar = OpenBar(live, 103.5m);
+		broker.Fill(live, broker.Calls[0].Order, 103.75m, 1, "F1");
+		broker.Fill(live, broker.Calls[0].Order, 104, 1, "F2");
+		broker.Position.Volume = 2;
+		AddTick(live, bar, 115);
+		var moved = broker.Calls.Last(c => c.Name == "modify");
+		Check(moved.NewOrder.Type == OrderTypes.Stop && moved.NewOrder.TriggerPrice == 109 && moved.NewOrder.QuantityToFill == 2,
+			$"the live stop moves to 109.00: {moved.NewOrder.TriggerPrice}");
 	}
 
 	private static void FlatBy()
