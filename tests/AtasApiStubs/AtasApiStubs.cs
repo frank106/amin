@@ -542,7 +542,11 @@ namespace ATAS.Indicators
 	{
 		public decimal TickSize { get; set; } = 0.25m;
 		public string Instrument { get; set; } = "NQ";
+#if ATAS_TIMEZONE_HOURS
+		public int TimeZone { get; set; }                  // older ATAS (classic 8.0.14): whole hours
+#else
 		public TimeSpan TimeZoneOffset { get; set; }
+#endif
 	}
 
 	public class MouseLocationInfo

@@ -1,10 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <!-- Builds FvgReactionLiquiditySweep.dll against an installed ATAS.
 
-       Windows, classic ATAS Platform: one DLL per runtime, as docs.atas.net recommends.
-       Copy the one matching your ATAS version from bin\Release\net8.0-windows or
-       bin\Release\net10.0-windows into %APPDATA%\ATAS\Indicators (or Documents\ATAS\Indicators).
-       Building the net10.0 target needs the .NET 10 SDK.
+       Windows, classic ATAS Platform: one DLL per runtime, as docs.atas.net recommends. The
+       build makes the one for the .NET the installed ATAS runs on, in bin\Release\net10.0-windows
+       (or bin\Release\net8.0-windows); copy it into %APPDATA%\ATAS\Indicators (or
+       Documents\ATAS\Indicators). Building the net10.0 target needs the .NET 10 SDK.
 
        macOS, ATAS X: builds against the libraries inside the ATAS X app. Copy
        bin/Release/net10.0/FvgReactionLiquiditySweep.dll into
@@ -20,20 +20,30 @@
 
   <!-- override ATAS_BASE with -p:ATAS_BASE=... if ATAS is installed elsewhere -->
   <PropertyGroup Condition=" '$(AtasX)' != 'true' ">
-    <TargetFrameworks>net8.0-windows;net10.0-windows</TargetFrameworks>
+    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files (x86)/ATAS Platform</ATAS_BASE>
+    <!-- only the DLL for the .NET the installed ATAS runs on, as its runtimeconfig names it; both
+         when that can't be read. -p:TargetFrameworks=net8.0-windows picks one by hand. -->
+    <_AtasRuntimeConfig>$(ATAS_BASE)/OFT.Platform.runtimeconfig.json</_AtasRuntimeConfig>
+    <_AtasRuntime Condition=" Exists('$(_AtasRuntimeConfig)') ">$([System.IO.File]::ReadAllText('$(_AtasRuntimeConfig)'))</_AtasRuntime>
+    <TargetFrameworks Condition=" '$(TargetFrameworks)' == '' And $(_AtasRuntime.Contains('net10.0')) ">net10.0-windows</TargetFrameworks>
+    <TargetFrameworks Condition=" '$(TargetFrameworks)' == '' And $(_AtasRuntime.Contains('net8.0')) ">net8.0-windows</TargetFrameworks>
+    <TargetFrameworks Condition=" '$(TargetFrameworks)' == '' ">net8.0-windows;net10.0-windows</TargetFrameworks>
     <UseWPF>true</UseWPF>
     <!-- .NET 8's WPF reference pack leaves out System.Drawing.Common (DashStyle); the Windows
          Forms one brings it, as .NET 10's WPF pack does on its own -->
     <UseWindowsForms Condition=" '$(TargetFramework)' == 'net8.0-windows' ">true</UseWindowsForms>
-    <!-- classic ATAS has IInstrumentInfo.TimeZone (hours) where ATAS X has TimeZoneOffset -->
-    <DefineConstants>$(DefineConstants);ATAS_CLASSIC</DefineConstants>
-    <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files (x86)/ATAS Platform</ATAS_BASE>
   </PropertyGroup>
 
   <PropertyGroup Condition=" '$(AtasX)' == 'true' ">
     <TargetFramework>net10.0</TargetFramework>
     <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' And $([MSBuild]::IsOSPlatform('OSX')) ">/Applications/ATAS X.app/Contents/MonoBundle</ATAS_BASE>
     <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files/ATAS X</ATAS_BASE>
+  </PropertyGroup>
+
+  <!-- ATAS gives the chart's time zone as IInstrumentInfo.TimeZoneOffset; older versions (classic
+       ATAS 8.0.14) only have TimeZone, in whole hours. Read off the ATAS being built against. -->
+  <PropertyGroup Condition=" Exists('$(ATAS_BASE)/ATAS.Indicators.dll') And $([System.IO.File]::ReadAllText('$(ATAS_BASE)/ATAS.Indicators.dll').Contains('TimeZoneOffset')) == 'false' ">
+    <DefineConstants>$(DefineConstants);ATAS_TIMEZONE_HOURS</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

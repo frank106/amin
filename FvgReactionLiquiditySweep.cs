@@ -7230,10 +7230,15 @@ namespace ATAS.Indicators.Technical
 
 		#region Helpers
 
+		// classic ATAS's Indicator has a TickSize of its own; this one falls back to 0.01 when the
+		// chart has no instrument yet
+#pragma warning disable CS0108
 		private decimal TickSize => InstrumentInfo != null && InstrumentInfo.TickSize > 0 ? InstrumentInfo.TickSize : 0.01m;
+#pragma warning restore CS0108
 
-		// the chart's time zone: classic ATAS gives it in whole hours (TimeZone), ATAS X as a TimeSpan
-#if ATAS_CLASSIC
+		// the chart's time zone: a TimeSpan, or whole hours (TimeZone) on older ATAS versions - the
+		// build reads which one the installed ATAS has
+#if ATAS_TIMEZONE_HOURS
 		private TimeSpan ChartTimeZoneOffset => TimeSpan.FromHours(InstrumentInfo.TimeZone);
 #else
 		private TimeSpan ChartTimeZoneOffset => InstrumentInfo.TimeZoneOffset;
