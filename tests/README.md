@@ -194,7 +194,10 @@ What it checks:
 `IndicatorTests` checks the worst-case odds themselves: with the chart settling the worst case too,
 they equal the labels' trade by trade; with the default rule they differ and lean lower. It also
 checks the day's trend on a random market with volume: with *Only trade with the day's trend* on,
-every signal goes the day's way, worked out bar by bar with the system's own New York clock.
+every signal goes the day's way, worked out bar by bar with the system's own New York clock. And
+with *Buy in discount, short in premium* on, every BUY closes below the middle of the last swing
+range and every SHORT above it, the swings worked out bar by bar from the bars alone, each counted
+only once the bars after it have closed; flipping the filter's sides makes 824 signals fail it.
 
 Every one of 24 deliberate bugs put into the execution code as first written (a hidden signal traded, the breaker
 late, the stop placed after the take profit, slippage the wrong way, fills counted twice...) makes

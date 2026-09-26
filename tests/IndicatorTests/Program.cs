@@ -229,6 +229,7 @@ internal static class Program
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
 		Run("Worst-case odds: the labels' with the worst case on the chart, lower otherwise", WorstCaseOdds);
 		Run("Day's trend: every signal goes the day's way", DayTrendFilter);
+		Run("Premium / discount: buys in discount, shorts in premium", PremiumDiscountFilter);
 		Run("Bar export: the chart's bars and footprint, as the backtest reads them", BarExport);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
@@ -1440,6 +1441,7 @@ internal static class Program
 			"resting orders of 70 contracts");
 		Check(!fresh.ShowScoreboard, "the scoreboard opens on hover");
 		Check(!fresh.OnlyWithDayTrend, "signals whatever the day's trend");
+		Check(!fresh.OnlyInDiscountOrPremium && fresh.PremiumDiscountSwingBars == 50, "signals in premium and discount alike; 50-bar swings when that is on");
 
 		// every setting has its own place in the settings window
 		var orders = IndicatorType.GetProperties()
@@ -4863,6 +4865,65 @@ internal static class Program
 		var against = trades.Where(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)).ToList();
 		Check(against.Count == 0, $"every signal goes the day's way: {against.Count} don't (first on bar {against.FirstOrDefault()?.EntryBar})");
 		Check(all.Any(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)), "and without the filter some wouldn't");
+	}
+
+	// With Buy in discount, short in premium: every buy's signal bar closes below the middle of the
+	// range between the last swing high and low, every short's above it - each swing confirmed only
+	// once the bars after it have closed, a run of one kind keeping its most extreme - worked out
+	// here bar by bar from the bars alone
+	private static void PremiumDiscountFilter()
+	{
+		const int length = 10;
+		var market = Generate(6000, 13);
+		var bars = market.Candles;
+		var all = Trades(RunHistorical(bars, null, market.SessionStarts));
+		var trades = Trades(RunHistorical(bars, i =>
+		{
+			i.OnlyInDiscountOrPremium = true;
+			i.PremiumDiscountSwingBars = length;
+		}, market.SessionStarts));
+		Check(trades.Count(t => t.IsLong) > 5 && trades.Count(t => !t.IsLong) > 5 && trades.Count < all.Count,
+			$"buys and shorts, fewer than without the filter: {trades.Count} of {all.Count}");
+
+		var zone = new int[bars.Count];
+		decimal high = 0, low = 0;
+		var last = 0;
+
+		for (var b = 0; b < bars.Count; b++)
+		{
+			var pivot = b - length;
+
+			if (pivot >= length)
+			{
+				var others = Enumerable.Range(pivot - length, 2 * length + 1).Where(k => k != pivot).ToList();
+				var isHigh = others.All(k => bars[k].High <= bars[pivot].High);
+				var isLow = others.All(k => bars[k].Low >= bars[pivot].Low);
+
+				if (isHigh && isLow)
+				{
+					isHigh = bars[pivot].Close >= (bars[pivot].High + bars[pivot].Low) / 2;
+					isLow = !isHigh;
+				}
+
+				if (isHigh)
+				{
+					high = last == 1 ? Math.Max(high, bars[pivot].High) : bars[pivot].High;
+					last = 1;
+				}
+				else if (isLow)
+				{
+					low = last == -1 && low > 0 ? Math.Min(low, bars[pivot].Low) : bars[pivot].Low;
+					last = -1;
+				}
+			}
+
+			var middle = (high + low) / 2;
+			zone[b] = low <= 0 || high <= low ? 0 : bars[b].Close < middle ? -1 : bars[b].Close > middle ? 1 : 0;
+		}
+
+		var against = trades.Where(t => zone[t.EntryBar] != (t.IsLong ? -1 : 1)).ToList();
+		Check(against.Count == 0, $"every buy closes in discount, every short in premium: {against.Count} don't (first on bar {against.FirstOrDefault()?.EntryBar})");
+		Check(all.Any(t => zone[t.EntryBar] != (t.IsLong ? -1 : 1)), "and without the filter some wouldn't");
 	}
 
 	// FVG Bar Export writes the chart's closed bars and their footprint, as the backtest runner reads them

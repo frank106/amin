@@ -349,6 +349,23 @@ It was on by default in the version that brought it, and is off since its first 
 days of MNQ, trades averaged roughly 4–5 ticks less with it than without it, on the bars as assumed
 and in the worst case alike (see [On ATAS's own data](#on-atass-own-data)).
 
+### Premium and discount
+
+With *Buy in discount, short in premium* on (off by default), a BUY needs its signal bar to close
+below the middle of the range between the last swing high and swing low - the discount half - and
+a SHORT above it, in the premium half. A swing high is a bar with no higher high within *Premium /
+discount swing length* bars (50) on either side, a swing low likewise, and a run of swings of one
+kind keeps its most extreme one. The idea and these definitions come from
+[joshyattridge/smart-money-concepts](https://github.com/joshyattridge/smart-money-concepts) (MIT),
+whose swings look at the bars after a swing as soon as it forms; here a swing only counts once
+those bars have closed, so history reads as it did live and a backtest can't peek ahead. The panel
+says which half the last close is in, and the range.
+
+On 50 days of MNQ settled on the real 1-second path, it was the one idea from that package that
+helped: FVG reactions (*Signal source: FVG reaction only*) went from losing to about break-even a
+trade, and with the executor's daily rules they came out ahead in both halves of the test. See
+[On ATAS's own data](#on-atass-own-data).
+
 ### Where the probability comes from
 
 Every signal on the chart is followed forward until it ends: at the TP, at the break-even stop
@@ -587,6 +604,28 @@ The day's trend cost 4–5 ticks a trade in both pairs, which is why it is off b
 Nothing here is clearly profitable: the best average is 0.5 standard errors from zero, and on the
 CFD's ticks above the bars overstated this bracket by 2.6 ticks a trade. The 1-second export
 measures that on MNQ itself.
+
+**On the 1-second path**, over the same 50 days, the defaults lost 4.8 ticks a trade after costs
+instead of the +0.2 the bars showed: about 200 trades the bars counted as take profits had come
+back to the break-even stop inside the minute. Every setting tested lost, the highest win rate
+included (a 20-tick target with a 120-tick stop: 86% of trades made money, −3.9 ticks a trade).
+
+**Ideas from smart-money-concepts**, tried on FVG reactions with a candlestick pattern, 09:30–12:30,
+on the 1-second path, picked on July–August and checked on September:
+
+| FVG reactions, 09:30–12:30 | Signals | Won money | Net a trade | Executor, 50 days | Jul–Aug | Sep |
+|---|---|---|---|---|---|---|
+| no filter | 617 | 67% | −4.1 | −$258 | −$85 | −$173 |
+| with the market structure (last close beyond a 50-bar swing) | 317 | 65% | −7.5 | −$720 | −$630 | −$90 |
+| in discount / premium (50-bar swings) | 260 | 72% | +3.0 | +$613 | +$135 | +$478 |
+
+*Executor* is what it would have made on one MNQ contract: one position at a time, the +140-tick
+daily target, and a $70 daily loss limit that skips trades that could breach it. Trading with the
+market structure made things worse at every swing length from 5 to 50 bars, as the day's trend
+did. Discount and premium made them better at 10 bars and up, in both halves and in regular hours
+too (+$763), and made every other signal set tried a little less bad - but only the FVG reactions came out ahead,
+and at under 1 standard error from zero that is not proof yet. The built-in filter gives the same
+results as this test did.
 
 ## Honest limits
 
@@ -942,6 +981,8 @@ show while the chart is open.
 | | Trend EMA period (0 = off) | 50 | |
 | | Only trade with the trend / Require delta / Require order-flow confirmation / Require candlestick pattern | off | |
 | | Only trade with the day's trend | off | BUYs only above the day's open and VWAP, SHORTs only below both, none in between |
+| | Buy in discount, short in premium | off | BUYs only below the middle of the last swing range, SHORTs only above it |
+| | Premium / discount swing length (bars) | 50 | a swing high has no higher high within this many bars either side; it counts once they have closed |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
@@ -1018,6 +1059,9 @@ chart's signals unless you switch it on:
   * **the day's trend** (off): signals only go the day's way - above the day's open and VWAP for
     BUYs, below both for SHORTs. It came out on, and is off since it made the signals worse on 50
     days of MNQ;
+  * **premium and discount** (off): BUYs only in the lower half of the last swing range, SHORTs
+    only in the upper half, after joshyattridge/smart-money-concepts - the one idea from it that
+    helped on 50 days of MNQ, see [Premium and discount](#premium-and-discount);
   * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
   * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
     tick value and a typical commission;

@@ -687,6 +687,9 @@ namespace ATAS.Indicators.Technical
 			public int DayTrend;               // the day's trend at the last closed bar: 1 up, -1 down, 0 none
 			public decimal DayOpen;            // what it is measured against (0: not known yet)
 			public decimal DayVwap;
+			public int Zone;                   // premium / discount at the last closed bar: -1 discount, 1 premium, 0 neither
+			public decimal RangeHigh;          // the swing range it is measured in (0: not known yet)
+			public decimal RangeLow;
 			public Scoreboard Board;
 			public List<(string Text, Color Color)> Execution;   // null while execution is off
 		}
@@ -986,6 +989,13 @@ namespace ATAS.Indicators.Technical
 		private decimal _trendOpen;
 		private decimal _trendPriceVolume;
 		private decimal _trendVolume;
+
+		// Premium and discount: the last confirmed swing high and low, whose middle splits the range
+		// into premium above and discount below, and which kind of swing was confirmed last (1 a
+		// high, -1 a low, 0 none yet), so a run of swings of one kind keeps its most extreme one
+		private decimal _rangeHigh;
+		private decimal _rangeLow;
+		private int _rangeLastSwing;
 		private bool _hasRth;
 		private decimal _rthHigh;
 		private decimal _rthLow;
@@ -1215,6 +1225,8 @@ namespace ATAS.Indicators.Technical
 		private int _trendEmaPeriod = 50;
 		private bool _onlyWithTrend;
 		private bool _onlyWithDayTrend;
+		private bool _onlyInDiscountOrPremium;
+		private int _premiumDiscountSwingBars = 50;
 		private bool _requireDeltaConfirmation;
 		private bool _requireFillConfirmation;
 		private bool _requireCandlePattern;
@@ -1699,6 +1711,23 @@ namespace ATAS.Indicators.Technical
 		{
 			get => _onlyWithDayTrend;
 			set { _onlyWithDayTrend = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Buy in discount, short in premium", GroupName = "Signals", Order = 115,
+			Description = "Buys only when the signal bar closes below the middle of the range between the last swing high and swing low (discount), shorts only above it (premium). A swing counts once the bars after it have closed, so history reads as it did live.")]
+		public bool OnlyInDiscountOrPremium
+		{
+			get => _onlyInDiscountOrPremium;
+			set { _onlyInDiscountOrPremium = value; RecalculateValues(); }
+		}
+
+		[Display(Name = "Premium / discount swing length (bars)", GroupName = "Signals", Order = 116,
+			Description = "A swing high has no higher high within this many bars on either side, a swing low no lower low; each counts once that many bars have closed after it.")]
+		[Range(2, 500)]
+		public int PremiumDiscountSwingBars
+		{
+			get => _premiumDiscountSwingBars;
+			set { _premiumDiscountSwingBars = Math.Min(500, Math.Max(2, value)); RecalculateValues(); }
 		}
 
 		[Display(Name = "Require delta confirmation", GroupName = "Signals", Order = 107,
@@ -2451,6 +2480,9 @@ namespace ATAS.Indicators.Technical
 			_trendOpen = 0;
 			_trendPriceVolume = 0;
 			_trendVolume = 0;
+			_rangeHigh = 0;
+			_rangeLow = 0;
+			_rangeLastSwing = 0;
 			_hasRth = false;
 			_hasPriorRth = false;
 			_hasOvernight = false;
@@ -2533,6 +2565,9 @@ namespace ATAS.Indicators.Technical
 			// every bar belongs to a trading day, warm-up included
 			var (keyLow, keyHigh) = UpdateKeyLevels(bar, candle);
 			UpdateDayTrend(candle);
+
+			if (OnlyInDiscountOrPremium)
+				UpdateSwingRange(bar);
 
 			if (bar < SwingLookback + 3)
 				return;
@@ -2950,6 +2985,67 @@ namespace ATAS.Indicators.Technical
 
 			var vwap = DayVwap;
 			return close > _trendOpen && close > vwap ? 1 : close < _trendOpen && close < vwap ? -1 : 0;
+		}
+
+		// Confirms the swing PremiumDiscountSwingBars bars back, now that the bars after it have
+		// closed: a swing high has no higher high within that many bars on either side, a swing low no
+		// lower low (a bar that is both counts for the side it closed on). A run of swings of one kind
+		// keeps its most extreme one. After the swing highs and lows and retracements of
+		// joshyattridge/smart-money-concepts (MIT), which look at the bars after a swing as soon as it
+		// forms; here a swing only counts once they have closed, as a live chart sees it.
+		private void UpdateSwingRange(int bar)
+		{
+			var length = PremiumDiscountSwingBars;
+			var pivotBar = bar - length;
+
+			if (pivotBar < length)
+				return;
+
+			var pivot = GetCandle(pivotBar);
+			var isHigh = true;
+			var isLow = true;
+
+			for (var i = pivotBar - length; i <= bar && (isHigh || isLow); i++)
+			{
+				if (i == pivotBar)
+					continue;
+
+				var other = GetCandle(i);
+				isHigh &= other.High <= pivot.High;
+				isLow &= other.Low >= pivot.Low;
+			}
+
+			if (isHigh && isLow)
+			{
+				isHigh = pivot.Close >= (pivot.High + pivot.Low) / 2;
+				isLow = !isHigh;
+			}
+
+			if (isHigh)
+			{
+				if (_rangeLastSwing != 1 || pivot.High > _rangeHigh)
+					_rangeHigh = pivot.High;
+
+				_rangeLastSwing = 1;
+			}
+			else if (isLow)
+			{
+				if (_rangeLastSwing != -1 || _rangeLow == 0 || pivot.Low < _rangeLow)
+					_rangeLow = pivot.Low;
+
+				_rangeLastSwing = -1;
+			}
+		}
+
+		// where a close sits in the range between the last swing high and low: -1 below its middle
+		// (discount), 1 above it (premium), 0 on it or while either swing is still unknown
+		private int PremiumDiscount(decimal close)
+		{
+			if (_rangeLow <= 0 || _rangeHigh <= _rangeLow)
+				return 0;
+
+			var middle = (_rangeHigh + _rangeLow) / 2;
+			return close < middle ? -1 : close > middle ? 1 : 0;
 		}
 
 		// whether a bar (by its open time) may give a signal
@@ -4117,6 +4213,7 @@ namespace ATAS.Indicators.Technical
 
 			if ((OnlyWithTrend && !withTrend)
 				|| (OnlyWithDayTrend && DayTrend(candle.Close) != (isLong ? 1 : -1))
+				|| (OnlyInDiscountOrPremium && PremiumDiscount(candle.Close) != (isLong ? -1 : 1))
 				|| (RequireDeltaConfirmation && !deltaConfirms)
 				|| (RequireFillConfirmation && !fillConfirms)
 				|| (RequireCandlePattern && !hasPattern))
@@ -6728,6 +6825,9 @@ namespace ATAS.Indicators.Technical
 				DayTrend = _lastClosedBar >= 0 && _lastClosedBar < CurrentBar ? DayTrend(GetCandle(_lastClosedBar).Close) : 0,
 				DayOpen = _trendVolume > 0 ? _trendOpen : 0,
 				DayVwap = DayVwap,
+				Zone = _lastClosedBar >= 0 && _lastClosedBar < CurrentBar ? PremiumDiscount(GetCandle(_lastClosedBar).Close) : 0,
+				RangeHigh = _rangeHigh,
+				RangeLow = _rangeLow,
 				Board = withScoreboard ? BuildScoreboard() : null,
 				Execution = ExecutionPanelLines()
 			};
@@ -7292,6 +7392,21 @@ namespace ATAS.Indicators.Technical
 					: "No clear day trend (between the open and VWAP): no signals";
 
 				footer.Insert(2, ($"{trend} · open {FormatPrice(stats.DayOpen)} · VWAP {FormatPrice(stats.DayVwap)}", DimTextColor));
+			}
+
+			// with premium / discount: which way signals may go now, in which swing range
+			if (OnlyInDiscountOrPremium)
+			{
+				var known = stats.RangeLow > 0 && stats.RangeHigh > stats.RangeLow;
+				var zone = !known ? "Premium / discount: waiting for a swing high and a swing low"
+					: stats.Zone < 0 ? "Discount (below the middle of the swing range): buys only"
+					: stats.Zone > 0 ? "Premium (above the middle of the swing range): shorts only"
+					: "At the middle of the swing range: no signals";
+
+				if (known)
+					zone += $" · range {FormatPrice(stats.RangeLow)} – {FormatPrice(stats.RangeHigh)}";
+
+				footer.Insert(OnlyWithDayTrend && stats.DayOpen > 0 ? 3 : 2, (zone, DimTextColor));
 			}
 
 			var restingSize = RestingSize == RestingSizeRule.FixedContracts
