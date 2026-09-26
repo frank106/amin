@@ -147,8 +147,8 @@ internal static class Program
 		Check(fresh.LiveTimeInForce == FvgReactionLiquiditySweep.OrderLifetime.ConnectionDefault, "live orders at the connection's time in force");
 		Check(!fresh.BreakEvenFromFill, "the break-even stop at the signal's price, as on the chart");
 		Check(!fresh.FilterByWorstCase, "the signals the chart shows, by its own odds");
-		Check(fresh.DailyProfitTargetTicks == 140 && fresh.CostsFromInstrument && fresh.OnlyWithDayTrend,
-			"a +140t daily profit target, the instrument's own costs, signals with the day's trend");
+		Check(fresh.DailyProfitTargetTicks == 140 && fresh.CostsFromInstrument && !fresh.OnlyWithDayTrend,
+			"a +140t daily profit target, the instrument's own costs, signals whatever the day's trend");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")

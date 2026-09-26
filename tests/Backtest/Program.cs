@@ -24,7 +24,9 @@
 //   --set <Name>=<Value>    any indicator setting, e.g. --set SignalHours=AllHours (repeatable)
 //   --trades <file.csv>     write every signal (shown and hidden) to a CSV
 //   --ticks <file>          ticks (time, price) inside the bars: where a bar has them, trades are settled
-//                           on them, as a live chart does, instead of on an assumed path (repeatable)
+//                           on them, as a live chart does, instead of on an assumed path (repeatable).
+//                           Shorter bars work too (time, open, high, low, close), e.g. FVG Bar Export's
+//                           from a 1-second chart: each gives its open, nearer extreme, other one, close
 //   --footprint <file>      each bar's footprint (time, price, volume, bid, ask), as FVG Bar Export
 //                           writes it: big fills, the Fill signals and the order-flow confirmation
 //
@@ -170,7 +172,7 @@ internal static class Program
 				var ticks = new List<(long Time, int Price)>();
 
 				foreach (var file in options.TickFiles)
-					ticks.AddRange(ReadTicks(file, options));
+					ticks.AddRange(ReadTicks(file, options, notes));
 
 				paths = AttachTicks(candles, ticks, options, notes);
 			}
@@ -702,14 +704,22 @@ internal static class Program
 	}
 
 	// Ticks as (UTC time, price in ticks). A header names the time (or date and time) and the
-	// price (price, last, bid...) columns; without one they are time, price.
-	private static List<(long Time, int Price)> ReadTicks(string path, Options o)
+	// price (price, last, bid...) columns; without one they are time, price. A file of short bars
+	// instead - open, high, low and close, like FVG Bar Export's from a 1-second chart - gives the
+	// path inside each of them, all at its time: its open, the nearer of its high and low (on a tie,
+	// the low first when it closed up, as a candle), the other one, and its close.
+	private static List<(long Time, int Price)> ReadTicks(string path, Options o, List<string> notes)
 	{
 		var ticks = new List<(long, int)>();
 		char separator = ',';
-		int time = -1, date = -1, clock = -1, price = -1;
+		int time = -1, date = -1, clock = -1, price = -1, open = -1, high = -1, low = -1, close = -1;
 		var first = true;
 		var skipped = 0;
+		var bars = 0;
+		var last = DateTime.MinValue;
+		var steps = new Dictionary<TimeSpan, int>();
+
+		int InTicks(string value) => (int)Math.Round(Number(value) * o.PriceScale / o.Tick, MidpointRounding.AwayFromZero);
 
 		foreach (var raw in ReadLines(path))
 		{
@@ -732,6 +742,13 @@ internal static class Program
 					date = Find("date", "day");
 					clock = Find("time");
 					price = Find("price", "last", "trade price", "px", "bid", "close", "mid");
+					open = Find("open", "o", "open price", "opening price", "first");
+					high = Find("high", "h", "high price", "max");
+					low = Find("low", "l", "low price", "min");
+					close = Find("close", "c", "close price", "last", "closing price", "settle");
+
+					if (open < 0 || high < 0 || low < 0 || close < 0)
+						(open, high, low, close) = (-1, -1, -1, -1);
 
 					if (date >= 0 && clock >= 0 && clock != date && (time < 0 || time == clock))
 						time = -1;
@@ -744,7 +761,7 @@ internal static class Program
 						clock = -1;
 					}
 
-					if ((time < 0 && date < 0) || price < 0)
+					if ((time < 0 && date < 0) || (price < 0 && open < 0))
 						throw new InvalidDataException($"{path}: can't find the time and price columns in \"{line}\"");
 
 					continue;
@@ -762,14 +779,42 @@ internal static class Program
 				if (!TryParseTime(stamp, o.Zone, out var utc))
 					throw new FormatException($"time \"{stamp}\"");
 
-				var value = Number(f[price]) * o.PriceScale;
-				ticks.Add((utc.Ticks, (int)Math.Round(value / o.Tick, MidpointRounding.AwayFromZero)));
+				if (open < 0)
+				{
+					ticks.Add((utc.Ticks, InTicks(f[price])));
+					continue;
+				}
+
+				var (start, top, bottom, end) = (InTicks(f[open]), InTicks(f[high]), InTicks(f[low]), InTicks(f[close]));
+				var highFirst = top - start != start - bottom ? top - start < start - bottom : end < start;
+				var walk = new[] { start, highFirst ? top : bottom, highFirst ? bottom : top, end };
+				ticks.Add((utc.Ticks, start));
+
+				for (var k = 1; k < walk.Length; k++)
+				{
+					if (walk[k] != walk[k - 1])
+						ticks.Add((utc.Ticks, walk[k]));
+				}
+
+				if (bars++ < 5000 && utc > last && last > DateTime.MinValue)
+					steps[utc - last] = steps.TryGetValue(utc - last, out var seen) ? seen + 1 : 1;
+
+				last = utc;
 			}
 			catch (Exception e) when (e is FormatException || e is IndexOutOfRangeException || e is OverflowException)
 			{
 				if (++skipped <= 3)
 					Console.Error.WriteLine($"{path}: skipped \"{line}\" ({e.Message})");
 			}
+		}
+
+		if (bars > 0)
+		{
+			var step = steps.Count == 0 ? TimeSpan.Zero : steps.OrderByDescending(s => s.Value).First().Key;
+			var length = step == TimeSpan.Zero ? string.Empty
+				: step.TotalSeconds < 60 ? $" of {step.TotalSeconds.ToString("0.###", Inv)} s" : $" of {step.TotalMinutes.ToString("0.###", Inv)} min";
+			notes.Add($"{Path.GetFileName(path)}: {bars:N0} bars{length} read as the path inside the bars: each one's open, the nearer of its high "
+				+ "and low, the other, its close");
 		}
 
 		return ticks;

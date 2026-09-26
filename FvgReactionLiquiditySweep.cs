@@ -1214,7 +1214,7 @@ namespace ATAS.Indicators.Technical
 		private int _confluenceBars = 10;
 		private int _trendEmaPeriod = 50;
 		private bool _onlyWithTrend;
-		private bool _onlyWithDayTrend = true;
+		private bool _onlyWithDayTrend;
 		private bool _requireDeltaConfirmation;
 		private bool _requireFillConfirmation;
 		private bool _requireCandlePattern;

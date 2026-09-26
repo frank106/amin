@@ -332,7 +332,7 @@ The panel shows which one is on, with the New York time of the last bar to check
 
 ### The day's trend
 
-With *Only trade with the day's trend* (on), signals only go the day's way:
+With *Only trade with the day's trend* on (it is off by default), signals only go the day's way:
 
 * **up**, BUYs only: the signal bar closes above both the day's open and its VWAP;
 * **down**, SHORTs only: it closes below both;
@@ -344,6 +344,10 @@ Before the session opens, the day counts from 18:00, when the trading day starts
 the day's trend is not taken at all, as with the other filters, so the chart, its statistics, the
 backtest and the executor all see the same signals. The panel shows the day's trend, its open and its
 VWAP.
+
+It was on by default in the version that brought it, and is off since its first backtest: on 50
+days of MNQ, trades averaged roughly 4–5 ticks less with it than without it, on the bars as assumed
+and in the worst case alike (see [On ATAS's own data](#on-atass-own-data)).
 
 ### Where the probability comes from
 
@@ -529,9 +533,8 @@ want the chart's odds to reflect what really happened, *Bracket size: Multiples 
 the bracket that history on bars settles almost exactly. Judge any change on ticks (`--ticks`),
 live, or at least next to the runner's worst-case row.
 
-These runs came before *Only trade with the day's trend*, which is now on by default:
-`--set OnlyWithDayTrend=false` gives the signals they had. The day's trend itself hasn't been
-through the backtest yet - run it with and without, on ticks, before trusting it.
+These runs came before *Only trade with the day's trend*, which is off by default, so the defaults
+give the signals they had. On ATAS's own MNQ data below, it made them worse.
 
 ### On ATAS's own data
 
@@ -556,7 +559,34 @@ dotnet run -c Release --project tests/Backtest -- <..._bars.csv> --footprint <..
 ```
 
 Trades are still settled on an assumed path inside each bar; the worst-case row next to the result
-shows how much that matters.
+shows how much that matters. A second export, from a **1-second chart** of the same instrument and
+days (*Include the footprint* off), settles it: given with `--ticks`, the 1-second bars are read as
+the path inside each minute - each second's open, the nearer of its high and low, the other, its
+close - and trades follow it as on a live chart:
+
+```
+dotnet run -c Release --project tests/Backtest -- <..._1m_..._bars.csv> --footprint <..._1m_..._footprint.csv.gz> --ticks <..._1s_..._bars.csv> --tick-value 0.5 --commission 3
+```
+
+On a made-up market traded tick by tick, the 1-second bars settled every trade exactly as the
+ticks themselves did. A 1-second chart of many days is heavy for ATAS; if it won't load them all,
+export what it will: bars without seconds are settled on the bars, and the report says how much
+of the trades' time the seconds covered.
+
+**50 days of MNQ** (19 July – 25 September 2026, 1-minute bars with their footprint, the default
+bracket, 5 ticks of costs a trade), net ticks a trade after costs:
+
+| Settings | Signals | TP or BE | On the bars | Worst case |
+|---|---|---|---|---|
+| the defaults with the day's trend (then on by default) | 1,204 | 64% | −4.4 | −14.0 |
+| the defaults without it | 2,691 | 67% | +0.2 | −10.3 |
+| 09:30–12:00, overlapping trades, with the day's trend | 596 | 63% | −4.2 | −16.0 |
+| 09:30–12:00, overlapping trades, without it | 1,544 | 67% | +0.9 | −10.4 |
+
+The day's trend cost 4–5 ticks a trade in both pairs, which is why it is off by default now.
+Nothing here is clearly profitable: the best average is 0.5 standard errors from zero, and on the
+CFD's ticks above the bars overstated this bracket by 2.6 ticks a trade. The 1-second export
+measures that on MNQ itself.
 
 ## Honest limits
 
@@ -911,7 +941,7 @@ show while the chart is open.
 | | Sweep -> FVG window (bars) | 10 | |
 | | Trend EMA period (0 = off) | 50 | |
 | | Only trade with the trend / Require delta / Require order-flow confirmation / Require candlestick pattern | off | |
-| | Only trade with the day's trend | on | BUYs only above the day's open and VWAP, SHORTs only below both, none in between |
+| | Only trade with the day's trend | off | BUYs only above the day's open and VWAP, SHORTs only below both, none in between |
 | | Cooldown between signals (bars) | 3 | per direction |
 | | One trade at a time | on | new signals while a trade is open are hidden but still learned from |
 | | Min TP probability to show (%) | 0 | hide signals with lower TP odds; they are still learned from |
@@ -971,8 +1001,8 @@ draws its own markers for them. The sweep series also mark sweeps of key levels.
 
 ## Changes in this version
 
-New in this version. The execution is off by default; of what came with it, the day's trend changes
-the chart's signals (switch *Only trade with the day's trend* off for the ones before it):
+New in this version. The execution is off by default, and nothing that came with it changes the
+chart's signals unless you switch it on:
 
 * **execution**: the indicator can send the orders of its own signals, paper by default, with
   position sizing, a daily loss limit, live orders only once armed for the chart's account, and a
@@ -985,14 +1015,16 @@ the chart's signals (switch *Only trade with the day's trend* off for the ones b
   * **the log report** (`tests/LogReport`) sums the executor's logs up;
   * **Windows**: the build makes the DLL for the installed ATAS only, and reads which chart time
     zone property that ATAS version has, so classic ATAS 8.0.14 builds it;
-  * **the day's trend** (on): signals only go the day's way - above the day's open and VWAP for
-    BUYs, below both for SHORTs;
+  * **the day's trend** (off): signals only go the day's way - above the day's open and VWAP for
+    BUYs, below both for SHORTs. It came out on, and is off since it made the signals worse on 50
+    days of MNQ;
   * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
   * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
     tick value and a typical commission;
   * **FVG Bar Export**: a second indicator that writes a chart's bars and footprint for the
     backtest runner, which now reads delta and (`--footprint`) the footprint too - see
-    [On ATAS's own data](#on-atass-own-data).
+    [On ATAS's own data](#on-atass-own-data). The runner reads 1-second bars as the path inside
+    each minute (`--ticks`), so an export from a 1-second chart settles trades as ticks would.
 
 New in the previous version, all off by default:
 

@@ -250,7 +250,11 @@ dotnet run -c Release --project tests/Backtest -- nq-1min.csv --tz America/New_Y
   instead of an assumed one. Those bars are rebuilt from their ticks. The report then puts the
   result on the ticks next to the same history on the bars alone (as assumed, and worst case), and
   says how much of the trades' time the ticks covered. Give ticks for the whole stretch you test
-  (`--from` / `--to`): where there are none, trades are settled on the bars as before.
+  (`--from` / `--to`): where there are none, trades are settled on the bars as before. Shorter
+  bars stand in for ticks: a file with open, high, low and close columns - FVG Bar Export's from a
+  1-second chart - gives each of its bars' open, the nearer of its high and low, the other, and its
+  close. On a made-up market of 3.5 million trades, the runner settled every signal the same on
+  its 1-second bars as on the trades themselves.
 * **Output**:
   * TP / BE / SL / expired, ticks per trade before and after costs, net ticks and dollars, and
     how many standard errors the average is from zero;

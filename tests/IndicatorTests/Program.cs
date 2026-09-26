@@ -1439,7 +1439,7 @@ internal static class Program
 		Check(fresh.RestingSize == FvgReactionLiquiditySweep.RestingSizeRule.FixedContracts && fresh.RestingOrderMin == 70 && fresh.RestingMultiplier == 5.0,
 			"resting orders of 70 contracts");
 		Check(!fresh.ShowScoreboard, "the scoreboard opens on hover");
-		Check(fresh.OnlyWithDayTrend, "signals only with the day's trend");
+		Check(!fresh.OnlyWithDayTrend, "signals whatever the day's trend");
 
 		// every setting has its own place in the settings window
 		var orders = IndicatorType.GetProperties()
