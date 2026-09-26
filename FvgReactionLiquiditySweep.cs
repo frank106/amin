@@ -6950,7 +6950,7 @@ namespace ATAS.Indicators.Technical
 			var estimate = trade.Estimate;
 			var percents = LabelPercents(trade.HasBreakEven, estimate.Odds);
 			var side = trade.IsLong ? "buys" : "shorts";
-			var time = trade.EntryTime.Add(InstrumentInfo.TimeZoneOffset).ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+			var time = trade.EntryTime.Add(ChartTimeZoneOffset).ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
 			var expected = estimate.ExpectedTicks.ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture);
 
 			var odds = trade.HasBreakEven
@@ -7137,7 +7137,7 @@ namespace ATAS.Indicators.Technical
 		private List<(string Text, Color Color)> OrderTooltip(RestingOrder order)
 		{
 			var kind = order.IsBid ? "bid" : "offer";
-			var time = order.FirstTime.Add(InstrumentInfo.TimeZoneOffset).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+			var time = order.FirstTime.Add(ChartTimeZoneOffset).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
 			var lines = new List<(string Text, Color Color)>();
 
 			switch (order.State)
@@ -7231,6 +7231,13 @@ namespace ATAS.Indicators.Technical
 		#region Helpers
 
 		private decimal TickSize => InstrumentInfo != null && InstrumentInfo.TickSize > 0 ? InstrumentInfo.TickSize : 0.01m;
+
+		// the chart's time zone: classic ATAS gives it in whole hours (TimeZone), ATAS X as a TimeSpan
+#if ATAS_CLASSIC
+		private TimeSpan ChartTimeZoneOffset => TimeSpan.FromHours(InstrumentInfo.TimeZone);
+#else
+		private TimeSpan ChartTimeZoneOffset => InstrumentInfo.TimeZoneOffset;
+#endif
 
 		// the stop only moves if the trigger sits between the entry and the take profit
 		private bool BreakEvenEnabled => BreakEvenTriggerTicks > 0 && BreakEvenTriggerTicks < TakeProfitTicks;

@@ -25,6 +25,8 @@
     <!-- .NET 8's WPF reference pack leaves out System.Drawing.Common (DashStyle); the Windows
          Forms one brings it, as .NET 10's WPF pack does on its own -->
     <UseWindowsForms Condition=" '$(TargetFramework)' == 'net8.0-windows' ">true</UseWindowsForms>
+    <!-- classic ATAS has IInstrumentInfo.TimeZone (hours) where ATAS X has TimeZoneOffset -->
+    <DefineConstants>$(DefineConstants);ATAS_CLASSIC</DefineConstants>
     <ATAS_BASE Condition=" '$(ATAS_BASE)' == '' ">C:/Program Files (x86)/ATAS Platform</ATAS_BASE>
   </PropertyGroup>
 
