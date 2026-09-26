@@ -225,6 +225,7 @@ internal static class Program
 			i.EqualToleranceTicks = 4;
 		}, seed: 83));
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
+		Run("Worst-case odds: the labels' with the worst case on the chart, lower otherwise", WorstCaseOdds);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
 		Console.WriteLine();
@@ -4777,6 +4778,35 @@ internal static class Program
 		var names = text == "None" ? new List<string>() : text.Split(", ").ToList();
 		names.Sort(StringComparer.Ordinal);
 		return names;
+	}
+
+	// Every trade is also settled, on a copy, with the worst case inside each bar, into odds of its
+	// own (WorstEstimate) that the executor can filter on
+	private static void WorstCaseOdds()
+	{
+		var market = Generate(6000, 7);
+
+		(double Tp, double Be, double Sl, double Ev) OddsOf(object trade, string estimate)
+		{
+			var e = Get(trade, estimate);
+			double Value(string name) => (double)e.GetType().GetProperty(name).GetValue(e);
+			return (Value("TakeProfit"), Value("BreakEven"), Value("StopLoss"), Value("ExpectedTicks"));
+		}
+
+		// the chart settles worst case itself: every copy ends as its trade does, so the two odds
+		// agree trade by trade
+		var worst = TradesRaw(RunHistorical(market.Candles, i => i.SameBarRule = FvgReactionLiquiditySweep.SameBarHitRule.StopLossFirst, market.SessionStarts));
+		Check(worst.Count > 30 && worst.All(t => OddsOf(t, "Estimate").Equals(OddsOf(t, "WorstEstimate"))),
+			$"with the worst case on the chart, the worst-case odds are the labels' ({worst.Count} trades)");
+
+		// the default, the nearer extreme first: where a bar's order decided a trade, its copy ends the
+		// pessimistic way - the worst-case odds differ, and lean lower on average
+		var nearest = TradesRaw(RunHistorical(market.Candles, null, market.SessionStarts));
+		var differ = nearest.Count(t => !OddsOf(t, "Estimate").Equals(OddsOf(t, "WorstEstimate")));
+		var labelEv = nearest.Average(t => OddsOf(t, "Estimate").Ev);
+		var worstEv = nearest.Average(t => OddsOf(t, "WorstEstimate").Ev);
+		Check(differ > nearest.Count / 4, $"the worst-case odds differ on {differ} of {nearest.Count} trades");
+		Check(worstEv < labelEv, $"and lean lower: EV {worstEv:0.00}t on average against the labels' {labelEv:0.00}t");
 	}
 
 	private static List<object> TradesRaw(FvgReactionLiquiditySweep ind)

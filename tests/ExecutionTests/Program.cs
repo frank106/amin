@@ -48,6 +48,7 @@ internal static class Program
 		Run("Daily loss limit: trips on a loss, blocks the day, resets the next", DailyLossLimit);
 		Run("Daily loss limit: a trade whose stop could breach it is skipped", SkipTradesBeyondLimit);
 		Run("Daily loss limit: a restart reads the day back from the log", RestartRestoresTheDay);
+		Run("Log: a file an earlier version started keeps its columns", LogKeepsItsColumns);
 		Run("Signal hours: no signal, no order", SignalHours);
 		Run("One trade at a time: hidden signals and overlapping ones are skipped", OneTradeAtATime);
 		Run("Time exits: Max bars in trade and the session end close at market", TimeExits);
@@ -81,6 +82,18 @@ internal static class Program
 			i.DailyLossLimit = 400;
 		}, expect: rows => Check(rows.Any(r => r["event"] == "SKIPPED" && r["note"].StartsWith("its stop could lose", StringComparison.Ordinal)),
 			"trades skipped for their risk")));
+		Run("Random markets: worst-case odds filter what is traded", () => RandomMarkets(seed: 41, configure: i =>
+		{
+			i.MinExpectedTicks = 1;
+			i.FilterByWorstCase = true;
+		}, expect: rows =>
+		{
+			var taken = rows.Where(r => r["event"] == "SIGNAL").ToList();
+			var dropped = rows.Where(r => r["event"] == "SKIPPED" && r["note"].StartsWith("its worst-case EV", StringComparison.Ordinal)).ToList();
+			Check(taken.All(r => Int(r["ev_ticks"]) >= 1 && Int(r["ev_worst_ticks"]) >= 1), "every trade taken passes on both odds");
+			Check(dropped.Count > 0 && dropped.All(r => Int(r["ev_ticks"]) >= 1 && Int(r["ev_worst_ticks"]) < 1),
+				$"signals the chart showed but the worst case failed are skipped: {dropped.Count}");
+		}));
 		Run("Random markets: the loss limit trips and stops each day", () => RandomMarkets(seed: 31, configure: i =>
 		{
 			i.DailyLossLimit = 150;
@@ -125,12 +138,13 @@ internal static class Program
 		Check(fresh.CountAccountPnl, "live, the account's closed P&L counts toward the limit");
 		Check(fresh.LiveTimeInForce == FvgReactionLiquiditySweep.OrderLifetime.ConnectionDefault, "live orders at the connection's time in force");
 		Check(!fresh.BreakEvenFromFill, "the break-even stop at the signal's price, as on the chart");
+		Check(!fresh.FilterByWorstCase, "the signals the chart shows, by its own odds");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 16, $"sixteen settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 17, $"seventeen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -171,6 +185,7 @@ internal static class Program
 			&& signal["trend"] == "no" && signal["delta"] == "yes" && signal["order_flow"] == "no" && signal["pattern"] == "yes",
 			"setup, pattern and confirmations as the scoreboard counts them");
 		Check(signal["odds_tp"] == "22" && signal["odds_be"] == "45" && signal["odds_sl"] == "33" && signal["ev_ticks"] == "0", "the odds on its label");
+		Check(signal["ev_worst_ticks"] == "0", "and the worst case's, the same on a fresh chart");
 		Check(signal["entry"] == "103.5" && signal["take_profit"] == "123.5" && signal["stop_loss"] == "83.5" && signal["be_trigger"] == "113.5"
 			&& signal["be_stop"] == "108.5", "the chart trade's own prices");
 
@@ -409,6 +424,29 @@ internal static class Program
 		// live counts apart from paper
 		var live = Buy(Live(new FakeBroker(), limit), folder);
 		Check(DayPnl(live, paper: false) == 0, "the live day doesn't see the paper loss");
+	}
+
+	private static void LogKeepsItsColumns()
+	{
+		// today's file was started by an earlier version, without the ev_worst_ticks column, and holds
+		// a -$100 trade: new rows keep the file's columns, and the day is read back from it
+		var folder = NewFolder();
+		Directory.CreateDirectory(folder);
+		var old = ExecutionColumns().Where(c => c != "ev_worst_ticks").ToList();
+		var closed = old.Select(c => c == "event" ? "CLOSED" : c == "pnl_usd" || c == "day_pnl_usd" ? "-100.00" : string.Empty);
+		File.WriteAllText(Path.Combine(folder, "2026-03-02_NQ_paper.csv"),
+			string.Join(",", old) + Environment.NewLine + string.Join(",", closed) + Environment.NewLine, new UTF8Encoding(true));
+
+		var ind = Buy(folder: folder);
+		OpenBar(ind, 103.5m);
+		var rows = Rows(ind);
+		Check(DayPnl(ind, paper: true) == -100 && rows.Any(r => r["event"] == "RESTORE"), $"the day is read back: {DayPnl(ind, paper: true)}");
+		Check(Only(rows, "SIGNAL")["setup"] == "FVG" && !rows[0].ContainsKey("ev_worst_ticks"), "new rows under the file's own columns");
+
+		// the next day's file is new, with every column
+		StreamPattern(ind, 60, Start.Date.AddHours(23).AddMinutes(5));
+		var header = File.ReadLines(Path.Combine(folder, "2026-03-03_NQ_paper.csv")).First().TrimStart('﻿');
+		Check(header == string.Join(",", ExecutionColumns()), $"a new file has today's columns: {header}");
 	}
 
 	private static void SignalHours()
@@ -1197,6 +1235,7 @@ internal static class Program
 		var decided = rows.Where(r => r["event"] == "SIGNAL" || r["event"] == "SKIPPED").ToList();
 		Check(decided.Count == chart.Count && decided.All(r => chart.ContainsKey((Int(r["signal_bar"]), r["side"] == "BUY"))),
 			$"one SIGNAL or SKIPPED row per real-time signal: {decided.Count} rows, {chart.Count} signals");
+		Check(decided.All(r => r["ev_ticks"].Length > 0 && r["ev_worst_ticks"].Length > 0), "each with its EV on the label and in the worst case");
 
 		foreach (var row in taken)
 		{

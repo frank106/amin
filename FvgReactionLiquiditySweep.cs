@@ -594,6 +594,7 @@ namespace ATAS.Indicators.Technical
 			public bool FillBidsFilled;
 			public KeyLevel SweptLevel;           // the key level a key-level sweep took (null = none)
 			public ProbabilityEstimate Estimate;
+			public ProbabilityEstimate WorstEstimate; // the same, from trades settled with the worst case inside each bar
 			public bool IsShown;          // false = tracked for the statistics only (filtered, or a position was already open)
 			public bool HasBreakEven;     // the break-even stop was on when the signal fired
 			public decimal TriggerPrice;  // reaching this price moves the stop...
@@ -1023,6 +1024,13 @@ namespace ATAS.Indicators.Technical
 		private readonly List<(int Bar, decimal Price)> _openSwingLows = new List<(int Bar, decimal Price)>();
 		private readonly ProbabilityModel _model = new ProbabilityModel();
 
+		// Every trade is also settled on a copy with the worst case inside each bar (the stop first
+		// whenever a bar's high / low order would decide it), into a model of its own. Bars settle a
+		// break-even step optimistically (see the README), so these are the odds the executor can
+		// go by; the chart's labels keep theirs.
+		private readonly List<SignalTrade> _openWorstCase = new List<SignalTrade>();
+		private readonly ProbabilityModel _worstModel = new ProbabilityModel();
+
 		// where the statistics panel was drawn last (render thread only), for its hover
 		private Rectangle _lastPanel = Rectangle.Empty;
 
@@ -1233,9 +1241,13 @@ namespace ATAS.Indicators.Technical
 		{
 			"logged_utc", "bar_time_ny", "trading_day", "mode", "account", "instrument", "event", "signal", "signal_bar", "side",
 			"setup", "trigger", "patterns", "confirmations", "trend", "delta", "order_flow", "pattern", "odds_tp", "odds_be",
-			"odds_sl", "ev_ticks", "order", "type", "qty", "price", "entry", "take_profit", "stop_loss", "be_trigger", "be_stop",
-			"position", "pnl_ticks", "pnl_usd", "day_pnl_usd", "chart_outcome", "chart_ticks", "note"
+			"odds_sl", "ev_ticks", "ev_worst_ticks", "order", "type", "qty", "price", "entry", "take_profit", "stop_loss", "be_trigger",
+			"be_stop", "position", "pnl_ticks", "pnl_usd", "day_pnl_usd", "chart_outcome", "chart_ticks", "note"
 		};
+
+		// each log file's columns as its header has them, so a file an earlier version started (with
+		// fewer columns) keeps getting rows it can read
+		private readonly Dictionary<string, string[]> _logColumns = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
 
 		// live: how long the account may show no position while the executor holds one before the
 		// position counts as closed outside the indicator (fills can arrive after the position update)
@@ -1281,6 +1293,7 @@ namespace ATAS.Indicators.Technical
 		private bool _countAccountPnl = true;
 		private TimeSpan _flatByTime;
 		private int _flatByLastEntryMinutes = 10;
+		private bool _filterByWorstCase;
 		private bool _breakEvenFromFill;
 		private OrderLifetime _liveTimeInForce;
 		private decimal _tickValue = 5m;
@@ -2208,6 +2221,14 @@ namespace ATAS.Indicators.Technical
 			set { _flatByLastEntryMinutes = Math.Min(600, Math.Max(0, value)); _execConfigDirty = true; }
 		}
 
+		[Display(Name = "Filter trades by worst-case odds", GroupName = "Execution", Order = 509,
+			Description = "Off: the executor takes the signals the chart shows. On: only those whose odds, settled with the worst case inside each bar, also pass Min TP probability and Min expected ticks. With a break-even step inside a bar the labels' odds lean optimistic (see the README). The log has both EVs either way.")]
+		public bool FilterByWorstCase
+		{
+			get => _filterByWorstCase;
+			set { _filterByWorstCase = value; _execConfigDirty = true; }
+		}
+
 		[Display(Name = "Break-even stop from the fill", GroupName = "Execution", Order = 510,
 			Description = "Off: the stop moves to the signal's break-even price, as on the chart. On: to the same profit counted from the position's average fill, so slippage on the entry doesn't eat into it. It still moves when the chart's trade reaches its trigger.")]
 		public bool BreakEvenFromFill
@@ -2401,11 +2422,13 @@ namespace ATAS.Indicators.Technical
 			_boughtAt.Clear();
 			_trades.Clear();
 			_openTrades.Clear();
+			_openWorstCase.Clear();
 			_ema.Clear();
 			_cumulativeRange.Clear();
 			_openSwingHighs.Clear();
 			_openSwingLows.Clear();
 			_model.Reset();
+			_worstModel.Reset();
 			_patternCacheBar = -1;
 
 			_lastClosedBar = -1;
@@ -4026,6 +4049,7 @@ namespace ATAS.Indicators.Technical
 			var timeBucket = TimeBucket(candle.Time);
 			var volatilityBucket = VolatilityBucket(bar);
 			var path = ModelPath(isLong, trigger, timeBucket, volatilityBucket, withTrend, confirmations);
+			var prior = PriorOdds(target, risk, triggerTicks, locked, breakEven);
 
 			return new SignalTrade
 			{
@@ -4064,8 +4088,8 @@ namespace ATAS.Indicators.Technical
 				FillVolume = fromFill ? fill.Volume : 0,
 				FillBidsFilled = fromFill && fill.BidsFilled,
 				SweptLevel = sweptLevel,
-				Estimate = _model.Estimate(path, PriorOdds(target, risk, triggerTicks, locked, breakEven), ProbabilitySmoothing,
-					target, breakEven ? locked : 0, risk)
+				Estimate = _model.Estimate(path, prior, ProbabilitySmoothing, target, breakEven ? locked : 0, risk),
+				WorstEstimate = _worstModel.Estimate(path, prior, ProbabilitySmoothing, target, breakEven ? locked : 0, risk)
 			};
 		}
 
@@ -4163,6 +4187,7 @@ namespace ATAS.Indicators.Technical
 
 			_trades.Add(trade);
 			_openTrades.Add(trade);
+			_openWorstCase.Add(trade.Clone());
 
 			// a real-time signal waits for the executor, which decides once the update is done (a
 			// hidden one only gets a line in its log)
@@ -4259,14 +4284,41 @@ namespace ATAS.Indicators.Technical
 				CloseTrade(trade, result.Outcome, bar, result.ExitPrice, ref alerts);
 				_openTrades.RemoveAt(i);
 			}
+
+			// the worst-case copies along the same stretch
+			for (var i = _openWorstCase.Count - 1; i >= 0; i--)
+			{
+				var copy = _openWorstCase[i];
+
+				if (bar <= copy.EntryBar)
+					continue;
+
+				var result = Walk(copy, bar, start, newHigh, newLow, candle.Close, out _, out _, out _, SameBarHitRule.StopLossFirst);
+
+				if (result.Outcome == TradeOutcome.Open)
+					continue;
+
+				EndWorstCase(copy, result.Outcome, bar, result.ExitPrice);
+				_openWorstCase.RemoveAt(i);
+			}
+		}
+
+		// A worst-case copy ended. As for the chart's model, only a real ending (TP, break-even, SL)
+		// teaches it: an expired trade reached none, a limit order that never filled is no trade.
+		private void EndWorstCase(SignalTrade copy, TradeOutcome outcome, int bar, decimal exitPrice)
+		{
+			EndTrade(copy, outcome, bar, exitPrice);
+
+			if (outcome == TradeOutcome.TakeProfit || outcome == TradeOutcome.BreakEven || outcome == TradeOutcome.StopLoss)
+				_worstModel.Record(ModelPath(copy), outcome);
 		}
 
 		// Moves one trade along a stretch of trading: fills a waiting limit order and moves the stop
 		// as the stretch reaches them. How it ends is left to the caller.
 		private PathResult Walk(SignalTrade trade, int bar, decimal start, decimal? newHigh, decimal? newLow, decimal close,
-			out bool filled, out bool moved, out bool ambiguous)
+			out bool filled, out bool moved, out bool ambiguous, SameBarHitRule? rule = null)
 		{
-			var result = SettleStretch(trade, start, newHigh, newLow, close, SameBarRule, out ambiguous);
+			var result = SettleStretch(trade, start, newHigh, newLow, close, rule ?? SameBarRule, out ambiguous);
 			filled = trade.Pending && result.Filled;
 			moved = result.BreakEvenActive && !trade.BreakEvenActive;
 
@@ -4298,6 +4350,18 @@ namespace ATAS.Indicators.Technical
 				CloseTrade(trade, outcome, bar, outcome == TradeOutcome.Missed ? trade.EntryPrice : candle.Close, ref alerts);
 				_openTrades.RemoveAt(i);
 			}
+
+			for (var i = _openWorstCase.Count - 1; i >= 0; i--)
+			{
+				var copy = _openWorstCase[i];
+				var outcome = StaleOutcome(copy, bar);
+
+				if (outcome == TradeOutcome.Open)
+					continue;
+
+				EndWorstCase(copy, outcome, bar, outcome == TradeOutcome.Missed ? copy.EntryPrice : candle.Close);
+				_openWorstCase.RemoveAt(i);
+			}
 		}
 
 		// Whether a trade runs out of time on a closed bar: a limit order that waited its bars
@@ -4321,6 +4385,9 @@ namespace ATAS.Indicators.Technical
 			}
 
 			_openTrades.Clear();
+
+			// the copies end with them, teaching nothing (no fill, or expired)
+			_openWorstCase.Clear();
 		}
 
 		private void CloseTrade(SignalTrade trade, TradeOutcome outcome, int bar, decimal exitPrice, ref List<PendingAlert> alerts)
@@ -4858,6 +4925,9 @@ namespace ATAS.Indicators.Technical
 			if (PastLastEntry())
 				return $"no new entries from {ClockTime(LastEntryTime)} New York (flat by {ClockTime(FlatByTime)}) until the trading day turns at 18:00";
 
+			if (FilterByWorstCase && WorstCaseBlocker(trade) is string worstCase)
+				return worstCase;
+
 			if (trade.Outcome != TradeOutcome.Open)
 				return "the chart's trade ended before an order could go in";
 
@@ -4908,6 +4978,28 @@ namespace ATAS.Indicators.Technical
 				return $"another chart ({holder}) has a live trade on this account: one live trade per account at a time";
 
 			return null;
+		}
+
+		// With Filter trades by worst-case odds: why the signal's worst-case odds miss the chart's own
+		// show filters (null: they pass). Compared as labelled, like the chart's filters.
+		private string WorstCaseBlocker(SignalTrade trade)
+		{
+			var tp = LabelPercents(trade.HasBreakEven, trade.WorstEstimate.Odds)[0];
+
+			if (tp < MinProbabilityPercent)
+				return $"its worst-case TP odds ({tp}%) are under Min TP probability ({MinProbabilityPercent}%)";
+
+			var ev = WorstExpectedTicks(trade);
+
+			if (MinExpectedTicks != 0 && ev < MinExpectedTicks)
+				return $"its worst-case EV ({SignedTicks(ev)}t) is under Min expected ticks ({MinExpectedTicks}t)";
+
+			return null;
+		}
+
+		private static int WorstExpectedTicks(SignalTrade trade)
+		{
+			return (int)Math.Round(trade.WorstEstimate.ExpectedTicks, MidpointRounding.AwayFromZero);
 		}
 
 		// Why live orders can't go out now (null: armed)
@@ -5900,6 +5992,9 @@ namespace ATAS.Indicators.Technical
 			if (FlatByOn)
 				parts.Add($"flat by {ClockTime(FlatByTime)} New York, last entry {ClockTime(LastEntryTime)}");
 
+			if (FilterByWorstCase)
+				parts.Add("worst-case odds for Min TP probability and Min expected ticks");
+
 			if (BreakEvenFromFill)
 				parts.Add("break-even counted from the fill");
 
@@ -6024,6 +6119,7 @@ namespace ATAS.Indicators.Technical
 				row["odds_be"] = trade.HasBreakEven ? odds[1].ToString(CultureInfo.InvariantCulture) : string.Empty;
 				row["odds_sl"] = odds[odds.Length - 1].ToString(CultureInfo.InvariantCulture);
 				row["ev_ticks"] = LabelExpectedTicks(trade).ToString(CultureInfo.InvariantCulture);
+				row["ev_worst_ticks"] = WorstExpectedTicks(trade).ToString(CultureInfo.InvariantCulture);
 				row["entry"] = Number(trade.EntryPrice);
 				row["take_profit"] = Number(trade.TakeProfitPrice);
 				row["stop_loss"] = Number(trade.StopLossPrice);
@@ -6067,9 +6163,14 @@ namespace ATAS.Indicators.Technical
 
 				// the header, with a byte-order mark so spreadsheets read the file as UTF-8
 				if (!File.Exists(path))
+				{
 					File.WriteAllText(path, string.Join(",", ExecutionLogColumns) + Environment.NewLine, new UTF8Encoding(true));
+					_logColumns[path] = ExecutionLogColumns;
+				}
+				else if (!_logColumns.ContainsKey(path))
+					_logColumns[path] = FileColumns(path);
 
-				var line = string.Join(",", ExecutionLogColumns.Select(c => Csv(row.TryGetValue(c, out var value) ? value : null)));
+				var line = string.Join(",", _logColumns[path].Select(c => Csv(row.TryGetValue(c, out var value) ? value : null)));
 				File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
 				_execLogError = null;
 			}
@@ -6077,6 +6178,13 @@ namespace ATAS.Indicators.Technical
 			{
 				_execLogError = $"Execution log not written: {ex.Message}";
 			}
+		}
+
+		// the columns a log file's header names; a file without a readable header gets today's
+		private static string[] FileColumns(string path)
+		{
+			var header = SplitCsv(File.ReadLines(path).FirstOrDefault() ?? string.Empty);
+			return header.Contains("event") ? header : ExecutionLogColumns;
 		}
 
 		private string LogPath(DateTime day, bool paper)
