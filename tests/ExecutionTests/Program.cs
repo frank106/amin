@@ -49,6 +49,7 @@ internal static class Program
 		Run("Daily loss limit: a trade whose stop could breach it is skipped", SkipTradesBeyondLimit);
 		Run("Daily loss limit: a restart reads the day back from the log", RestartRestoresTheDay);
 		Run("Log: a file an earlier version started keeps its columns", LogKeepsItsColumns);
+		Run("Log report: the trades summed up", LogReport);
 		Run("Signal hours: no signal, no order", SignalHours);
 		Run("One trade at a time: hidden signals and overlapping ones are skipped", OneTradeAtATime);
 		Run("Time exits: Max bars in trade and the session end close at market", TimeExits);
@@ -447,6 +448,30 @@ internal static class Program
 		StreamPattern(ind, 60, Start.Date.AddHours(23).AddMinutes(5));
 		var header = File.ReadLines(Path.Combine(folder, "2026-03-03_NQ_paper.csv")).First().TrimStart('﻿');
 		Check(header == string.Join(",", ExecutionColumns()), $"a new file has today's columns: {header}");
+	}
+
+	private static void LogReport()
+	{
+		// one BUY that hits its take profit, and a second one hidden while it was open
+		var ind = Buy(i =>
+		{
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly;
+			i.EnableShortSignals = false;
+		});
+		StreamBar(ind, new[] { 103.5m, 104, 110, 109 });                      // in at 103.75
+		StreamPattern(ind, 105);                                              // a second BUY, hidden: skipped
+		StreamBar(ind, new[] { 108.5m, 115, 124 });                           // the first one's TP: +79t, $390
+
+		var report = ExecutionLogReport.Build(Rows(ind));
+		Check(report.Total.Count == 1 && report.Total.Tp == 1 && report.Total.Ticks == 79 && report.Total.Dollars == 390 && report.Taken == 1,
+			$"one trade, TP, +79t, $390: {report.Total.Count} {report.Total.Ticks} {report.Total.Dollars}");
+		Check(report.BySetup.Single().Name == "FVG" && report.ByHour.Single().Name == "09:00" && report.ByConfirmations.Single().Name == "2 confirmations",
+			"by setup, hour and confirmations");
+		Check(report.Skipped.Count == 1 && report.Skipped[0] == ("hidden on the chart", 1), $"the skip, without its details: {report.Skipped.FirstOrDefault()}");
+
+		var text = ExecutionLogReport.Format(report, 1);
+		Check(text.StartsWith("Execution log: paper, 2026-03-02 to 2026-03-02, 1 trading day, 1 file\n1 closed trade, 0 entries not filled, 1 signal skipped\n", StringComparison.Ordinal)
+			&& text.Contains("The trades made +79.0 ticks each (+$390.00 after commission)"), $"the report:\n{text}");
 	}
 
 	private static void SignalHours()
@@ -1297,6 +1322,16 @@ internal static class Program
 			var ticks = Dec(row["pnl_ticks"]);
 			Check(Math.Abs(ticks) < 200, $"signal {row["signal"]}: a result in range ({ticks}t)");
 		}
+
+		// the log report adds up to the log, table by table
+		var report = ExecutionLogReport.Build(rows);
+		Check(report.Total.Count == closed.Count && report.Total.Dollars == closed.Sum(r => Dec(r["pnl_usd"])) && report.Total.Ticks == closed.Sum(r => Dec(r["pnl_ticks"])),
+			$"the report sums the log: {report.Total.Count} trades, {report.Total.Dollars}");
+
+		foreach (var table in new[] { report.BySide, report.BySetup, report.ByConfirmations, report.ByLabel, report.ByHour })
+			Check(table.Sum(g => g.Tally.Count) == closed.Count && table.Sum(g => g.Tally.Dollars) == report.Total.Dollars, "each table adds up to the total");
+
+		Check(report.Taken == taken.Count && report.Skipped.Sum(r => r.Count) == rows.Count(r => r["event"] == "SKIPPED"), "and counts what was taken and skipped");
 
 		expect?.Invoke(rows);
 	}

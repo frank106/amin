@@ -31,6 +31,8 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\FvgReactionLiquiditySweep.cs" Link="FvgReactionLiquiditySweep.cs" />
+    <!-- the log report, checked against the logs these runs write -->
+    <Compile Include="..\LogReport\ExecutionLogReport.cs" Link="ExecutionLogReport.cs" />
     <ProjectReference Include="..\AtasApiStubs\AtasApiStubs.csproj" />
   </ItemGroup>
 </Project>
