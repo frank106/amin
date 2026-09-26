@@ -51,6 +51,7 @@ internal static class Program
 		Run("Signal hours: no signal, no order", SignalHours);
 		Run("One trade at a time: hidden signals and overlapping ones are skipped", OneTradeAtATime);
 		Run("Time exits: Max bars in trade and the session end close at market", TimeExits);
+		Run("Flat by: closed at market at a set time, no entries before it, the next day again", FlatBy);
 		Run("History never trades", HistoryNeverTrades);
 		Run("Recalculating the chart keeps the open position and its orders", RecalculationKeepsThePosition);
 		Run("Panel lines and alerts", PanelAndAlerts);
@@ -117,12 +118,13 @@ internal static class Program
 			"one contract, no loss limit until set, no live account");
 		Check(fresh.TickValue == 5 && fresh.CommissionPerContract == 5 && fresh.SlippageTicks == 1 && fresh.AlertOnOrders && fresh.ExecutionLogFolder.Length == 0,
 			"NQ's tick value, the backtest's costs, alerts, the default log folder");
+		Check(fresh.FlatByTime == TimeSpan.Zero && fresh.FlatByLastEntryMinutes == 10, "no flat-by time; with one, no entries in its last 10 minutes");
 
 		var group = IndicatorType.GetProperties()
 			.Where(p => p.GetCustomAttribute<DisplayAttribute>()?.GetGroupName() == "Execution")
 			.Select(p => p.Name)
 			.ToList();
-		Check(group.Count == 11, $"eleven settings under Execution: {string.Join(", ", group)}");
+		Check(group.Count == 13, $"thirteen settings under Execution: {string.Join(", ", group)}");
 
 		// off: the chart signals as ever, and the executor does nothing at all
 		var broker = new FakeBroker();
@@ -469,6 +471,71 @@ internal static class Program
 		rows = Rows(session);
 		Check(Only(rows, "CHART")["chart_outcome"] == "EXP" && Only(rows, "FILL", "exit")["price"] == "105.75",
 			$"closed at the next session's first price: {Describe(rows)}");
+	}
+
+	private static void FlatBy()
+	{
+		// flat by 09:52, entries until 09:51: the 09:50 BUY goes in, and out at 09:52 whatever the chart does
+		var ind = Buy(i =>
+		{
+			i.FlatByTime = new TimeSpan(9, 52, 0);
+			i.FlatByLastEntryMinutes = 1;
+			i.OneTradeAtATime = false;
+			i.SignalSource = FvgReactionLiquiditySweep.SignalMode.FvgReactionOnly;
+			i.EnableShortSignals = false;
+		});
+		var mode = Only(Rows(ind), "MODE")["note"];
+		Check(mode.EndsWith(" · overlapping signals on the chart · flat by 09:52 New York, last entry 09:51", StringComparison.Ordinal), $"the MODE row names it: {mode}");
+
+		StreamBar(ind, new[] { 103.5m, 104, 106, 105 });                      // 20 (09:50): in at 103.75
+		StreamBar(ind, new[] { 105m, 106, 104, 105.5m });                     // 21 (09:51)
+		OpenBar(ind, 105.5m);                                                 // 22 (09:52): flat
+
+		var rows = Rows(ind);
+		Check(Trail(rows) == "SIGNAL ORDER:entry FILL:entry ORDER:stop ORDER:take_profit EXIT CANCEL:take_profit CANCELLED:take_profit CANCEL:stop "
+			+ "CANCELLED:stop ORDER:exit FILL:exit CLOSED", $"order trail: {Trail(rows)}");
+		Check(Only(rows, "EXIT")["note"] == "flat by 09:52 New York", $"closed for the flat-by time: {Only(rows, "EXIT")["note"]}");
+
+		var closed = Only(rows, "CLOSED");
+		Check(Only(rows, "FILL", "exit")["price"] == "105.25" && closed["pnl_ticks"] == "6" && closed["pnl_usd"] == "25.00" && closed["chart_outcome"] == "OPEN",
+			$"at market, +6t ($25), with the chart's trade still open: {closed["pnl_ticks"]}t {closed["chart_outcome"]}");
+		Check(Trades(ind).Single().Outcome == "Open", "the chart's trade carries on");
+
+		// a later BUY the same day: past the last entry
+		StreamPattern(ind, 60);
+		var skipped = Only(Rows(ind), "SKIPPED");
+		Check(skipped["note"] == "no new entries from 09:51 New York (flat by 09:52) until the trading day turns at 18:00", $"skipped: {skipped["note"]}");
+
+		// the next trading day, from 18:00 New York: taken again
+		StreamPattern(ind, 40, Start.Date.AddHours(23).AddMinutes(5));
+		Check(Rows(ind).Count(r => r["event"] == "SIGNAL") == 2, $"the next day's BUY is taken: {Trail(Rows(ind))}");
+
+		// a limit entry still waiting at the flat-by time is cancelled
+		var waiting = Buy(i =>
+		{
+			i.Entry = FvgReactionLiquiditySweep.EntryRule.LimitPullback;
+			i.FlatByTime = new TimeSpan(9, 51, 0);
+			i.FlatByLastEntryMinutes = 0;
+		});
+		OpenBar(waiting, 103.5m);                                             // 20 (09:50): the limit waits at 103.00
+		OpenBar(waiting, 103.75m);                                            // 21 (09:51): flat
+		rows = Rows(waiting);
+		Check(Trail(rows) == "SIGNAL ORDER:entry CANCEL:entry CANCELLED:entry NOFILL" && Only(rows, "CANCEL", "entry")["note"] == "flat by 09:51 New York",
+			$"the waiting entry is cancelled: {Trail(rows)}");
+
+		// a flat-by time in CME's daily break, when nothing trades: the position closes at the new
+		// trading day's first price
+		var late = LiveIndicator(FvgSetup(Start.AddHours(7)), i =>
+		{
+			i.FlatByTime = new TimeSpan(17, 30, 0);
+			i.FlatByLastEntryMinutes = 10;
+		});
+		StreamBar(late, Hammer, delta: 50);                                   // 19 (16:49)
+		StreamBar(late, new[] { 103.5m, 104, 105 });                          // 20 (16:50): in
+		OpenBar(late, 105, Start.Date.AddHours(23).AddMinutes(1));            // 18:01 New York: the next trading day
+		rows = Rows(late);
+		Check(Only(rows, "EXIT")["note"] == "flat by 17:30 New York (the trading day turned before it)" && rows.Any(r => r["event"] == "CLOSED"),
+			$"closed as the day turned: {Trail(rows)}");
 	}
 
 	private static void HistoryNeverTrades()

@@ -776,6 +776,7 @@ namespace ATAS.Indicators.Technical
 		{
 			public string SignalId;
 			public SignalTrade Trade;
+			public DateTime Opened;          // when the executor took the signal (UTC)
 			public bool Paper;
 			public bool IsLong;
 			public decimal Contracts;
@@ -1264,6 +1265,8 @@ namespace ATAS.Indicators.Technical
 		private int _contracts = 1;
 		private decimal _dailyLossLimit;
 		private bool _skipTradesBeyondLimit = true;
+		private TimeSpan _flatByTime;
+		private int _flatByLastEntryMinutes = 10;
 		private decimal _tickValue = 5m;
 		private decimal _commissionPerContract = 5m;
 		private int _slippageTicks = 1;
@@ -2164,7 +2167,24 @@ namespace ATAS.Indicators.Technical
 			set { _skipTradesBeyondLimit = value; _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 506,
+		[Display(Name = "Flat by (New York, 00:00 = off)", GroupName = "Execution", Order = 507,
+			Description = "Each trading day at this New York time the position is closed at market and a waiting entry is cancelled; the chart's trade carries on without it. 00:00: off.")]
+		public TimeSpan FlatByTime
+		{
+			get => _flatByTime;
+			set { _flatByTime = WithinDay(value); _execConfigDirty = true; RedrawChart(); }
+		}
+
+		[Display(Name = "No new entries in the last (minutes)", GroupName = "Execution", Order = 508,
+			Description = "With a flat-by time: no new entries from this many minutes before it until the trading day turns at 18:00 New York.")]
+		[Range(0, 600)]
+		public int FlatByLastEntryMinutes
+		{
+			get => _flatByLastEntryMinutes;
+			set { _flatByLastEntryMinutes = Math.Min(600, Math.Max(0, value)); _execConfigDirty = true; }
+		}
+
+		[Display(Name = "Tick value ($ per contract)", GroupName = "Execution", Order = 512,
 			Description = "5 for NQ, 0.5 for MNQ. When the trading connection reports a different one, the larger is used, so a wrong setting can only make the loss limit stricter.")]
 		[Range(0.0, 100000.0)]
 		public decimal TickValue
@@ -2173,7 +2193,7 @@ namespace ATAS.Indicators.Technical
 			set { _tickValue = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Commission ($ per contract, round trip)", GroupName = "Execution", Order = 507,
+		[Display(Name = "Commission ($ per contract, round trip)", GroupName = "Execution", Order = 513,
 			Description = "Taken off every closed trade, for the daily loss limit and the log. 5.00 is the backtest's one tick on NQ; set what your broker charges.")]
 		[Range(0.0, 100000.0)]
 		public decimal CommissionPerContract
@@ -2182,7 +2202,7 @@ namespace ATAS.Indicators.Technical
 			set { _commissionPerContract = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Slippage (ticks per market / stop fill)", GroupName = "Execution", Order = 508,
+		[Display(Name = "Slippage (ticks per market / stop fill)", GroupName = "Execution", Order = 514,
 			Description = "Paper market and stop orders fill this many ticks worse than the price that reached them. Both modes count it in a new trade's risk.")]
 		[Range(0, 1000)]
 		public int SlippageTicks
@@ -2191,7 +2211,7 @@ namespace ATAS.Indicators.Technical
 			set { _slippageTicks = Math.Max(0, value); _execConfigDirty = true; }
 		}
 
-		[Display(Name = "Alert on orders", GroupName = "Execution", Order = 509,
+		[Display(Name = "Alert on orders", GroupName = "Execution", Order = 515,
 			Description = "An ATAS alert on each fill and each closed position. A halt, a rejected order and the daily loss limit always alert.")]
 		public bool AlertOnOrders
 		{
@@ -2199,7 +2219,7 @@ namespace ATAS.Indicators.Technical
 			set => _alertOnOrders = value;
 		}
 
-		[Display(Name = "Log folder (empty = ATAS's data folder)", GroupName = "Execution", Order = 510,
+		[Display(Name = "Log folder (empty = ATAS's data folder)", GroupName = "Execution", Order = 516,
 			Description = "Where the CSV log of every signal, order, fill and result goes: one file per trading day, instrument and mode. Empty: ATAS/FvgExecution in the application data folder.")]
 		public string ExecutionLogFolder
 		{
@@ -4558,6 +4578,7 @@ namespace ATAS.Indicators.Technical
 				FollowPrices(bar);
 				_execPrice = candle.Close;
 				ManagePosition();
+				FlattenAtFlatBy();
 
 				foreach (var trade in _execCandidates)
 					ConsiderSignal(trade);
@@ -4761,6 +4782,7 @@ namespace ATAS.Indicators.Technical
 			{
 				SignalId = SignalId(trade),
 				Trade = trade.Clone(),
+				Opened = _execNow,
 				Paper = paper,
 				IsLong = trade.IsLong,
 				Contracts = Contracts,
@@ -4792,6 +4814,9 @@ namespace ATAS.Indicators.Technical
 
 			if (_execPosition != null && !_execPosition.Done)
 				return "a position is already open (execution holds one at a time)";
+
+			if (PastLastEntry())
+				return $"no new entries from {ClockTime(LastEntryTime)} New York (flat by {ClockTime(FlatByTime)}) until the trading day turns at 18:00";
 
 			if (trade.Outcome != TradeOutcome.Open)
 				return "the chart's trade ended before an order could go in";
@@ -4915,6 +4940,68 @@ namespace ATAS.Indicators.Technical
 		private decimal EffectiveTickValue()
 		{
 			return Math.Max(TickValue, TradingManager?.Security?.TickCost ?? 0m);
+		}
+
+		// The flat-by time is measured into the trading day, which starts at 18:00 New York, so an
+		// evening time counts as early in the day. 00:00 is off; 18:00 is the day's very end.
+		private bool FlatByOn => FlatByTime != TimeSpan.Zero;
+
+		private static TimeSpan IntoTradingDay(TimeSpan newYorkTime)
+		{
+			return WithinDay(newYorkTime - TradingDayStart);
+		}
+
+		private TimeSpan FlatByIntoDay => IntoTradingDay(FlatByTime) == TimeSpan.Zero ? TimeSpan.FromDays(1) : IntoTradingDay(FlatByTime);
+
+		// the New York time from which no new entry goes in
+		private TimeSpan LastEntryTime => WithinDay(FlatByTime - TimeSpan.FromMinutes(FlatByLastEntryMinutes));
+
+		private bool PastLastEntry()
+		{
+			if (!FlatByOn || _execNow.Year < 2)
+				return false;
+
+			var last = FlatByIntoDay - TimeSpan.FromMinutes(FlatByLastEntryMinutes);
+			return IntoTradingDay(NewYorkTime(_execNow).TimeOfDay) >= (last < TimeSpan.Zero ? TimeSpan.Zero : last);
+		}
+
+		// whether the trading day has turned since a position opened
+		private bool DayTurnedSince(DateTime opened)
+		{
+			return TradingDayOf(NewYorkTime(_execNow)) > TradingDayOf(NewYorkTime(opened));
+		}
+
+		// The flat-by time has come for the position: the position closes at market and a waiting
+		// entry is cancelled, whatever the chart's trade does next. A position still open when the
+		// trading day turns (a flat-by time with no trading after it, in CME's daily break) closes at
+		// the new day's first price.
+		private void FlattenAtFlatBy()
+		{
+			var pos = _execPosition;
+
+			if (!FlatByOn || pos == null || pos.Done || pos.Exiting || _execNow.Year < 2)
+				return;
+
+			var turned = DayTurnedSince(pos.Opened);
+
+			if (!turned && IntoTradingDay(NewYorkTime(_execNow).TimeOfDay) < FlatByIntoDay)
+				return;
+
+			var reason = $"flat by {ClockTime(FlatByTime)} New York{(turned ? " (the trading day turned before it)" : string.Empty)}";
+
+			if (pos.Open > 0)
+				BeginExit(pos, reason);
+			else
+			{
+				CancelExecOrder(pos, pos.Entry, reason);
+				CheckDone(pos);
+			}
+		}
+
+		// "15:55"
+		private static string ClockTime(TimeSpan time)
+		{
+			return time.ToString(@"hh\:mm", CultureInfo.InvariantCulture);
 		}
 
 		// a new position takes over from the last one, whose chart trade may still be running
@@ -5717,7 +5804,7 @@ namespace ATAS.Indicators.Technical
 				? $"tick value {Money(TickValue)} (the connection says {Money(platform)}; using {Money(EffectiveTickValue())})"
 				: $"tick value {Money(TickValue)}";
 
-			var config = string.Join(" · ", new[]
+			var parts = new List<string>
 			{
 				!ExecuteSignals ? "execution off (an open position is still managed)" : PaperTrading ? "paper" : $"live, account {LiveAccount}",
 				$"{Contracts} contract{(Contracts == 1 ? string.Empty : "s")}",
@@ -5731,7 +5818,13 @@ namespace ATAS.Indicators.Technical
 				Entry == EntryRule.LimitPullback ? $"limit entry {PullbackPercent}% back, valid {LimitValidBars} bars" : "entry at the close",
 				$"signals {HoursText()}",
 				OneTradeAtATime ? "one trade at a time" : "overlapping signals on the chart"
-			});
+			};
+
+			// the executor's own safety settings, named only when they are on
+			if (FlatByOn)
+				parts.Add($"flat by {ClockTime(FlatByTime)} New York, last entry {ClockTime(LastEntryTime)}");
+
+			var config = string.Join(" · ", parts);
 
 			if (config == _execConfig)
 				return;
