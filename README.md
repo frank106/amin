@@ -533,6 +533,31 @@ These runs came before *Only trade with the day's trend*, which is now on by def
 `--set OnlyWithDayTrend=false` gives the signals they had. The day's trend itself hasn't been
 through the backtest yet - run it with and without, on ticks, before trusting it.
 
+### On ATAS's own data
+
+*FVG Bar Export*, the second indicator in the same DLL (also under *My Indicators*), writes the bars
+a chart has loaded to files the runner reads - with what the CFD data above lacks: the futures'
+own volume, each bar's delta, and its footprint (the volume, bid and ask at every price), so the
+*Fill* signals and the delta and order-flow confirmations get backtested too. Load a chart with as
+many days as the data feed gives and add the indicator. Once the history is in, it says on the
+chart what it wrote to `%APPDATA%\ATAS\FvgExport` (or its *Folder*):
+
+```
+MNQZ6_1m_2026-06-01_2026-09-25_bars.csv            time,open,high,low,close,volume,delta,bid,ask
+MNQZ6_1m_2026-06-01_2026-09-25_footprint.csv.gz    time,price,volume,bid,ask
+```
+
+Times are the bars' open times in UTC, and the forming bar is left out; with *Include the
+footprint* off it writes the bars alone. Then, for MNQ ($0.50 a tick, so a $1.50 commission is 3
+ticks):
+
+```
+dotnet run -c Release --project tests/Backtest -- <..._bars.csv> --footprint <..._footprint.csv.gz> --tick-value 0.5 --commission 3
+```
+
+Trades are still settled on an assumed path inside each bar; the worst-case row next to the result
+shows how much that matters.
+
 ## Honest limits
 
 * The probability is a frequency from the history loaded on the chart, not a guarantee. Markets
@@ -964,7 +989,10 @@ the chart's signals (switch *Only trade with the day's trend* off for the ones b
     BUYs, below both for SHORTs;
   * **a daily profit target** (+140 ticks): no new entries for the rest of the day once made;
   * **the instrument's own costs** (on): NQ, MNQ, ES, MES and other CME contracts get their own
-    tick value and a typical commission.
+    tick value and a typical commission;
+  * **FVG Bar Export**: a second indicator that writes a chart's bars and footprint for the
+    backtest runner, which now reads delta and (`--footprint`) the footprint too - see
+    [On ATAS's own data](#on-atass-own-data).
 
 New in the previous version, all off by default:
 

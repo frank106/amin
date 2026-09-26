@@ -234,6 +234,12 @@ dotnet run -c Release --project tests/Backtest -- nq-1min.csv --tz America/New_Y
   milliseconds or nanoseconds, and files may be `.gz` or `.zip`. `--tz` gives the zone of times
   without an offset, and `--bar-time close` handles files stamped at the bar's close. When a file
   mixes contracts, each trading day keeps its most traded one.
+* **ATAS's own data**: *FVG Bar Export*, added to an ATAS chart, writes its bars with their volume,
+  delta, bid and ask, and a footprint file (time, price, volume, bid, ask). A `delta` column feeds
+  the delta confirmation, and `--footprint <file>` gives the bars their footprint: big fills, the
+  *Fill* signals and the order-flow confirmation, which plain bars can't have. `IndicatorTests`
+  checks that the export writes every closed bar and every price of its footprint exactly as the
+  chart has them.
 * **Settings**: the indicator's defaults, `--preset 1min` (Swing Lookback 30, Min FVG Size 8,
   cooldown 10), and `--set Name=Value` for any setting.
 * **Costs**: `--commission` ticks a round trip (1) and `--slippage` ticks on each market order

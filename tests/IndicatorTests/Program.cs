@@ -7,6 +7,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 
@@ -227,6 +229,7 @@ internal static class Program
 		Run("Recalculate is deterministic", RecalculateIsDeterministic);
 		Run("Worst-case odds: the labels' with the worst case on the chart, lower otherwise", WorstCaseOdds);
 		Run("Day's trend: every signal goes the day's way", DayTrendFilter);
+		Run("Bar export: the chart's bars and footprint, as the backtest reads them", BarExport);
 		Run("Render: zones, fills, orders, sweeps, labels, panel, tooltips", RenderSmoke);
 
 		Console.WriteLine();
@@ -4860,6 +4863,84 @@ internal static class Program
 		var against = trades.Where(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)).ToList();
 		Check(against.Count == 0, $"every signal goes the day's way: {against.Count} don't (first on bar {against.FirstOrDefault()?.EntryBar})");
 		Check(all.Any(t => trend[t.EntryBar] != (t.IsLong ? 1 : -1)), "and without the filter some wouldn't");
+	}
+
+	// FVG Bar Export writes the chart's closed bars and their footprint, as the backtest runner reads them
+	private static void BarExport()
+	{
+		var market = Generate(600, 3);
+
+		foreach (var candle in market.Candles)
+		{
+			candle.Volume = candle.Levels.Sum(l => l.Volume);
+			candle.Bid = candle.Levels.Sum(l => l.Bid);
+			candle.Ask = candle.Levels.Sum(l => l.Ask);
+		}
+
+		var folder = Path.Combine(Path.GetTempPath(), "fvg-export-test-" + Guid.NewGuid().ToString("N"));
+		var inv = CultureInfo.InvariantCulture;
+		string N(decimal v) => v.ToString("0.########", inv);
+		string T(DateTime t) => t.ToString("yyyy-MM-dd HH:mm:ss", inv);
+
+		try
+		{
+			var export = new FvgBarExport
+			{
+				InstrumentInfo = new InstrumentInfo { TickSize = Tick, Instrument = "MNQZ6" }, ChartInfo = new FakeChart(), Folder = folder
+			};
+
+			void Load()
+			{
+				export.Candles.Clear();
+				export.Candles.AddRange(market.Candles);
+				export.HarnessRecalculate();
+
+				for (var i = 0; i < market.Candles.Count; i++)
+					export.HarnessCalculate(i);
+			}
+
+			Load();
+
+			// the last bar is still forming: every other one is written
+			var closed = market.Candles.Take(market.Candles.Count - 1).ToList();
+			var stem = $"MNQZ6_1m_{closed[0].Time.ToString("yyyy-MM-dd", inv)}_{closed[closed.Count - 1].Time.ToString("yyyy-MM-dd", inv)}";
+			var files = Directory.GetFiles(folder).Select(Path.GetFileName).OrderBy(f => f, StringComparer.Ordinal).ToList();
+			Check(files.SequenceEqual(new[] { stem + "_bars.csv", stem + "_footprint.csv.gz" }), $"two files, named after the chart: {string.Join(", ", files)}");
+
+			var bars = File.ReadAllLines(Path.Combine(folder, stem + "_bars.csv"));
+			Check(bars[0] == "time,open,high,low,close,volume,delta,bid,ask" && bars.Length == closed.Count + 1,
+				$"a header and every closed bar: {bars.Length - 1} of {closed.Count}");
+
+			var differ = closed.Where((c, i) => i + 1 >= bars.Length
+				|| bars[i + 1] != $"{T(c.Time)},{N(c.Open)},{N(c.High)},{N(c.Low)},{N(c.Close)},{N(c.Volume)},{N(c.Delta)},{N(c.Bid)},{N(c.Ask)}").Count();
+			Check(differ == 0, $"every bar as the chart has it: {differ} differ");
+
+			using (var reader = new StreamReader(new GZipStream(File.OpenRead(Path.Combine(folder, stem + "_footprint.csv.gz")), CompressionMode.Decompress)))
+			{
+				var rows = reader.ReadToEnd().Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+				var expected = closed.SelectMany(c => c.Levels.OrderBy(l => l.Price).Select(l => $"{T(c.Time)},{N(l.Price)},{N(l.Volume)},{N(l.Bid)},{N(l.Ask)}")).ToList();
+				Check(rows[0] == "time,price,volume,bid,ask" && rows.Skip(1).SequenceEqual(expected),
+					$"every price of every closed bar: {rows.Length - 1} rows, {expected.Count} expected");
+			}
+
+			// the chart says what was written, and where
+			var context = new RenderContext();
+			export.HarnessRender(context);
+			Check(context.Strings.Any(s => s.StartsWith($"FVG Bar Export: {closed.Count.ToString("N0", inv)} bars, ", StringComparison.Ordinal))
+				&& context.Strings.Any(s => s.StartsWith("written to " + Path.Combine(folder, stem), StringComparison.Ordinal)),
+				$"the chart says: {string.Join(" | ", context.Strings)}");
+
+			// again, without the footprint: the bars file is replaced, and nothing half-written stays
+			export.IncludeFootprint = false;
+			Load();
+			Check(Directory.GetFiles(folder).Length == 2 && !Directory.GetFiles(folder).Any(f => f.EndsWith(".partial", StringComparison.Ordinal))
+				&& File.ReadAllLines(Path.Combine(folder, stem + "_bars.csv")).Length == closed.Count + 1, "exported again, nothing left half-written");
+		}
+		finally
+		{
+			if (Directory.Exists(folder))
+				Directory.Delete(folder, true);
+		}
 	}
 
 	private static List<object> TradesRaw(FvgReactionLiquiditySweep ind)

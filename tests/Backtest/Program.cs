@@ -25,14 +25,17 @@
 //   --trades <file.csv>     write every signal (shown and hidden) to a CSV
 //   --ticks <file>          ticks (time, price) inside the bars: where a bar has them, trades are settled
 //                           on them, as a live chart does, instead of on an assumed path (repeatable)
+//   --footprint <file>      each bar's footprint (time, price, volume, bid, ask), as FVG Bar Export
+//                           writes it: big fills, the Fill signals and the order-flow confirmation
 //
 // Files can be .csv, .csv.gz or .zip. Columns are found by their header (time / date + time,
-// open, high, low, close, volume, symbol) or, without a header, taken as time, open, high, low,
-// close, volume (a date and a time may be two columns). Times can be text or Unix seconds,
-// milliseconds or nanoseconds. Bars carry no footprint, so big fills (and the Fill signals and
-// order-flow confirmation they give) and the delta confirmation need data this runner does not
-// read; everything built from candles works as on the chart. With --ticks, bars that have ticks are
-// replayed tick by tick, so trades follow the real path inside them, as on a live chart.
+// open, high, low, close, volume, delta, symbol) or, without a header, taken as time, open, high,
+// low, close, volume (a date and a time may be two columns). Times can be text or Unix seconds,
+// milliseconds or nanoseconds. Plain bars carry no footprint, so big fills (and the Fill signals
+// and order-flow confirmation they give) need --footprint, and the delta confirmation a delta
+// column; everything built from candles works as on the chart. FVG Bar Export, added to an ATAS
+// chart, writes both from ATAS's own data. With --ticks, bars that have ticks are replayed tick by
+// tick, so trades follow the real path inside them, as on a live chart.
 
 using System;
 using System.Collections;
@@ -59,6 +62,7 @@ internal static class Program
 	{
 		public List<string> Files = new List<string>();
 		public List<string> TickFiles = new List<string>();
+		public List<string> FootprintFiles = new List<string>();
 		public TimeZoneInfo Zone = TimeZoneInfo.Utc;
 		public bool CloseTimes;
 		public DateTime From = DateTime.MinValue;
@@ -79,7 +83,7 @@ internal static class Program
 	private sealed class Row
 	{
 		public DateTime Time;
-		public decimal Open, High, Low, Close, Volume;
+		public decimal Open, High, Low, Close, Volume, Delta;
 		public string Symbol;
 	}
 
@@ -154,6 +158,10 @@ internal static class Program
 				rows.AddRange(ReadRows(file, options));
 
 			candles = BuildCandles(rows, options, out notes);
+
+			if (options.FootprintFiles.Count > 0)
+				AttachFootprint(candles, options, notes);
+
 			ind.InstrumentInfo = new InstrumentInfo { TickSize = options.Tick };
 			changed = ApplySettings(ind, options);
 
@@ -270,7 +278,12 @@ internal static class Program
 			}
 
 			var first = path[0] * tick;
-			var forming = new IndicatorCandle { Open = first, High = first, Low = first, Close = first, Volume = bar.Volume, Time = bar.Time };
+			// the bar's volume, delta and footprint are its final ones: signals are only decided on
+			// closed bars
+			var forming = new IndicatorCandle
+			{
+				Open = first, High = first, Low = first, Close = first, Volume = bar.Volume, Delta = bar.Delta, Levels = bar.Levels, Time = bar.Time
+			};
 			ind.Candles.Add(forming);
 
 			foreach (var step in path)
@@ -377,6 +390,10 @@ internal static class Program
 					o.TickFiles.Add(Next(ref i));
 					break;
 
+				case "--footprint":
+					o.FootprintFiles.Add(Next(ref i));
+					break;
+
 				default:
 					if (args[i].StartsWith("--", StringComparison.Ordinal))
 						throw new ArgumentException($"unknown option {args[i]}");
@@ -443,7 +460,7 @@ internal static class Program
 	{
 		var rows = new List<Row>();
 		char separator = ',';
-		int time = -1, date = -1, clock = -1, open = -1, high = -1, low = -1, close = -1, volume = -1, symbol = -1;
+		int time = -1, date = -1, clock = -1, open = -1, high = -1, low = -1, close = -1, volume = -1, delta = -1, symbol = -1;
 		var first = true;
 		var lineNumber = 0;
 		var skipped = 0;
@@ -474,6 +491,7 @@ internal static class Program
 					low = Find("low", "l", "low price", "min");
 					close = Find("close", "c", "close price", "last", "closing price", "settle");
 					volume = Find("volume", "vol", "v", "tickvol", "tick volume", "total volume", "tickvolume");
+					delta = Find("delta", "bar delta");
 					symbol = Find("symbol", "ticker", "instrument", "raw_symbol", "contract");
 
 					// "date" and "time" as two columns, or one column with both
@@ -523,6 +541,7 @@ internal static class Program
 					Low = Number(f[low]) * o.PriceScale,
 					Close = Number(f[close]) * o.PriceScale,
 					Volume = volume >= 0 && volume < f.Length && f[volume].Length > 0 ? Number(f[volume]) : 0,
+					Delta = delta >= 0 && delta < f.Length && f[delta].Length > 0 ? Number(f[delta]) : 0,
 					Symbol = symbol >= 0 ? f[symbol] : null
 				});
 			}
@@ -537,6 +556,62 @@ internal static class Program
 			Console.Error.WriteLine($"{path}: {skipped} lines skipped in all");
 
 		return rows;
+	}
+
+	// Each bar's footprint - the volume, bid and ask at every price - from files whose header names
+	// time, price, volume, bid and ask (FVG Bar Export writes them), matched to the bars by time
+	private static void AttachFootprint(List<IndicatorCandle> candles, Options o, List<string> notes)
+	{
+		var byTime = new Dictionary<DateTime, IndicatorCandle>();
+
+		foreach (var candle in candles)
+			byTime[candle.Time] = candle;
+
+		long levels = 0, elsewhere = 0;
+
+		foreach (var path in o.FootprintFiles)
+		{
+			int time = -1, price = -1, volume = -1, bid = -1, ask = -1;
+			var first = true;
+
+			foreach (var raw in ReadLines(path))
+			{
+				var line = raw.Trim().TrimStart('﻿');
+
+				if (line.Length == 0)
+					continue;
+
+				var f = Split(line, ',');
+
+				if (first)
+				{
+					first = false;
+					var names = f.Select(n => n.ToLowerInvariant()).ToArray();
+					(time, price, volume, bid, ask) = (Array.IndexOf(names, "time"), Array.IndexOf(names, "price"), Array.IndexOf(names, "volume"),
+						Array.IndexOf(names, "bid"), Array.IndexOf(names, "ask"));
+
+					if (time < 0 || price < 0 || volume < 0 || bid < 0 || ask < 0)
+						throw new InvalidDataException($"{path}: a footprint file needs time, price, volume, bid and ask columns, not \"{line}\"");
+
+					continue;
+				}
+
+				if (!TryParseTime(f[time], o.Zone, out var utc) || !byTime.TryGetValue(utc, out var bar))
+				{
+					elsewhere++;
+					continue;
+				}
+
+				bar.Levels.Add(new PriceVolumeInfo
+				{
+					Price = Number(f[price]) * o.PriceScale, Volume = Number(f[volume]), Bid = Number(f[bid]), Ask = Number(f[ask])
+				});
+				levels++;
+			}
+		}
+
+		notes.Add($"footprint: {levels.ToString("N0", Inv)} prices on {candles.Count(c => c.Levels.Count > 0).ToString("N0", Inv)} of {candles.Count.ToString("N0", Inv)} bars"
+			+ (elsewhere > 0 ? $" ({elsewhere.ToString("N0", Inv)} rows for bars not in range)" : string.Empty));
 	}
 
 	private static string[] Split(string line, char separator)
@@ -823,7 +898,7 @@ internal static class Program
 			if (high != Grid(r.High) || low != Grid(r.Low))
 				repaired++;
 
-			candles.Add(new IndicatorCandle { Open = open, High = high, Low = low, Close = close, Volume = r.Volume, Time = r.Time });
+			candles.Add(new IndicatorCandle { Open = open, High = high, Low = low, Close = close, Volume = r.Volume, Delta = r.Delta, Time = r.Time });
 		}
 
 		if (duplicates > 0)

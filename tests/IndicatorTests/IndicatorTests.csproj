@@ -30,6 +30,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\FvgReactionLiquiditySweep.cs" Link="FvgReactionLiquiditySweep.cs" />
+    <Compile Include="..\..\FvgBarExport.cs" Link="FvgBarExport.cs" />
     <ProjectReference Include="..\AtasApiStubs\AtasApiStubs.csproj" />
   </ItemGroup>
 </Project>
