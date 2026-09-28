@@ -156,12 +156,16 @@ What it checks:
   its orders to finish as they would have;
 * **the panel and alerts**: the executor's lines, and alerts on fills and results (or not);
 * **live orders** against the fake broker: not armed without the chart's account, a daily loss
-  limit, a connection or the right tick size, or when the account already holds a position; the
-  calls themselves (a market BUY for the chart's account, no confirmation dialog, the stop before
-  the take profit in one OCO group, ModifyOrderAsync to break-even, the leftover leg cancelled);
+  limit, a connection or the right tick size, when ATAS's own SL/TP is on, or when the account
+  already holds a position; the calls themselves (a market BUY for the chart's account, no
+  confirmation dialog and no wait on unanswered orders, the stop before the take profit as two plain
+  orders, ModifyOrderAsync to break-even, the leftover leg cancelled);
   fills reported before or after the order's state, twice, or for someone else's order; partial
   fills resizing the bracket; a take profit filling while the executor cancels it; a rejected stop
-  (closed at market, halted); a stop cancelled outside the indicator (closed and halted a few
+  (closed at market, halted); a stop the broker holds back with a call that never returns (the take
+  profit still sent; 5 seconds on counted as rejected, closed at market, halted; cancelled again when
+  it turns up working, a warning halt when it fills after all; confirmed after 2 seconds: nothing
+  happens - turning the check off fails 11 checks); a stop cancelled outside the indicator (closed and halted a few
   seconds on, but not when its take profit's fill cancelled it); a position closed outside the
   indicator (halted);
 * **the safety settings**: one live trade per account across charts, given back when the position is

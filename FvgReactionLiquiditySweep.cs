@@ -785,6 +785,8 @@ namespace ATAS.Indicators.Technical
 			public bool CancelSent;
 			public int CancelAttempts;      // live: cancels the broker refused
 			public bool FillPending;        // live: reported filled, its fills not in yet
+			public DateTime Sent;           // live: when it was sent
+			public bool Confirmed;          // live: ATAS showed it at the broker (working, filled or cancelled)
 
 			public bool Matches(Order order, string id)
 			{
@@ -1311,6 +1313,10 @@ namespace ATAS.Indicators.Technical
 		// position counts as closed outside the indicator (fills can arrive after the position update)
 		private static readonly TimeSpan AccountFlatGrace = TimeSpan.FromSeconds(3);
 
+		// live: how long a stop, take profit or closing order may go without the broker taking it
+		// before it counts as rejected (a broker answers in well under a second)
+		private static readonly TimeSpan ConfirmGrace = TimeSpan.FromSeconds(5);
+
 		// Live trades, one per account at a time across the charts of this ATAS: the account's ID ->
 		// the indicator whose live position holds it, from its entry until the position is done
 		private static readonly Dictionary<string, FvgReactionLiquiditySweep> LiveAccountHolders =
@@ -1319,6 +1325,7 @@ namespace ATAS.Indicators.Technical
 		private readonly List<SignalTrade> _execCandidates = new List<SignalTrade>();   // real-time signals of the bar that just closed
 		private readonly List<ExecOrder> _paperBook = new List<ExecOrder>();            // paper orders resting in the simulator
 		private readonly HashSet<string> _execFillIds = new HashSet<string>();          // live fills already counted
+		private readonly List<ExecOrder> _execUnconfirmed = new List<ExecOrder>();     // live orders the broker never confirmed: they may still turn up
 		private readonly ExecDay _paperDay = new ExecDay();
 		private readonly ExecDay _liveDay = new ExecDay();
 		private ExecPosition _execPosition;
@@ -2510,7 +2517,7 @@ namespace ATAS.Indicators.Technical
 
 			// live orders only: paper ones never leave the indicator
 			if (requests != null)
-				_ = SendLiveRequests(requests);
+				SendLiveRequests(requests);
 		}
 
 		private void ResetState()
@@ -5263,6 +5270,7 @@ namespace ATAS.Indicators.Technical
 				{
 					CheckAccount(pos);
 					CheckProtection(pos);
+					CheckConfirmations(pos);
 				}
 
 				if (trade.Outcome != TradeOutcome.Open)
@@ -5325,7 +5333,7 @@ namespace ATAS.Indicators.Technical
 				false, false);
 
 			var type = trade.LimitEntry ? OrderTypes.Limit : OrderTypes.Market;
-			pos.Entry = NewOrder(pos, OrderRole.Entry, pos.IsLong, type, pos.Contracts, trade.EntryPrice, null);
+			pos.Entry = NewOrder(pos, OrderRole.Entry, pos.IsLong, type, pos.Contracts, trade.EntryPrice);
 			Place(pos, pos.Entry);
 		}
 
@@ -5450,7 +5458,26 @@ namespace ATAS.Indicators.Technical
 			if (security.TickSize > 0 && security.TickSize != TickSize)
 				return $"the instrument's tick size ({security.TickSize.ToString(CultureInfo.InvariantCulture)}) is not the chart's";
 
+			// its target a tick in front of the executor's closes winners behind its back, and two
+			// stops can both fill
+			if (TradingFlag(manager, "IsStopLossModeActivated") || TradingFlag(manager, "IsTakeProfitModeActivated"))
+				return "ATAS's own stop loss / take profit (SL/TP) is on: it would trade against the executor's bracket, switch it off";
+
 			return null;
+		}
+
+		// a flag of the chart's trading connection that not every ATAS has (false where it is missing)
+		private static bool TradingFlag(ITradingManager manager, string name)
+		{
+			try
+			{
+				var property = typeof(ITradingManager).GetProperty(name) ?? manager.GetType().GetProperty(name);
+				return property?.GetValue(manager) is bool on && on;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
 		}
 
 		// Two charts armed for one account would each keep their own position and loss limit, so a
@@ -5663,7 +5690,10 @@ namespace ATAS.Indicators.Technical
 			_execFillIds.Clear();
 		}
 
-		private ExecOrder NewOrder(ExecPosition pos, OrderRole role, bool isBuy, OrderTypes type, decimal quantity, decimal price, string ocoGroup)
+		// No OCO group: the executor cancels what is left itself once the position is flat, and on
+		// connections without OCO at the broker (Rithmic among them) ATAS keeps OCO pairs on this
+		// computer - where, on 2026-09-28, it held a live stop back: the broker never got it.
+		private ExecOrder NewOrder(ExecPosition pos, OrderRole role, bool isBuy, OrderTypes type, decimal quantity, decimal price)
 		{
 			var order = new Order
 			{
@@ -5677,9 +5707,6 @@ namespace ATAS.Indicators.Technical
 				order.Price = price;
 			else if (type == OrderTypes.Stop)
 				order.TriggerPrice = price;
-
-			if (ocoGroup != null)
-				order.OCOGroup = ocoGroup;
 
 			if (!pos.Paper)
 			{
@@ -5705,7 +5732,10 @@ namespace ATAS.Indicators.Technical
 			if (pos.Paper)
 				PaperPlace(pos, order);
 			else
+			{
+				order.Sent = _execNow;
 				Request(new LiveRequest(LiveAction.Place, order.Order));
+			}
 		}
 
 		private void CancelExecOrder(ExecPosition pos, ExecOrder order, string reason)
@@ -5835,9 +5865,8 @@ namespace ATAS.Indicators.Technical
 				return;
 			}
 
-			var group = $"FVG {pos.SignalId}";
-			pos.Stop = NewOrder(pos, OrderRole.StopLoss, !pos.IsLong, OrderTypes.Stop, pos.Open, stop, group);
-			pos.TakeProfit = NewOrder(pos, OrderRole.TakeProfit, !pos.IsLong, OrderTypes.Limit, pos.Open, trade.TakeProfitPrice, group);
+			pos.Stop = NewOrder(pos, OrderRole.StopLoss, !pos.IsLong, OrderTypes.Stop, pos.Open, stop);
+			pos.TakeProfit = NewOrder(pos, OrderRole.TakeProfit, !pos.IsLong, OrderTypes.Limit, pos.Open, trade.TakeProfitPrice);
 			Place(pos, pos.Stop);
 			Place(pos, pos.TakeProfit);
 		}
@@ -5916,7 +5945,7 @@ namespace ATAS.Indicators.Technical
 			if (pos.Orders.Any(o => o.Working || o.FillPending))
 				return;
 
-			pos.Exit = NewOrder(pos, OrderRole.Exit, !pos.IsLong, OrderTypes.Market, pos.Open, 0, null);
+			pos.Exit = NewOrder(pos, OrderRole.Exit, !pos.IsLong, OrderTypes.Market, pos.Open, 0);
 			Place(pos, pos.Exit);
 		}
 
@@ -6016,8 +6045,8 @@ namespace ATAS.Indicators.Technical
 
 		// Live: an open position always has its stop working. One whose stop went away without the
 		// executor asking (cancelled by hand, expired at the broker) is closed at market and execution
-		// halts - after a few seconds, which leaves time for a take profit that filled as its OCO
-		// partner was cancelled to report its fill.
+		// halts - after a few seconds, which leaves time for a take profit that filled as the stop was
+		// cancelled to report its fill.
 		private void CheckProtection(ExecPosition pos)
 		{
 			if (pos.Open <= 0 || pos.Exiting || pos.Stop == null || pos.Stop.Working || pos.Stop.FillPending)
@@ -6037,6 +6066,63 @@ namespace ATAS.Indicators.Technical
 
 			Halt(pos, "the position's stop was cancelled outside the indicator: the unprotected position is closed at market");
 			BeginExit(pos, "unprotected: the stop was cancelled outside the indicator");
+		}
+
+		// Live: a stop, take profit or closing order the broker hasn't taken a few seconds after it was
+		// sent (ATAS shows it neither working nor done) can't be counted on. It is asked to cancel, in
+		// case it still turns up, and counts as rejected: without its stop or take profit the position
+		// is closed at market and execution halts, and the closing order no longer waits for it.
+		private void CheckConfirmations(ExecPosition pos)
+		{
+			foreach (var order in pos.Orders.ToList())
+			{
+				if (order.Confirmed || order.Role == OrderRole.Entry || (!order.Working && !order.FillPending))
+					continue;
+
+				if (order.Order.State != OrderStates.None || order.Replaced.Any(o => o.State != OrderStates.None))
+				{
+					order.Confirmed = true;
+					continue;
+				}
+
+				if (_execNow - order.Sent < ConfirmGrace)
+					continue;
+
+				var message = $"the broker didn't confirm it within {ConfirmGrace.TotalSeconds:0} s";
+				CancelExecOrder(pos, order, message);
+				_execUnconfirmed.Add(order);
+				OrderFailed(pos, order, message);
+			}
+		}
+
+		// An order counted as rejected because the broker never confirmed it, heard of after all: one
+		// working at the broker is asked to cancel again, one that fills halts execution - the account
+		// may then hold a position the executor doesn't know of. True when the order was one of them.
+		private bool UnconfirmedOrderTurnedUp(Order order, string id, MyTrade fill)
+		{
+			var late = _execUnconfirmed.FirstOrDefault(o => o.Matches(order, id));
+
+			if (late == null)
+				return false;
+
+			var pos = _execPosition;
+
+			if (fill != null)
+			{
+				_execUnconfirmed.Remove(late);
+				Halt(pos, $"the {RoleName(late.Role)} order the broker hadn't confirmed filled after all ({Qty(Math.Abs(fill.Volume))} @ {FormatPrice(fill.Price)}): " +
+					"the account may hold a position the indicator doesn't know of, check it in ATAS");
+			}
+			else if (order.Status() == OrderStatus.Canceled)
+				_execUnconfirmed.Remove(late);
+			else if (order.State == OrderStates.Active && late.CancelAttempts < 2)
+			{
+				late.CancelAttempts++;
+				Log("WARN", pos, $"the {RoleName(late.Role)} order the broker hadn't confirmed turned up working: cancelled again");
+				Request(new LiveRequest(LiveAction.Cancel, order));
+			}
+
+			return true;
 		}
 
 		// stops new entries until Execute signals is switched off and on again
@@ -6186,13 +6272,19 @@ namespace ATAS.Indicators.Technical
 			return requests;
 		}
 
-		// Live order calls, made outside the lock and one after the other (the stop before the take
-		// profit), with ATAS's async calls - the synchronous ones are obsolete. ATAS reports back on
-		// its own threads; a call that fails counts as a rejection of its order.
-		private async Task SendLiveRequests(List<LiveRequest> requests)
+		// Live order calls, made outside the lock with ATAS's async calls - the synchronous ones are
+		// obsolete. They start one after the other (the stop before the take profit) without waiting
+		// for each to finish, so a call ATAS holds up can't hold back the ones after it (on 2026-09-28
+		// the take profit never went out behind a stop ATAS held). No dialogs: without
+		// checkOrderStates: false ATAS asks the user whenever an earlier order is unanswered, and the
+		// call waits for a click. ATAS reports back on its own threads; a call that fails counts as a
+		// rejection of its order.
+		private void SendLiveRequests(List<LiveRequest> requests)
 		{
 			foreach (var request in requests)
 			{
+				Task call;
+
 				try
 				{
 					var manager = TradingManager ?? throw new InvalidOperationException("the chart has no trading connection");
@@ -6200,23 +6292,37 @@ namespace ATAS.Indicators.Technical
 					switch (request.Action)
 					{
 						case LiveAction.Place:
-							await manager.OpenOrderAsync(request.Order, setDefaultQuantity: false, askConfirmation: false).ConfigureAwait(false);
+							call = manager.OpenOrderAsync(request.Order, setDefaultQuantity: false, askConfirmation: false, checkOrderStates: false);
 							break;
 
 						case LiveAction.Modify:
-							await manager.ModifyOrderAsync(request.Order, request.NewOrder, askConfirmation: false).ConfigureAwait(false);
+							call = manager.ModifyOrderAsync(request.Order, request.NewOrder, askConfirmation: false, checkOrderStates: false);
 							break;
 
 						default:
-							await manager.CancelOrderAsync(request.Order, askConfirmation: false).ConfigureAwait(false);
+							call = manager.CancelOrderAsync(request.Order, askConfirmation: false, checkOrderStates: false);
 							break;
 					}
 				}
 				catch (Exception ex)
 				{
-					var failed = request;
-					ExecutionCallback(() => OrderCallFailed(failed, ex.Message));
+					call = Task.FromException(ex);
 				}
+
+				_ = WatchLiveCall(request, call ?? Task.CompletedTask);
+			}
+		}
+
+		// a call that fails, whenever it ends, counts as a rejection of its order
+		private async Task WatchLiveCall(LiveRequest request, Task call)
+		{
+			try
+			{
+				await call.ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				ExecutionCallback(() => OrderCallFailed(request, ex.Message));
 			}
 		}
 
@@ -6244,7 +6350,7 @@ namespace ATAS.Indicators.Technical
 				FireAlerts(alerts);
 
 			if (requests != null)
-				_ = SendLiveRequests(requests);
+				SendLiveRequests(requests);
 		}
 
 		private void OrderCallFailed(LiveRequest request, string message)
@@ -6351,24 +6457,46 @@ namespace ATAS.Indicators.Technical
 
 		private void LiveFill(MyTrade myTrade)
 		{
-			var pos = _execPosition;
-			var exec = myTrade == null || pos == null || pos.Paper ? null : pos.Find(myTrade.Order, myTrade.OrderId);
-
-			// not one of the executor's orders (a manual trade, another strategy), or reported twice
-			if (exec == null || (!string.IsNullOrEmpty(myTrade.Id) && !_execFillIds.Add(myTrade.Id)))
+			if (myTrade == null)
 				return;
 
+			var pos = _execPosition;
+			var exec = pos == null || pos.Paper ? null : pos.Find(myTrade.Order, myTrade.OrderId);
+
+			// reported twice
+			if (!string.IsNullOrEmpty(myTrade.Id) && !_execFillIds.Add(myTrade.Id))
+				return;
+
+			// not the position's: an order given up on, turning up after all - or none of the
+			// executor's business (a manual trade, another strategy)
+			if (exec == null)
+			{
+				UnconfirmedOrderTurnedUp(myTrade.Order, myTrade.OrderId, myTrade);
+				return;
+			}
+
+			exec.Confirmed = true;
 			ApplyFill(pos, exec, myTrade.Price, Math.Abs(myTrade.Volume));
 		}
 
 		private void LiveOrderChanged(Order order)
 		{
+			if (order == null)
+				return;
+
 			var pos = _execPosition;
-			var exec = order == null || pos == null || pos.Paper ? null : pos.Find(order, order.Id);
+			var exec = pos == null || pos.Paper ? null : pos.Find(order, order.Id);
+
+			// an order given up on, turning up after all
+			if (exec == null || _execUnconfirmed.Contains(exec))
+				UnconfirmedOrderTurnedUp(order, order.Id, null);
 
 			// an earlier version of a modified order doesn't speak for it
 			if (exec == null || (!ReferenceEquals(exec.Order, order) && order.Id != exec.Order.Id))
 				return;
+
+			if (order.State != OrderStates.None)
+				exec.Confirmed = true;
 
 			var status = order.Status();
 
@@ -6384,7 +6512,7 @@ namespace ATAS.Indicators.Technical
 					exec.Working = false;
 					exec.FillPending = false;
 					LogOrder("CANCELLED", pos, exec, exec.Quantity - exec.Filled, OrderPrice(exec.Order),
-						exec.CancelSent ? null : "not asked for by the indicator (by hand, the OCO partner's fill, or the broker)");
+						exec.CancelSent ? null : "not asked for by the indicator (by hand, or the broker)");
 				}
 			}
 			else if (status == OrderStatus.Filled && exec.Filled < exec.Quantity)

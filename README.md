@@ -774,8 +774,10 @@ It decides nothing the chart has not:
   closed. With a limit entry, a limit order at the signal's own price; it is cancelled when the
   chart's order expires (*Limit order valid*).
 * **The bracket.** Once filled, the signal's own stop and take profit, from whichever *Bracket size*
-  is on (fixed ticks, multiples of the ATR, or beyond the signal bar), the stop sent first, both in
-  one OCO group. When the trade reaches its break-even trigger, the stop moves to its break-even
+  is on (fixed ticks, multiples of the ATR, or beyond the signal bar), the stop sent first, as two
+  plain orders: when one fills, the executor cancels the other. There is no OCO group - on
+  connections without OCO at the broker, Rithmic among them, ATAS keeps OCO pairs on the computer,
+  and live on 2026-09-28 it held a stop back from the broker. When the trade reaches its break-even trigger, the stop moves to its break-even
   price - or, with *Break-even stop from the fill* on, to the same profit counted from the
   position's average fill, so slippage on the entry doesn't come off it.
 * **The exit.** The stop or the take profit, or at market as soon as the chart's trade ends while
@@ -877,11 +879,19 @@ instrument) only when all of these hold; otherwise each signal is logged as skip
 * *Live account* is the account selected on the chart (type its ID; case and spaces don't matter);
 * a *Daily loss limit* is set;
 * the chart's instrument has the trading instrument's tick size;
+* ATAS's own automatic stop loss / take profit (SL/TP) is off: its orders would work against the
+  executor's - its take profit a tick in front of the executor's closes winners behind its back, and
+  two stops can both fill;
 * the account holds no position in the instrument.
 
-The panel says *not armed* and why. Orders go without ATAS's confirmation dialog. If ATAS or the
-broker rejects the stop or the take profit, the position is closed at market and the executor
-**halts** (no new entries until *Execute signals* is switched off and on again); so does a stop
+The panel says *not armed* and why. Orders go without ATAS's confirmation dialog, and without its
+question about earlier orders still unanswered (`checkOrderStates`), which would hold an order until
+someone clicks. If ATAS or the broker rejects the stop or the take profit, the position is closed at
+market and the executor **halts** (no new entries until *Execute signals* is switched off and on
+again). So does a stop, take profit or closing order the broker hasn't confirmed 5 seconds after it
+went out: it is asked to cancel in case it still turns up, it is cancelled again if it turns up
+working, and one that fills after all halts the executor with a warning - the account may then hold
+a position the indicator doesn't know of. So does a stop
 that goes away without the executor asking (cancelled by hand, or expired at the broker), after a
 few seconds that leave room for a take profit filling at the same moment. A position that
 disappears from the account (closed by hand, say) halts it too, and so does a closing order that is
@@ -1137,6 +1147,12 @@ chart's signals unless you switch it on:
   * **safety**: one live trade per account across charts; live, the account's closed P&L counts
     toward the daily loss limit (on); an optional flat-by time; time in force for live orders; an
     optional break-even stop counted from the fill;
+  * **live orders on Rithmic**: the first live trade (2026-09-28) showed ATAS holding the stop back -
+    it was in an OCO group, which ATAS keeps on the computer for Rithmic - so the take profit never
+    went out and the break-even move was refused. The stop and take profit are now two plain orders,
+    each call goes out without waiting on the one before or on ATAS's dialogs, an order the broker
+    hasn't confirmed within 5 seconds closes the position and halts, and live trading isn't armed
+    while ATAS's own SL/TP is on;
   * **worst-case odds**: every trade is also settled with the worst case inside each bar, the log
     carries that EV next to the label's, and the executor can filter on it;
   * **the log report** (`tests/LogReport`) sums the executor's logs up;

@@ -66,6 +66,7 @@ internal static class Program
 		Run("Live: fills reported first by the order, or twice", LiveFillReports);
 		Run("Live: partial fills resize the bracket", LivePartialFills);
 		Run("Live: a rejected stop closes the position and halts", LiveRejectedStop);
+		Run("Live: a stop the broker never confirms closes the position and halts", LiveUnconfirmedStop);
 		Run("Live: a position closed outside the indicator halts it", LiveClosedOutside);
 		Run("Live: a stop cancelled outside the indicator closes the position", LiveStopCancelledOutside);
 		Run("Live: one live trade per account across charts", LiveOneTradePerAccount);
@@ -854,6 +855,9 @@ internal static class Program
 			== "live trading is not armed: the instrument's tick size (0.5) is not the chart's", "on an instrument that isn't the chart's");
 		Check(Skipped(new FakeBroker { Position = new Position { Volume = 2 } }, null) == "the account already holds a position (2) in this instrument",
 			"when the account already holds a position");
+		const string atasBracket = "live trading is not armed: ATAS's own stop loss / take profit (SL/TP) is on: it would trade against the executor's bracket, switch it off";
+		Check(Skipped(new FakeBroker { IsStopLossModeActivated = true }, null) == atasBracket, "while ATAS's own automatic stop loss is on");
+		Check(Skipped(new FakeBroker { IsTakeProfitModeActivated = true }, null) == atasBracket, "or its automatic take profit");
 
 		var panel = Panel(Buy(Live(new FakeBroker(), i => i.LiveAccount = string.Empty)));
 		Check(panel.Contains("Execution LIVE not armed: Live account is empty"), "the panel says why");
@@ -887,13 +891,15 @@ internal static class Program
 			"first a sell stop at 83.50");
 		Check(target.Type == OrderTypes.Limit && target.Price == 123.5m && target.Direction == OrderDirections.Sell && target.QuantityToFill == 1,
 			"then a sell limit at 123.50");
-		Check(stop.OCOGroup != null && stop.OCOGroup == target.OCOGroup, "one OCO group");
+		Check(stop.OCOGroup == null && target.OCOGroup == null, "two plain orders, no OCO group (ATAS holds OCO pairs back on Rithmic)");
+		Check(broker.CheckedStates.Count == 3 && broker.CheckedStates.All(c => !c), "no call waits on ATAS's dialog about unanswered orders");
 
 		AddTick(ind, bar, 110);
 		AddTick(ind, bar, 115);
 		var modify = broker.Calls.Single(c => c.Name == "modify");
 		Check(modify.Order == stop && modify.NewOrder.TriggerPrice == 108.5m && modify.NewOrder.QuantityToFill == 1 && !modify.AskConfirmation,
 			"ModifyOrderAsync moves the stop to 108.50");
+		Check(broker.CheckedStates.All(c => !c), "the move doesn't wait on a dialog either");
 
 		// the broker's fill report can come before the chart sees the print
 		broker.Fill(ind, target, 123.5m, 1, "F2");
@@ -1043,6 +1049,82 @@ internal static class Program
 		Check(!Panel(ind).Any(s => s.Contains("HALTED")), "off and on again resumes");
 	}
 
+	private static void LiveUnconfirmedStop()
+	{
+		// the connection holds the stop back and its call never returns, as ATAS held an OCO stop on
+		// Rithmic on 2026-09-28: the take profit still goes out, and 5 seconds on the stop counts as
+		// rejected - the position is closed at market and execution halts
+		var broker = new FakeBroker { Holds = o => o.Type == OrderTypes.Stop };
+		var ind = Buy(Live(broker));
+		var bar = OpenBar(ind, 103.5m);
+		broker.Fill(ind, broker.Calls[0].Order, 103.75m, 1, "F1");
+		broker.Position.Volume = 1;
+		Check(broker.Calls.Count == 3, $"the stop and the take profit sent: {broker.Calls.Count} calls");
+		var stop = broker.Calls[1].Order;
+		var target = broker.Calls[2].Order;
+		Check(stop.Type == OrderTypes.Stop && stop.State == OrderStates.None && target.Type == OrderTypes.Limit && target.State == OrderStates.Active,
+			"the take profit goes out though the stop's call never returns");
+
+		for (var i = 0; i < 4; i++)
+			AddTick(ind, bar, 104);
+
+		Check(broker.Calls.Count == 3 && !Rows(ind, "live").Any(r => r["event"] == "HALT"), "4 seconds unanswered: still waiting");
+
+		AddTick(ind, bar, 104);
+		var rows = Rows(ind, "live");
+		Check(Only(rows, "REJECTED", "stop")["note"] == "the broker didn't confirm it within 5 s", "5 seconds: the stop counts as rejected");
+		Check(rows.Any(r => r["event"] == "HALT" && r["note"] == "the stop order was rejected (the broker didn't confirm it within 5 s): the unprotected position is closed at market"),
+			$"halted: {Describe(rows.Where(r => r["event"] == "HALT"))}");
+		Check(broker.Calls.Count == 5 && broker.Calls[3].Name == "cancel" && broker.Calls[3].Order == stop && broker.Calls[4].Name == "cancel"
+			&& broker.Calls[4].Order == target, "the stop is asked to cancel in case it turns up, and the take profit is cancelled");
+
+		broker.ConfirmCancel(ind, target);
+		var exit = broker.Calls.Last();
+		Check(broker.Calls.Count == 6 && exit.Name == "open" && exit.Order.Type == OrderTypes.Market && exit.Order.Direction == OrderDirections.Sell
+			&& exit.Order.QuantityToFill == 1, "then it closes at market, without waiting on the stop");
+
+		broker.Fill(ind, exit.Order, 104, 1, "F2");
+		broker.Position.Volume = 0;
+		Check(Only(Rows(ind, "live"), "CLOSED")["pnl_ticks"] == "1", "closed, +1t");
+
+		// the held stop turns up working at the broker after all: cancelled again
+		stop.State = OrderStates.Active;
+		ind.HarnessOrderChanged(stop);
+		Check(broker.Calls.Count == 7 && broker.Calls[6].Name == "cancel" && broker.Calls[6].Order == stop, "the stop turning up is asked to cancel again");
+		Check(Rows(ind, "live").Any(r => r["event"] == "WARN" && r["note"] == "the stop order the broker hadn't confirmed turned up working: cancelled again"),
+			"and says so");
+
+		// ... and fills before that goes through, once the chart's trade is over: the account may hold
+		// a position the executor doesn't know of
+		AddTick(ind, bar, 123.5m);
+		broker.Fill(ind, stop, 100, 1, "F3");
+		rows = Rows(ind, "live");
+		var halts = rows.Where(r => r["event"] == "HALT").ToList();
+		Check(halts.Count == 2 && halts[1]["note"].StartsWith("the stop order the broker hadn't confirmed filled after all (1 @ ", StringComparison.Ordinal),
+			$"a late fill halts it with a warning: {Describe(halts)}");
+		Check(ind.Alerts.Any(a => a.StartsWith("Execution halted: the stop order the broker hadn't confirmed filled after all", StringComparison.Ordinal)), "an alert");
+
+		// a stop the broker takes a moment to confirm is no trouble (on a new chart: the one above
+		// still holds the account)
+		ind.HarnessDispose();
+		broker = new FakeBroker { Holds = o => o.Type == OrderTypes.Stop };
+		ind = Buy(Live(broker));
+		bar = OpenBar(ind, 103.5m);
+		broker.Fill(ind, broker.Calls[0].Order, 103.75m, 1, "F1");
+		broker.Position.Volume = 1;
+		stop = broker.Calls[1].Order;
+		AddTick(ind, bar, 104);
+		AddTick(ind, bar, 104);
+		stop.State = OrderStates.Active;
+		ind.HarnessOrderChanged(stop);
+
+		for (var i = 0; i < 8; i++)
+			AddTick(ind, bar, 104);
+
+		rows = Rows(ind, "live");
+		Check(broker.Calls.Count == 3 && !rows.Any(r => r["event"] == "HALT" || r["event"] == "REJECTED"), $"confirmed after 2 s: nothing happens ({Trail(rows)})");
+	}
+
 	private static void LiveClosedOutside()
 	{
 		var broker = new FakeBroker();
@@ -1098,8 +1180,8 @@ internal static class Program
 		Check(broker.Calls.Count == 5 && exit.Name == "open" && exit.Order.Type == OrderTypes.Market && exit.Order.Direction == OrderDirections.Sell,
 			"then it closes at market");
 
-		// the OCO partner: the take profit fills and the broker cancels the stop, reported first (on a
-		// new chart: the one above still holds the account)
+		// the take profit fills as the stop is cancelled (by a broker-side OCO, say), the cancel
+		// reported first (on a new chart: the one above still holds the account)
 		ind.HarnessDispose();
 		broker = new FakeBroker();
 		ind = Buy(Live(broker));
@@ -1270,12 +1352,28 @@ internal static class Program
 		public List<(string Name, Order Order, Order NewOrder, bool AskConfirmation, bool SetDefaultQuantity)> Calls { get; } =
 			new List<(string Name, Order Order, Order NewOrder, bool AskConfirmation, bool SetDefaultQuantity)>();
 
+		// each call's checkOrderStates: true makes ATAS ask the user while an earlier order is unanswered
+		public List<bool> CheckedStates { get; } = new List<bool>();
+
+		// orders the connection holds back, as ATAS held an OCO stop on Rithmic: never answered, and
+		// the call never returns
+		public Func<Order, bool> Holds { get; set; }
+
+		// ATAS's own automatic stop loss / take profit, as the real ITradingManager reports it
+		public bool IsStopLossModeActivated { get; set; }
+		public bool IsTakeProfitModeActivated { get; set; }
+
 		public Task OpenOrderAsync(Order order, bool setDefaultQuantity, bool askConfirmation = true, bool checkOrderStates = true)
 		{
 			order.Id = $"B{++_ids}";
-			order.State = OrderStates.Active;
 			order.Unfilled = order.QuantityToFill;
 			Calls.Add(("open", order, null, askConfirmation, setDefaultQuantity));
+			CheckedStates.Add(checkOrderStates);
+
+			if (Holds != null && Holds(order))
+				return new TaskCompletionSource<bool>().Task;
+
+			order.State = OrderStates.Active;
 			return Task.CompletedTask;
 		}
 
@@ -1283,12 +1381,14 @@ internal static class Program
 		{
 			newOrder.Unfilled = newOrder.QuantityToFill - (order.QuantityToFill - order.Unfilled);
 			Calls.Add(("modify", order, newOrder, askConfirmation, false));
+			CheckedStates.Add(checkOrderStates);
 			return Task.CompletedTask;
 		}
 
 		public Task CancelOrderAsync(Order order, bool askConfirmation = true, bool checkOrderStates = true)
 		{
 			Calls.Add(("cancel", order, null, askConfirmation, false));
+			CheckedStates.Add(checkOrderStates);
 			return Task.CompletedTask;
 		}
 
