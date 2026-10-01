@@ -787,6 +787,13 @@ namespace ATAS.Indicators.Technical
 			public bool FillPending;        // live: reported filled, its fills not in yet
 			public DateTime Sent;           // live: when it was sent
 			public bool Confirmed;          // live: ATAS showed it at the broker (working, filled or cancelled)
+			public bool Changing;           // live: a change sent whose replacement ATAS hasn't registered yet
+			public DateTime ChangeSent;
+			public decimal? NextPrice;      // live: the price and size wanted once the change under way is through
+			public decimal? NextQuantity;
+			public string NextReason;
+			public bool CancelQueued;       // live: to be cancelled once the change under way is through
+			public DateTime CancelAt;       // live: when its cancel went out (to ask again if it doesn't go through)
 
 			public bool Matches(Order order, string id)
 			{
@@ -1316,6 +1323,9 @@ namespace ATAS.Indicators.Technical
 		// live: how long a stop, take profit or closing order may go without the broker taking it
 		// before it counts as rejected (a broker answers in well under a second)
 		private static readonly TimeSpan ConfirmGrace = TimeSpan.FromSeconds(5);
+
+		// live: how long a cancel may go unanswered once the position is flat before it is sent again
+		private static readonly TimeSpan CancelGrace = TimeSpan.FromSeconds(3);
 
 		// Live trades, one per account at a time across the charts of this ATAS: the account's ID ->
 		// the indicator whose live position holds it, from its entry until the position is done
@@ -5271,6 +5281,8 @@ namespace ATAS.Indicators.Technical
 					CheckAccount(pos);
 					CheckProtection(pos);
 					CheckConfirmations(pos);
+					CheckChanges(pos);
+					CheckLeftovers(pos);
 				}
 
 				if (trade.Outcome != TradeOutcome.Open)
@@ -5748,6 +5760,19 @@ namespace ATAS.Indicators.Technical
 
 			if (!pos.Paper)
 			{
+				order.NextPrice = null;
+				order.NextQuantity = null;
+				order.NextReason = null;
+				order.CancelAt = _execNow;
+
+				// a change under way: the cancel follows once ATAS has registered the replacement - one
+				// sent before is lost, and the replacement then works at the broker on its own
+				if (ChangeUnderWay(order))
+				{
+					order.CancelQueued = true;
+					return;
+				}
+
 				Request(new LiveRequest(LiveAction.Cancel, order.Order));
 				return;
 			}
@@ -5758,9 +5783,24 @@ namespace ATAS.Indicators.Technical
 			LogOrder("CANCELLED", pos, order, order.Quantity - order.Filled, OrderPrice(order.Order));
 		}
 
-		// moves an order's price or resizes it; a live order is replaced by an updated copy
+		// Moves an order's price or resizes it; a live order is replaced by an updated copy. Live, one
+		// change at a time: on Rithmic ATAS replaces the order (cancels it, then registers a new one),
+		// and a second change sent before the replacement is registered is refused - so the latest
+		// price and size wanted wait for it.
 		private void ModifyExecOrder(ExecPosition pos, ExecOrder order, decimal price, decimal quantity, string reason)
 		{
+			if (!pos.Paper && ChangeUnderWay(order))
+			{
+				order.NextPrice = price;
+				order.NextQuantity = quantity;
+				order.NextReason = reason;
+				return;
+			}
+
+			order.NextPrice = null;
+			order.NextQuantity = null;
+			order.NextReason = null;
+
 			var old = order.Order;
 			var updated = pos.Paper ? old : old.Clone();
 
@@ -5776,12 +5816,62 @@ namespace ATAS.Indicators.Technical
 				updated.Unfilled = quantity - order.Filled;
 			else
 			{
+				// a new order to ATAS until it registers it
+				updated.State = OrderStates.None;
 				order.Replaced.Add(old);
 				order.Order = updated;
+				order.Changing = true;
+				order.ChangeSent = _execNow;
 				Request(new LiveRequest(LiveAction.Modify, old, updated));
 			}
 
 			LogOrder("MODIFY", pos, order, quantity, price, reason);
+		}
+
+		// a change still under way: ATAS hasn't registered the replacement (it shows it neither working
+		// nor done). One registered meanwhile is through.
+		private static bool ChangeUnderWay(ExecOrder order)
+		{
+			if (order.Changing && order.Order.State != OrderStates.None)
+				order.Changing = false;
+
+			return order.Changing;
+		}
+
+		// The price and size an order is to have: what it has, or what waits for the change under way
+		private static decimal WantedPrice(ExecOrder order)
+		{
+			return order.NextPrice ?? OrderPrice(order.Order);
+		}
+
+		private static decimal WantedQuantity(ExecOrder order)
+		{
+			return order.NextQuantity ?? order.Quantity;
+		}
+
+		// ATAS has registered a change (the replacement is at the broker): what waited for it goes out -
+		// the cancel, or the latest price and size
+		private void ChangeThrough(ExecPosition pos, ExecOrder order)
+		{
+			order.Changing = false;
+			var cancel = order.CancelQueued;
+			decimal price = WantedPrice(order), quantity = WantedQuantity(order);
+			var reason = order.NextReason;
+			order.CancelQueued = false;
+			order.NextPrice = null;
+			order.NextQuantity = null;
+			order.NextReason = null;
+
+			if (!order.Working)
+				return;
+
+			if (cancel)
+			{
+				order.CancelAt = _execNow;
+				Request(new LiveRequest(LiveAction.Cancel, order.Order));
+			}
+			else if (price != OrderPrice(order.Order) || quantity != order.Quantity)
+				ModifyExecOrder(pos, order, price, quantity, reason);
 		}
 
 		// A fill of one of the executor's orders, paper or live
@@ -5881,8 +5971,8 @@ namespace ATAS.Indicators.Technical
 
 				var size = order.Filled + pos.Open;
 
-				if (size != order.Quantity)
-					ModifyExecOrder(pos, order, OrderPrice(order.Order), size, "resized to the position");
+				if (size != WantedQuantity(order))
+					ModifyExecOrder(pos, order, WantedPrice(order), size, "resized to the position");
 			}
 		}
 
@@ -5917,7 +6007,7 @@ namespace ATAS.Indicators.Technical
 			pos.StopPrice = price;
 
 			if (pos.Stop != null && pos.Stop.Working && !pos.Stop.CancelSent)
-				ModifyExecOrder(pos, pos.Stop, price, pos.Stop.Quantity,
+				ModifyExecOrder(pos, pos.Stop, price, WantedQuantity(pos.Stop),
 					$"break-even: +{trade.TriggerTicks}t reached, the stop moves to +{trade.LockedTicks}t{(BreakEvenFromFill ? " from the fill" : string.Empty)}");
 		}
 
@@ -6092,6 +6182,75 @@ namespace ATAS.Indicators.Technical
 				CancelExecOrder(pos, order, message);
 				_execUnconfirmed.Add(order);
 				OrderFailed(pos, order, message);
+			}
+		}
+
+		// Live: a change ATAS has registered lets what waited for it go out; one it hasn't registered a
+		// few seconds after it was sent counts as rejected, like an order the broker never confirmed:
+		// what may still turn up is asked to cancel, and without its stop or take profit the position is
+		// closed at market and execution halts.
+		private void CheckChanges(ExecPosition pos)
+		{
+			foreach (var order in pos.Orders.ToList())
+			{
+				if (!order.Changing)
+					continue;
+
+				if (order.Order.State != OrderStates.None)
+				{
+					ChangeThrough(pos, order);
+					continue;
+				}
+
+				if (_execNow - order.ChangeSent < ConfirmGrace)
+					continue;
+
+				order.Changing = false;
+				order.CancelQueued = false;
+				order.NextPrice = null;
+				order.NextQuantity = null;
+				order.NextReason = null;
+				var message = $"its change wasn't confirmed within {ConfirmGrace.TotalSeconds:0} s";
+				order.CancelSent = true;
+				order.CancelAt = _execNow;
+				LogOrder("CANCEL", pos, order, order.Quantity - order.Filled, OrderPrice(order.Order), message);
+
+				foreach (var version in order.Replaced.Where(o => o.State == OrderStates.Active).Append(order.Order))
+					Request(new LiveRequest(LiveAction.Cancel, version));
+
+				_execUnconfirmed.Add(order);
+				OrderFailed(pos, order, message);
+			}
+		}
+
+		// Live: once the position is flat, none of its orders may stay working at the broker. A cancel
+		// still unanswered a few seconds on is sent again, three times in all; then execution halts and
+		// says so.
+		private void CheckLeftovers(ExecPosition pos)
+		{
+			if (pos.Open > 0)
+				return;
+
+			foreach (var order in pos.Orders)
+			{
+				if (!order.Working || !order.CancelSent || order.Changing || _execNow - order.CancelAt < CancelGrace)
+					continue;
+
+				if (order.CancelAttempts >= 2)
+				{
+					if (order.CancelAttempts == 2)
+					{
+						order.CancelAttempts++;
+						Halt(pos, $"the {RoleName(order.Role)} order is still working at the broker after the position closed: cancel it in ATAS");
+					}
+
+					continue;
+				}
+
+				order.CancelAttempts++;
+				order.CancelAt = _execNow;
+				LogOrder("CANCEL", pos, order, order.Quantity - order.Filled, OrderPrice(order.Order), "still working after the position closed: asked again");
+				Request(new LiveRequest(LiveAction.Cancel, order.Order));
 			}
 		}
 
@@ -6491,8 +6650,9 @@ namespace ATAS.Indicators.Technical
 			if (exec == null || _execUnconfirmed.Contains(exec))
 				UnconfirmedOrderTurnedUp(order, order.Id, null);
 
-			// an earlier version of a modified order doesn't speak for it
-			if (exec == null || (!ReferenceEquals(exec.Order, order) && order.Id != exec.Order.Id))
+			// an earlier version of a modified order doesn't speak for it (on Rithmic ATAS cancels it as
+			// it registers the replacement)
+			if (exec == null || exec.Replaced.Any(o => ReferenceEquals(o, order)) || (!ReferenceEquals(exec.Order, order) && order.Id != exec.Order.Id))
 				return;
 
 			if (order.State != OrderStates.None)
@@ -6521,6 +6681,10 @@ namespace ATAS.Indicators.Technical
 				exec.Working = false;
 				exec.FillPending = true;
 			}
+
+			// the change is registered: the cancel or the next change waiting for it goes out
+			if (exec.Changing && order.State != OrderStates.None)
+				ChangeThrough(pos, exec);
 
 			ContinueExit(pos);
 			CheckDone(pos);
@@ -6571,6 +6735,10 @@ namespace ATAS.Indicators.Technical
 
 			LogOrder("REJECTED", pos, exec, exec.Quantity, OrderPrice(previous), $"the change was rejected: {message}");
 			Notify($"The live {RoleName(exec.Role)} order could not be changed ({message}): it stays at {FormatPrice(OrderPrice(previous))}", BearColor, true);
+
+			// the order stands as it was: what waited for the change goes out to it
+			if (exec.Changing)
+				ChangeThrough(pos, exec);
 		}
 
 		// A cancel that didn't go through. Usually the order filled meanwhile (a take profit touched as

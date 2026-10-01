@@ -67,6 +67,7 @@ internal static class Program
 		Run("Live: partial fills resize the bracket", LivePartialFills);
 		Run("Live: a rejected stop closes the position and halts", LiveRejectedStop);
 		Run("Live: a stop the broker never confirms closes the position and halts", LiveUnconfirmedStop);
+		Run("Live: one change at a time, nothing left working once flat (Rithmic replaces orders)", LiveReplacedOrders);
 		Run("Live: a position closed outside the indicator halts it", LiveClosedOutside);
 		Run("Live: a stop cancelled outside the indicator closes the position", LiveStopCancelledOutside);
 		Run("Live: one live trade per account across charts", LiveOneTradePerAccount);
@@ -1125,6 +1126,93 @@ internal static class Program
 		Check(broker.Calls.Count == 3 && !rows.Any(r => r["event"] == "HALT" || r["event"] == "REJECTED"), $"confirmed after 2 s: nothing happens ({Trail(rows)})");
 	}
 
+	private static void LiveReplacedOrders()
+	{
+		// 2026-10-01 on Rithmic: break-even, then the take profit filling 4 + 1 - the stop's resize and
+		// its cancel must not overlap, or the replacement stop is left working with no position
+		var broker = new FakeBroker { Replaces = true };
+		var ind = Buy(Live(broker, i =>
+		{
+			i.Contracts = 5;
+			i.DailyLossLimit = 100000;
+		}));
+		var bar = OpenBar(ind, 103.5m);
+		Check(broker.Calls.Count == 1, $"a market entry for 5: {broker.Calls.Count} calls");
+		broker.Fill(ind, broker.Calls[0].Order, 103.75m, 5, "F1");
+		broker.Position.Volume = 5;
+		var stop = broker.Calls[1].Order;
+		var target = broker.Calls[2].Order;
+
+		AddTick(ind, bar, 110);
+		AddTick(ind, bar, 115);
+		Check(broker.Calls.Count == 4 && broker.Calls[3].Name == "modify", "break-even: the stop is changed");
+		var moved = broker.Calls[3].NewOrder;
+		AddTick(ind, bar, 116);
+		Check(broker.Calls.Count == 4, "nothing more while the replacement isn't registered");
+		broker.Register(ind, stop, moved);
+		Check(broker.Calls.Count == 4 && !Rows(ind, "live").Any(r => r["event"] == "CANCELLED"), "the old version's cancel isn't the stop's");
+
+		broker.Fill(ind, target, 123.5m, 4, "F2");
+		Check(broker.Calls.Count == 5 && broker.Calls[4].Name == "modify" && broker.Calls[4].NewOrder.QuantityToFill == 1, "4 of 5 filled: the stop resized to 1");
+		var resized = broker.Calls[4].NewOrder;
+		broker.Fill(ind, target, 123.5m, 1, "F3");
+		broker.Position.Volume = 0;
+		Check(broker.Calls.Count == 5 && Rows(ind, "live").Any(r => r["event"] == "CANCEL" && r["order"] == "stop"),
+			"flat: the stop's cancel waits for its replacement");
+
+		broker.Register(ind, moved, resized);
+		Check(broker.Calls.Count == 6 && broker.Calls[5].Name == "cancel" && broker.Calls[5].Order == resized, "registered: now it is cancelled");
+		broker.ConfirmCancel(ind, resized);
+		var rows = Rows(ind, "live");
+		Check(Only(rows, "CLOSED")["pnl_ticks"] == "79" && !rows.Any(r => r["event"] == "HALT"), $"closed on the take profit, nothing left: {Trail(rows)}");
+
+		// a cancel that goes nowhere: sent again 3 seconds on, twice; then a halt
+		ind.HarnessDispose();
+		broker = new FakeBroker();
+		ind = Buy(Live(broker));
+		bar = OpenBar(ind, 103.5m);
+		broker.Fill(ind, broker.Calls[0].Order, 103.75m, 1, "F1");
+		broker.Position.Volume = 1;
+		stop = broker.Calls[1].Order;
+		broker.Fill(ind, broker.Calls[2].Order, 123.5m, 1, "F2");
+		broker.Position.Volume = 0;
+		Check(broker.Calls.Count == 4 && broker.Calls[3].Order == stop, "flat: the stop is cancelled");
+
+		for (var i = 0; i < 3; i++)
+			AddTick(ind, bar, 110);
+
+		Check(broker.Calls.Count == 5 && broker.Calls[4].Name == "cancel" && broker.Calls[4].Order == stop, "3 seconds unanswered: asked again");
+
+		for (var i = 0; i < 6; i++)
+			AddTick(ind, bar, 110);
+
+		rows = Rows(ind, "live");
+		Check(broker.Calls.Count == 6 && rows.Any(r => r["event"] == "HALT" && r["note"] == "the stop order is still working at the broker after the position closed: cancel it in ATAS"),
+			$"three cancels unanswered: halted ({broker.Calls.Count} calls)");
+
+		// a change never registered with the position open: counted as rejected, closed at market
+		ind.HarnessDispose();
+		broker = new FakeBroker { Replaces = true };
+		ind = Buy(Live(broker));
+		bar = OpenBar(ind, 103.5m);
+		broker.Fill(ind, broker.Calls[0].Order, 103.75m, 1, "F1");
+		broker.Position.Volume = 1;
+		target = broker.Calls[2].Order;
+		AddTick(ind, bar, 110);
+		AddTick(ind, bar, 115);
+
+		for (var i = 0; i < 5; i++)
+			AddTick(ind, bar, 114);
+
+		rows = Rows(ind, "live");
+		Check(rows.Any(r => r["event"] == "REJECTED" && r["note"] == "its change wasn't confirmed within 5 s")
+			&& rows.Any(r => r["event"] == "HALT"), $"5 seconds: rejected, halted ({Trail(rows)})");
+		Check(broker.Calls.Any(c => c.Name == "cancel" && c.Order == target), "the take profit is cancelled");
+		broker.ConfirmCancel(ind, target);
+		var exit = broker.Calls.Last();
+		Check(exit.Name == "open" && exit.Order.Type == OrderTypes.Market && exit.Order.Direction == OrderDirections.Sell, "then it closes at market");
+	}
+
 	private static void LiveClosedOutside()
 	{
 		var broker = new FakeBroker();
@@ -1377,9 +1465,15 @@ internal static class Program
 			return Task.CompletedTask;
 		}
 
+		// as ATAS does on Rithmic: a change cancels the order and registers a replacement, which stays
+		// unregistered until Register; a cancel of an order not registered yet is lost
+		public bool Replaces { get; set; }
+
 		public Task ModifyOrderAsync(Order order, Order newOrder, bool askConfirmation = true, bool checkOrderStates = true)
 		{
+			newOrder.Id = $"B{++_ids}";
 			newOrder.Unfilled = newOrder.QuantityToFill - (order.QuantityToFill - order.Unfilled);
+			newOrder.State = Replaces ? OrderStates.None : OrderStates.Active;
 			Calls.Add(("modify", order, newOrder, askConfirmation, false));
 			CheckedStates.Add(checkOrderStates);
 			return Task.CompletedTask;
@@ -1390,6 +1484,16 @@ internal static class Program
 			Calls.Add(("cancel", order, null, askConfirmation, false));
 			CheckedStates.Add(checkOrderStates);
 			return Task.CompletedTask;
+		}
+
+		// the replacement of a change registered: the old version cancelled, the new one working
+		public void Register(FvgReactionLiquiditySweep ind, Order old, Order replacement)
+		{
+			old.State = OrderStates.Done;
+			old.Canceled = true;
+			ind.HarnessOrderChanged(old);
+			replacement.State = OrderStates.Active;
+			ind.HarnessOrderChanged(replacement);
 		}
 
 		// the broker's answers: a fill (reported as a trade, then as the order's new state), a cancel

@@ -1153,6 +1153,12 @@ chart's signals unless you switch it on:
     each call goes out without waiting on the one before or on ATAS's dialogs, an order the broker
     hasn't confirmed within 5 seconds closes the position and halts, and live trading isn't armed
     while ATAS's own SL/TP is on;
+  * **one order change at a time**: on Rithmic ATAS changes an order by cancelling it and
+    registering a replacement. On 2026-10-01 a take profit filling in pieces made the stop's resize
+    and its cancel overlap: the cancel went to a replacement not registered yet, and the stop was
+    left working with no position. Now a change waits for the one before it, a cancel waits for the
+    replacement, a change not registered within 5 seconds counts as rejected, and once the position
+    is flat a cancel still unanswered is sent again (3 seconds apart, three in all) before a halt;
   * **worst-case odds**: every trade is also settled with the worst case inside each bar, the log
     carries that EV next to the label's, and the executor can filter on it;
   * **the log report** (`tests/LogReport`) sums the executor's logs up;
